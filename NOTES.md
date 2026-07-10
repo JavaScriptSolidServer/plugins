@@ -45,17 +45,39 @@ are candidates, each with a consumer in this repo attached.
    a plugin rewriting every response is a bigger grant than route ownership.
    If it ships, gate it (`capabilities: ['hooks']`).
 
-## The wall (by design): pipeline-modifying features
+## The core/plugin line — answering #564 empirically
 
-pay/ documents it fully. Core's pay feature turns *LDP routes* into paid
-resources from inside the WAC hook — a plugin cannot touch routes it
-doesn't own, so pay/conneg/quotas/WAC are **core, not plugins**. That's the
-crisp line #564 needed:
+#564 asks: which of JSS's bundled features become plugins, and where's the
+line? This repo answers it by *trying* — porting each feature onto the
+public api and seeing what survives. The line that fell out:
 
-- route-owning features → plugins (proven here: relay, webrtc, terminal,
-  tunnel, notifications endpoint)
-- pipeline-modifying features → core (or a future, separately-gated hooks
-  capability)
+**A feature is plugin-able iff it OWNS its routes. It stays core iff it
+MODIFIES the request pipeline of routes it doesn't own.**
+
+| Feature | Shape | Verdict | Evidence |
+|---|---|---|---|
+| nostr relay | owns `/relay` ws | ✅ plugin | relay/ — parity + persistence |
+| webrtc | owns `/webrtc` ws | ✅ plugin | webrtc/ — full parity, zero imports |
+| terminal | owns a ws | ✅ plugin | terminal/ — hardened beyond core |
+| tunnel | owns a prefix | ✅ plugin | tunnel/ — parity, one prefix deviation |
+| notifications | owns a ws + watches storage | ✅ plugin | notifications/ — WAC via loopback |
+| NIP-05, cors-proxy, webdav, capabilities | own routes | ✅ plugin | this repo's later ports |
+| **pay** | 402s *LDP* routes from the WAC hook | ❌ **core** | pay/ — the wall-report |
+| conneg, quotas, WAC, LDP, the auth chain | modify every request | ❌ core | — they ARE the pod |
+
+So #564's migration list is right for the route-owning features (relay, AP,
+webrtc, terminal, tunnel, remoteStorage, the IdP's own endpoints) — each can
+move out-of-tree behind the loader with no core change, exactly as this repo
+demonstrates for six of them. Pay is the one on that list that CAN'T, and
+it's instructive: its essence is intercepting the LDP pipeline, which is the
+definition of core. The bundled features that look like plugins ARE plugins;
+the ones that look like middleware stay middleware.
+
+**Corollary for the loader:** the only thing that would move a
+pipeline-modifying feature across the line is a `capabilities: ['hooks']`
+grant (an explicit, separately-gated `onRequest`/`onSend`), which several
+findings above independently ask for. Until then, the line is clean and
+this repo is its proof.
 
 ## Bugs the composition surfaced (this repo's own dogfooding)
 
