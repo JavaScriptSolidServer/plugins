@@ -1,0 +1,162 @@
+// The money shot: ONE JavaScript Solid Server from npm, EVERY plugin in
+// this repo loaded from pure config, each surface exercised over the wire,
+// pods + WAC intact beside them all.
+
+import { describe, it, after } from 'node:test';
+import assert from 'node:assert';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { WebSocket } from 'ws';
+import { probePort, startJss } from './helpers.js';
+import { finalizeEvent, generateSecretKey } from './relay/nip01.js';
+
+const __dirname = path.dirname(fileURLToPath(new URL(import.meta.url)));
+const at = (p) => path.join(__dirname, p);
+
+function openWs(url, headers) {
+  const socket = new WebSocket(url, headers ? { headers } : undefined);
+  return new Promise((resolve, reject) => {
+    const lines = [];
+    socket.on('message', (d) => lines.push(String(d)));
+    socket.on('open', () => resolve({ socket, lines }));
+    socket.on('error', reject);
+  });
+}
+
+function waitFor(lines, predicate, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const timer = setInterval(() => {
+      const hit = lines.find(predicate);
+      if (hit) { clearInterval(timer); resolve(hit); }
+      else if (Date.now() - started > timeoutMs) {
+        clearInterval(timer);
+        reject(new Error(`timeout; lines: ${JSON.stringify(lines.slice(0, 10))}`));
+      }
+    }, 25);
+  });
+}
+
+describe('composition: every plugin on one server', () => {
+  let jss;
+  let base;
+  let wsBase;
+
+  after(async () => { if (jss) await jss.close(); });
+
+  it('boots pods + idp + six plugins from config', async () => {
+    const port = await probePort();
+    base = `http://127.0.0.1:${port}`;
+    wsBase = `ws://127.0.0.1:${port}`;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jss-compose-'));
+    jss = await startJss({
+      port,
+      root,
+      idp: true,
+      // Explicit ids: the <name>/plugin.js convention makes every basename
+      // reduce to 'plugin' — the loader's duplicate-id guard requires ids
+      // here (finding: derive from the parent dir for generic basenames).
+      plugins: [
+        { id: 'relay', module: at('relay/plugin.js'), prefix: '/relay' },
+        { id: 'webrtc', module: at('webrtc/plugin.js'), prefix: '/webrtc' },
+        { id: 'terminal', module: at('terminal/plugin.js'), prefix: '/terminal', config: { token: 'compose-secret' } },
+        { id: 'tunnel', module: at('tunnel/plugin.js'), prefix: '/tunnel' },
+        {
+          id: 'notifications',
+          module: at('notifications/plugin.js'),
+          prefix: '/.notifications',
+          config: { podsRoot: root, baseUrl: base },
+        },
+        { id: 'pay', module: at('pay/plugin.js'), prefix: '/paid', config: { cost: 2, address: 'x' } },
+      ],
+    });
+    assert.ok(jss.base);
+  });
+
+  it('relay: signed event round-trips', async () => {
+    const { socket, lines } = await openWs(`${wsBase}/relay`);
+    const event = finalizeEvent({ kind: 1, content: 'compose' }, generateSecretKey());
+    socket.send(JSON.stringify(['EVENT', event]));
+    await waitFor(lines, (l) => {
+      const m = JSON.parse(l);
+      return m[0] === 'OK' && m[1] === event.id && m[2] === true;
+    });
+    socket.close();
+  });
+
+  it('webrtc: content-addressed room relays an offer between peers', async () => {
+    // Anonymous content-addressed dialect (no credentials needed).
+    const room = 'a'.repeat(64); // hex hash "resource"
+    const a = await openWs(`${wsBase}/webrtc`);
+    const b = await openWs(`${wsBase}/webrtc`);
+    a.socket.send(JSON.stringify({ type: 'announce', resource: room, offers: [] }));
+    await waitFor(a.lines, (l) => JSON.parse(l).type === 'resource-peers');
+    b.socket.send(JSON.stringify({
+      type: 'announce', resource: room,
+      offers: [{ sdp: 'compose-offer', offer_id: 'o1' }],
+    }));
+    await waitFor(a.lines, (l) => {
+      const m = JSON.parse(l);
+      return m.type === 'offer' && m.offer_id === 'o1';
+    });
+    a.socket.close();
+    b.socket.close();
+  });
+
+  it('terminal: token-gated shell echoes', async () => {
+    const socket = new WebSocket(`${wsBase}/terminal?token=compose-secret`);
+    let buf = '';
+    socket.on('message', (d) => { buf += String(d); });
+    await new Promise((resolve, reject) => {
+      socket.on('open', resolve);
+      socket.on('error', reject);
+    });
+    await new Promise((r) => setTimeout(r, 400)); // let the shell spawn
+    socket.send('echo compose-ok\n');
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error(`no echo; got ${JSON.stringify(buf)}`)), 5000);
+      const iv = setInterval(() => {
+        if (buf.includes('compose-ok')) { clearTimeout(t); clearInterval(iv); resolve(); }
+      }, 25);
+    });
+    socket.close();
+  });
+
+  it('notifications: pod write fans out to a subscriber', async () => {
+    fs.writeFileSync(
+      path.join(jss.root, 'note.txt.acl'),
+      `@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+@prefix foaf: <http://xmlns.com/foaf/0.1/>.
+<#public> a acl:Authorization; acl:agentClass foaf:Agent;
+  acl:accessTo <./note.txt>; acl:mode acl:Read.
+`,
+    );
+    const { socket, lines } = await openWs(`${wsBase}/.notifications`);
+    await waitFor(lines, (l) => l === 'protocol solid-0.1');
+    socket.send(`sub ${base}/note.txt`);
+    await waitFor(lines, (l) => l === `ack ${base}/note.txt`);
+    fs.writeFileSync(path.join(jss.root, 'note.txt'), 'hello');
+    await waitFor(lines, (l) => l === `pub ${base}/note.txt`);
+    socket.close();
+  });
+
+  it('pay: 402 then paid content', async () => {
+    let res = await fetch(`${base}/paid/demo`);
+    assert.strictEqual(res.status, 402);
+    res = await fetch(`${base}/paid/demo`, { headers: { 'x-payment-proof': 'demo-proof-of-payment' } });
+    assert.strictEqual(res.status, 200);
+  });
+
+  it('pods still work beside all of it (idp register + WAC)', async () => {
+    let res = await fetch(`${base}/idp/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'composer', password: 'compose-pass', confirmPassword: 'compose-pass' }),
+    });
+    assert.ok(res.status < 400, `register: ${res.status}`);
+    res = await fetch(`${base}/composer/private/x`, { method: 'PUT', body: 'nope' });
+    assert.ok([401, 403].includes(res.status), `WAC: ${res.status}`);
+  });
+});

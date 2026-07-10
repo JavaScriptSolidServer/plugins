@@ -28,17 +28,19 @@ const fastify = createServer({
   root: PODS,
   idp: true,
   idpIssuer: PUBLIC_URL,
+  // Explicit ids — the <name>/plugin.js convention collides on basename.
   plugins: [
-    { module: at('relay/plugin.js'), prefix: '/relay' },
-    { module: at('webrtc/plugin.js'), prefix: '/webrtc' },
-    { module: at('terminal/plugin.js'), prefix: '/.terminal', config: { token: terminalToken } },
-    { module: at('tunnel/plugin.js'), prefix: '/tunnel' },
+    { id: 'relay', module: at('relay/plugin.js'), prefix: '/relay' },
+    { id: 'webrtc', module: at('webrtc/plugin.js'), prefix: '/webrtc' },
+    { id: 'terminal', module: at('terminal/plugin.js'), prefix: '/terminal', config: { token: terminalToken } },
+    { id: 'tunnel', module: at('tunnel/plugin.js'), prefix: '/tunnel' },
     {
+      id: 'notifications',
       module: at('notifications/plugin.js'),
       prefix: '/.notifications',
       config: { podsRoot: PODS, baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` },
     },
-    { module: at('pay/plugin.js'), prefix: '/paid', config: { cost: 1, address: 'demo' } },
+    { id: 'pay', module: at('pay/plugin.js'), prefix: '/paid', config: { cost: 1, address: 'demo' } },
   ],
 });
 
@@ -54,7 +56,7 @@ console.log(`jss + every plugin up at ${PUBLIC_URL}`);
 console.log(`  pods:           ${PUBLIC_URL}/idp/register`);
 console.log(`  relay:          ws  ${PUBLIC_URL}/relay`);
 console.log(`  webrtc:         ws  ${PUBLIC_URL}/webrtc`);
-console.log(`  terminal:       ws  ${PUBLIC_URL}/.terminal?token=${terminalToken}`);
+console.log(`  terminal:       ws  ${PUBLIC_URL}/terminal?token=${terminalToken}`);
 console.log(`  tunnel:         ws  ${PUBLIC_URL}/tunnel`);
 console.log(`  notifications:  ws  ${PUBLIC_URL}/.notifications`);
 console.log(`  paid demo:      GET ${PUBLIC_URL}/paid/demo`);

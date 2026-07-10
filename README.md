@@ -38,18 +38,24 @@ A plugin directory may import:
 without internals, that gap is the finding — document it in the port's
 README and NOTES.md, ship the closest honest approximation.
 
-## Layout
+## What's here
+
+| Plugin | Ports | Status | Notable |
+|---|---|---|---|
+| `relay/` | `src/nostr/relay.js` | ✅ parity + | pluginDir persistence core lacks; vendored NIP-01 verify |
+| `webrtc/` | `src/webrtc/index.js` | ✅ full parity | **zero imports** — `activate(api)` alone sufficed; fixes an auth race core has |
+| `terminal/` | `src/terminal/index.js` | ✅ parity + hardened | mandatory access control, minimal child env, confined cwd |
+| `tunnel/` | `src/tunnel/` | ✅ parity | one deviation: single-prefix forces `{prefix}/connect` control path |
+| `notifications/` | `src/notifications/` | ✅ parity | **the seam-forcer** — WAC via loopback; forces `api.events`, `api.serverInfo` |
+| `pay/` | pay mode | 📋 wall-report | pipeline-modifying → **stays core**; draws the #564 line |
+
+39 tests, all green (`npm test`), including `compose.test.js` — every plugin
+on one server from pure config. Findings consolidated in [NOTES.md](./NOTES.md).
 
 ```
-relay/           NIP-01 nostr relay              (port of src/nostr/relay.js)
-webrtc/          WebRTC signaling rooms          (port of src/webrtc/index.js)
-terminal/        WebSocket shell — GATED         (port of src/terminal/index.js)
-tunnel/          reverse tunnel over WebSocket   (port of src/tunnel/)
-notifications/   pod change notifications        (port of src/notifications/ — the seam-forcer)
-pay/             HTTP 402 paid routes            (port of src/mrc20.js pay mode — wall-report)
-compose.test.js  ONE server, every plugin, from pure config
-serve.js         demo composition
-NOTES.md         findings log: what the api gave us, what it didn't
+<name>/plugin.js   the port          <name>/test.js   real-JSS tests   <name>/README.md   findings
+compose.test.js    ONE server, every plugin           serve.js         demo composition
+helpers.js         test harness (boot JSS from npm)    NOTES.md         consolidated findings
 ```
 
 Each directory: `plugin.js` (exports `activate(api)`), `test.js` (boots a

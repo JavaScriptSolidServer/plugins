@@ -310,7 +310,9 @@ export async function activate(api) {
         return reply.code(502).send({ error: 'Bad Gateway', message: 'Tunnel not connected' });
       }
 
-      return reply.redirect(308, `${prefix}/${name}/`);
+      // (new-signature redirect; core's redirect(308, url) form is
+      // deprecated on the Fastify 4 the host ships)
+      return reply.redirect(`${prefix}/${name}/`, 308);
     });
   });
 
