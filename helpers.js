@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createServer } from 'javascript-solid-server/src/server.js';
 
-function probePort() {
+export function probePort() {
   return new Promise((resolve, reject) => {
     const probe = net.createServer();
     probe.once('error', reject);
@@ -29,7 +29,10 @@ function probePort() {
 export async function startJss({ plugins, ...opts } = {}) {
   const root = opts.root ?? fs.mkdtempSync(path.join(os.tmpdir(), 'jss-plugins-test-'));
   delete opts.root;
-  const port = await probePort();
+  // A fixed port lets configs reference the server's own origin (some
+  // plugins need it — see notifications; finding: api.serverInfo).
+  const port = opts.port ?? await probePort();
+  delete opts.port;
   const fastify = createServer({
     logger: false,
     forceCloseConnections: true,
