@@ -92,14 +92,15 @@ README and NOTES.md, ship the closest honest approximation.
 | `shortlink/` | — | link shortener for pod URLs (deliberately not an open redirector) |
 | `admin/` | — | **the capstone**: wp-admin-style operator home; each missing pillar names its seam |
 
-**374 tests, all green** (`npm test`), including `compose.test.js` — all
+**386 tests, all green** (`npm test`), including `compose.test.js` — all
 thirty-three plugins on one server from pure config, pods + WAC intact
 beside them. Findings consolidated in [NOTES.md](./NOTES.md); the full
 plugin-tagged backlog triaged in [ISSUES.md](./ISSUES.md); the build guide
 is [AGENT.md](./AGENT.md); the maintainer-facing summary — what to add
 to the api next, ranked, with evidence — is [REPORT.md](./REPORT.md);
 where this sits in the ecosystem and the realistic play is
-[STRATEGY.md](./STRATEGY.md).
+[STRATEGY.md](./STRATEGY.md); the four-axis security review and its
+outcomes is [SECURITY.md](./SECURITY.md).
 
 ```
 <name>/plugin.js   the port          <name>/test.js   real-JSS tests   <name>/README.md   findings

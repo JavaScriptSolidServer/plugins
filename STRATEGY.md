@@ -98,7 +98,10 @@ square can be an opportunity or a kill zone; this one has been both.
 3. **Identity UX** — WebID/bearer beats passwords technically and loses
    at onboarding every time.
 4. **Trust signals** — 0.0.x versioning; no third-party-plugin security
-   story (and plugins can intercept each other today — NOTES.md #9).
+   story (and plugins can intercept each other today — NOTES.md #9). A
+   first four-axis internal audit is done ([SECURITY.md](./SECURITY.md))
+   and the WAC-deferral pattern held, but third-party-plugin sandboxing
+   and signing remain open.
 5. **Bodies** — one maintainer + agents vs. twenty-year communities.
    (But see "what changed", point 3.)
 
