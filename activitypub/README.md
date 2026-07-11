@@ -37,7 +37,7 @@ operator must widen WAC: `createServer({ appPaths: ['/ap'], … })`. See
 | `GET` | `/ap/<user>/actor` | ✅ done | AS2 `Person` + `publicKey.publicKeyPem` (RSA, per-actor, persisted) |
 | `GET` | `/ap/<user>/outbox` | ✅ done | `OrderedCollection`; `?page=true` → `OrderedCollectionPage` with `Create{Note}` items |
 | `POST` | `/ap/<user>/outbox` | ✅ done | owner-only (`api.auth.getAgent`); stores a Note in the pod via loopback PUT |
-| `POST` | `/ap/<user>/inbox` | ✅ done (store) | persists every activity; `Follow` records the follower; **inbound signature verify: Phase 2** |
+| `POST` | `/ap/<user>/inbox` | ✅ done (store) | persists every activity (bounded `maxInbox`); `Follow` records the follower (deduped); **inbound signature verify: Phase 2** — unauthenticated-by-design, so outbound delivery is SSRF-gated |
 | `GET` | `/ap/<user>/followers` | ✅ done | `OrderedCollection` from persisted state |
 | `GET` | `/ap/<user>/following` | ✅ done | `OrderedCollection` (empty in Phase 1 — no outbound Follow yet) |
 | — | outbound delivery signing | ✅ done (stretch) | `signAndDeliver` signs POSTs with the actor RSA key (draft-cavage); `Accept` to a follower, `Create` to followers on post — best-effort, non-blocking |
@@ -100,7 +100,37 @@ Signature.
   `node:crypto`) — core's own inbox even logs-but-doesn't-reject today — but
   it's deferred here: Phase 1 **stores** inbound activities unconditionally
   and documents the gap. No core seam is required to close it; it's scope, not
-  a wall.
+  a wall. **The inbox therefore remains unauthenticated-by-design in Phase 1.**
+
+### Hardening the unauthenticated inbox (SSRF + DoS gates)
+
+Because inbound signatures aren't verified yet, an anonymous `Follow` supplies
+an attacker-controlled `actor` URL that the server would otherwise fetch (to
+resolve a delivery inbox) and then POST to — a classic SSRF against cloud
+metadata / internal services — and an anonymous flood could grow the persisted
+state without bound. Those surfaces are now **gated** (the mitigation that
+stands in for signature verification until Phase 2):
+
+- **SSRF gate on all outbound delivery** (`fetchActorInbox` + `signAndDeliver`).
+  A port of `corsproxy/`'s guard: the target scheme must be `http`/`https`, the
+  hostname is resolved (`node:dns`), and delivery is **refused if any resolved
+  address is private/loopback/link-local (incl. `169.254.169.254`)/CGNAT/ULA/
+  unspecified**, failing **closed** on a resolution error. Redirects are
+  followed **manually** and re-validated per hop (never `redirect:'follow'`).
+  Default is **closed**; `config.allowPrivateDelivery: true` is a documented
+  escape hatch for local/loopback testing only.
+- **Bounded state.** The inbox log is trimmed to the most recent
+  `config.maxInbox` (default 500) on every write, and the followers ledger is
+  **deduped by actor id** (duplicate `Follow` spam can't grow it).
+- **Atomic persistence.** State and keypair writes go to a temp file then
+  `fs.renameSync` over the target, so a crash mid-write can't truncate the
+  followers ledger / keypair.
+- **Capped outbox walk.** `GET outbox` caps its loopback status-container walk
+  at `config.maxResources` (default 1000), like `backup/` + `sparql/`.
+- **No leaked sockets.** Delivery responses are drained/cancelled on every path.
+
+Config knobs (all default-safe): `allowPrivateDelivery` (default `false`),
+`maxInbox` (default `500`), `maxResources` (default `1000`).
 
 ## Findings
 

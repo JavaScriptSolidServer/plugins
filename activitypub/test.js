@@ -15,6 +15,8 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
+import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { probePort, startJss } from '../helpers.js';
@@ -50,7 +52,11 @@ describe('activitypub plugin', () => {
       // single prefix, and the loader WAC-exempts only that prefix. Keeping
       // everything under one /ap root means the operator exempts ONE path.
       appPaths: ['/ap'],
-      plugins: [{ module: module_, config: { baseUrl: base } }],
+      // NOTE: allowPrivateDelivery is deliberately NOT set — the instance runs
+      // the DEFAULT (closed) SSRF policy, so the loopback-actor test below
+      // exercises the real production default. maxInbox is lowered only so the
+      // flood test can cross the cap without thousands of requests.
+      plugins: [{ module: module_, config: { baseUrl: base, maxInbox: 20 } }],
     });
     const reg = await fetch(`${base}/idp/register`, {
       method: 'POST',
@@ -188,5 +194,89 @@ describe('activitypub plugin', () => {
       }),
     });
     assert.strictEqual(res.status, 200);
+  });
+
+  // ---- SECURITY REGRESSIONS -------------------------------------------------
+
+  // Path to the per-actor state file. No explicit `id` is passed for the entry,
+  // so the loader derives it from the module basename → 'plugin'; pluginDir is
+  // <root>/.plugins/<id>/ (see plugins.js), state lives under state/<user>.json.
+  const statePath = () => path.join(jss.root, '.plugins', 'plugin', 'state', `${USER}.json`);
+  const readState = () => JSON.parse(fs.readFileSync(statePath(), 'utf8'));
+
+  it('SSRF: a Follow with a private/loopback actor URL is refused delivery (default config)', async () => {
+    // Stand up a loopback "internal service" and count every hit. A default
+    // instance (allowPrivateDelivery unset) must NEVER fetch it: the actor URL
+    // resolves to 127.0.0.1, so fetchActorInbox is gated to null.
+    let hits = 0;
+    const internal = http.createServer((req, res) => {
+      hits += 1;
+      res.writeHead(200, { 'content-type': 'application/activity+json' });
+      res.end(JSON.stringify({ id: 'x', inbox: `http://127.0.0.1/inbox` }));
+    });
+    const iport = await probePort();
+    await new Promise((r) => internal.listen(iport, '127.0.0.1', r));
+    try {
+      const privateActor = `http://127.0.0.1:${iport}/users/attacker`;
+      const res = await fetch(`${base}/ap/${USER}/inbox`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/activity+json' },
+        body: JSON.stringify({
+          '@context': 'https://www.w3.org/ns/activitystreams',
+          id: `${privateActor}#follows/1`,
+          type: 'Follow',
+          actor: privateActor,
+          object: `${base}/ap/${USER}/actor`,
+        }),
+      });
+      // The inbox POST itself still succeeds (unauthenticated-by-design store)…
+      assert.strictEqual(res.status, 200);
+      // …but the SSRF gate meant the private host was never contacted.
+      await new Promise((r) => setTimeout(r, 150)); // let any (buggy) delivery fire
+      assert.strictEqual(hits, 0, `SSRF gate leaked: private host got ${hits} request(s)`);
+      // The follower is still recorded, but with no resolvable inbox.
+      const rec = readState().followers.find((f) => f.actor === privateActor);
+      assert.ok(rec, 'follower not recorded');
+      assert.ok(!rec.inbox, `expected no delivery inbox, got ${rec.inbox}`);
+    } finally {
+      await new Promise((r) => internal.close(r));
+    }
+  });
+
+  it('DoS: the inbox log stays bounded (maxInbox) when flooded past the cap', async () => {
+    // maxInbox is 20 for this instance; flood well past it and assert the
+    // persisted log is trimmed to the most recent N rather than growing forever.
+    for (let i = 0; i < 60; i++) {
+      await fetch(`${base}/ap/${USER}/inbox`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/activity+json' },
+        body: JSON.stringify({ type: 'Like', id: `urn:flood:${i}`, actor: REMOTE_FOLLOWER }),
+      });
+    }
+    const inbox = readState().inbox;
+    assert.ok(inbox.length <= 20, `inbox not bounded: ${inbox.length} > 20`);
+    // The trim keeps the newest entries (last flood id is present).
+    assert.ok(
+      inbox.some((e) => e.activity?.id === 'urn:flood:59'),
+      'newest flooded activity was trimmed away',
+    );
+  });
+
+  it('DoS: duplicate Follows do not grow the followers ledger', async () => {
+    const dupActor = 'https://remote.example/users/dupfollower';
+    const follow = () => fetch(`${base}/ap/${USER}/inbox`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/activity+json' },
+      body: JSON.stringify({
+        '@context': 'https://www.w3.org/ns/activitystreams',
+        id: `${dupActor}#follows/dup`,
+        type: 'Follow',
+        actor: dupActor,
+        object: `${base}/ap/${USER}/actor`,
+      }),
+    });
+    for (let i = 0; i < 5; i++) assert.strictEqual((await follow()).status, 200);
+    const count = readState().followers.filter((f) => f.actor === dupActor).length;
+    assert.strictEqual(count, 1, `duplicate Follows created ${count} ledger entries`);
   });
 });

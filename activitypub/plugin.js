@@ -45,6 +45,137 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import net from 'node:net';
+import { lookup } from 'node:dns/promises';
+
+// --------------------------------------------------------------- SSRF gate
+//
+// The inbox is unauthenticated-by-design in Phase 1 (inbound HTTP-Signature
+// verification is the Phase-2 boundary — see README), so a Follow's
+// attacker-controlled `actor` URL is fetched (to resolve the delivery inbox)
+// and later POSTed to. That is an SSRF surface. The mitigation, until real
+// signature verification lands, is this gate — a port of corsproxy/'s
+// private-address guard: outbound delivery targets must be http/https AND
+// every resolved address must be public (loopback/RFC1918/link-local incl.
+// the 169.254.169.254 cloud-metadata endpoint/CGNAT/ULA/unspecified are all
+// refused), failing CLOSED on any resolution error. A target that fails the
+// gate is skipped silently (delivery returns null) — the inbox POST itself
+// still succeeds so normal federation semantics are preserved.
+const V4_BLOCKED_CIDRS = [
+  '0.0.0.0/8', //        "this network" / unspecified
+  '10.0.0.0/8', //       RFC1918
+  '100.64.0.0/10', //    CGNAT
+  '127.0.0.0/8', //      loopback
+  '169.254.0.0/16', //   link-local (incl. 169.254.169.254 cloud metadata)
+  '172.16.0.0/12', //    RFC1918
+  '192.0.0.0/24', //     IETF protocol assignments
+  '192.0.2.0/24', //     TEST-NET-1
+  '192.168.0.0/16', //   RFC1918
+  '198.18.0.0/15', //    benchmarking
+  '198.51.100.0/24', //  TEST-NET-2
+  '203.0.113.0/24', //   TEST-NET-3
+  '224.0.0.0/4', //      multicast
+  '240.0.0.0/4', //      reserved + broadcast
+];
+
+function v4ToInt(ip) {
+  const [a, b, c, d] = ip.split('.').map(Number);
+  return ((a << 24) >>> 0) + (b << 16) + (c << 8) + d;
+}
+
+const V4_BLOCKED = V4_BLOCKED_CIDRS.map((cidr) => {
+  const [base, bits] = cidr.split('/');
+  const mask = (0xffffffff << (32 - Number(bits))) >>> 0;
+  return { base: (v4ToInt(base) & mask) >>> 0, mask };
+});
+
+function isPrivateV4(ip) {
+  const n = v4ToInt(ip);
+  if (!Number.isFinite(n)) return true; // malformed — fail closed
+  return V4_BLOCKED.some(({ base, mask }) => ((n & mask) >>> 0) === base);
+}
+
+/** Expand an IPv6 literal to its 8 16-bit groups (null when malformed). */
+function expandV6(ip) {
+  let addr = ip.split('%')[0].toLowerCase();
+  const dotted = addr.match(/(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (dotted) {
+    const [a, b, c, d] = dotted[1].split('.').map(Number);
+    addr = addr.slice(0, -dotted[1].length)
+      + ((a << 8) | b).toString(16) + ':' + ((c << 8) | d).toString(16);
+  }
+  const [headStr, tailStr = ''] = addr.split('::');
+  const head = headStr ? headStr.split(':') : [];
+  const tail = tailStr ? tailStr.split(':') : [];
+  const groups = addr.includes('::')
+    ? [...head, ...Array(Math.max(0, 8 - head.length - tail.length)).fill('0'), ...tail]
+    : head;
+  if (groups.length !== 8) return null;
+  const nums = groups.map((g) => parseInt(g || '0', 16));
+  return nums.some((n) => !Number.isFinite(n) || n < 0 || n > 0xffff) ? null : nums;
+}
+
+function isPrivateV6(ip) {
+  const g = expandV6(ip);
+  if (!g) return true; // malformed — fail closed
+  const zeroThrough = (i) => g.slice(0, i).every((n) => n === 0);
+  const embeddedV4 = () => `${g[6] >> 8}.${g[6] & 0xff}.${g[7] >> 8}.${g[7] & 0xff}`;
+  if (zeroThrough(5) && g[5] === 0xffff) return isPrivateV4(embeddedV4()); // ::ffff:v4
+  if (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every((n) => n === 0)) {
+    return isPrivateV4(embeddedV4()); // 64:ff9b::/96 NAT64
+  }
+  if (g.every((n) => n === 0)) return true; //                :: unspecified
+  if (zeroThrough(7) && g[7] === 1) return true; //           ::1 loopback
+  if ((g[0] & 0xfe00) === 0xfc00) return true; //             fc00::/7 ULA
+  if ((g[0] & 0xffc0) === 0xfe80) return true; //             fe80::/10 link-local
+  if ((g[0] & 0xffc0) === 0xfec0) return true; //             fec0::/10 site-local
+  if (g[0] === 0x2001 && g[1] === 0x0db8) return true; //     2001:db8::/32 documentation
+  return false;
+}
+
+function isPrivateIp(ip) {
+  const kind = net.isIP(ip);
+  if (kind === 4) return isPrivateV4(ip);
+  if (kind === 6) return isPrivateV6(ip);
+  return true; // not an IP literal — fail closed
+}
+
+/** True only if hostname resolves and EVERY address is public. Fail closed. */
+async function resolvesToPublic(hostname) {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (net.isIP(host)) return !isPrivateIp(host);
+  let records;
+  try { records = await lookup(host, { all: true, verbatim: true }); }
+  catch { return false; } // unresolvable — fail closed
+  if (!records?.length) return false; // zero addresses — fail closed
+  return records.every(({ address }) => !isPrivateIp(address));
+}
+
+/**
+ * Fetch a delivery target behind the SSRF gate. Scheme must be http/https and
+ * (unless cfg.allowPrivateDelivery) every resolved hop must be public.
+ * Redirects are followed MANUALLY and each hop is re-validated (redirect:
+ * 'follow' would let a public URL 302 to 169.254.169.254). Returns the
+ * Response, or null if the target is refused / unreachable — callers treat
+ * null as "skip delivery". The caller owns consuming res.body.
+ */
+async function gatedFetch(startUrl, init, cfg, { follow = true, maxHops = 5 } = {}) {
+  let current;
+  try { current = new URL(String(startUrl).replace(/#.*$/, '')); }
+  catch { return null; }
+  for (let hop = 0; ; hop++) {
+    if (current.protocol !== 'http:' && current.protocol !== 'https:') return null;
+    if (!cfg.allowPrivateDelivery && !(await resolvesToPublic(current.hostname))) return null;
+    let res;
+    try { res = await fetch(current, { ...init, redirect: 'manual' }); }
+    catch { return null; }
+    const location = res.headers.get('location');
+    if (res.status < 300 || res.status >= 400 || !location || !follow || hop >= maxHops) return res;
+    await res.body?.cancel().catch(() => {}); // drop the redirect body before the next hop
+    try { current = new URL(location, current); }
+    catch { return null; }
+  }
+}
 
 const AS_CONTEXT = 'https://www.w3.org/ns/activitystreams';
 const SEC_CONTEXT = 'https://w3id.org/security/v1';
@@ -107,6 +238,36 @@ export async function activate(api) {
   fs.mkdirSync(keysDir, { recursive: true });
   fs.mkdirSync(stateDir, { recursive: true });
 
+  // Hardening knobs (all default-safe; see README "Findings"):
+  //  - allowPrivateDelivery: default FALSE — outbound delivery to
+  //    private/loopback/link-local targets is refused (SSRF gate). Set true
+  //    ONLY for local testing against a loopback inbox.
+  //  - maxInbox:    cap the persisted inbox log (unauthenticated writers can
+  //    otherwise grow it without bound → disk/CPU DoS).
+  //  - maxResources: cap the loopback status walk in GET outbox (matches
+  //    backup/ + sparql/).
+  const cfg = {
+    allowPrivateDelivery: api.config.allowPrivateDelivery === true, // default closed
+    maxInbox: Number.isFinite(api.config.maxInbox) && api.config.maxInbox > 0
+      ? api.config.maxInbox : 500,
+    maxResources: Number.isFinite(api.config.maxResources) && api.config.maxResources > 0
+      ? api.config.maxResources : 1000,
+  };
+
+  // Crash-safe write: land the bytes in a temp file, then atomically rename
+  // over the target (atomic on the same fs). A crash mid-write can no longer
+  // truncate the followers ledger / keypair — the old file survives intact.
+  function writeFileAtomic(file, data) {
+    const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+    try {
+      fs.writeFileSync(tmp, data);
+      fs.renameSync(tmp, file);
+    } catch (e) {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+      throw e;
+    }
+  }
+
   // --------------------------------------------------------------- helpers
   const cors = (reply) => reply
     .header('access-control-allow-origin', '*')
@@ -143,7 +304,7 @@ export async function activate(api) {
       privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
     });
     const kp = { publicKey, privateKey };
-    fs.writeFileSync(file, JSON.stringify(kp, null, 2));
+    writeFileAtomic(file, JSON.stringify(kp, null, 2));
     return kp;
   }
 
@@ -154,7 +315,7 @@ export async function activate(api) {
     catch { return emptyState(); }
   }
   function saveState(user, state) {
-    fs.writeFileSync(path.join(stateDir, `${user}.json`), JSON.stringify(state, null, 2));
+    writeFileAtomic(path.join(stateDir, `${user}.json`), JSON.stringify(state, null, 2));
   }
 
   // ---- the actor document (AS2 Person + security context) ----------------
@@ -209,10 +370,15 @@ export async function activate(api) {
       if (res.ok) {
         const container = await res.json();
         const contains = [].concat(container.contains ?? []);
+        let fetched = 0;
         for (const child of contains) {
+          // Cap the loopback walk so a huge status container can't turn one
+          // GET outbox into an unbounded fan-out (matches backup/ + sparql/).
+          if (fetched >= cfg.maxResources) break;
           const cid = typeof child === 'string' ? child : child['@id'];
           const m = cid && /\/([0-9]+)\.jsonld$/.exec(cid);
           if (!m) continue;
+          fetched += 1;
           const noteRes = await lb(`/${user}/${STATUS_DIR}/${m[1]}.jsonld`, {
             headers: { accept: 'application/ld+json' }, auth,
           });
@@ -250,26 +416,40 @@ export async function activate(api) {
       .sign(kp.privateKey, 'base64');
     const sig = `keyId="${keyId(user)}",algorithm="rsa-sha256",`
       + `headers="(request-target) host date digest content-type",signature="${signature}"`;
-    return fetch(inboxUrl, {
+    // SSRF gate: the inbox URL came from an attacker-controlled actor doc, so
+    // it is validated (public target only, unless allowPrivateDelivery) before
+    // the POST. Redirects are NOT followed for delivery — a signed POST cannot
+    // be replayed to a re-signed target — a 3xx just fails the delivery. The
+    // response body is consumed on every path so no undici socket leaks.
+    const res = await gatedFetch(inboxUrl, {
       method: 'POST',
       headers: {
         host: u.host, date, digest, 'content-type': AP_CT,
         accept: AP_CT, signature: sig,
       },
       body,
-    });
+    }, cfg, { follow: false });
+    if (res) await res.body?.cancel().catch(() => {});
+    return res;
   }
 
-  /** Fetch a remote actor's inbox URL (for delivery). null on any failure. */
+  /**
+   * Fetch a remote actor's inbox URL (for delivery). null on any failure OR
+   * when the actor URL fails the SSRF gate (private/loopback/link-local),
+   * which is how a Follow with `actor: http://169.254.169.254/…` is refused.
+   * The response body is consumed on every path (no socket leak).
+   */
   async function fetchActorInbox(actorUrl) {
+    const res = await gatedFetch(actorUrl, { headers: { accept: AP_CT } }, cfg, { follow: true });
+    if (!res) return null;
+    if (!res.ok) { await res.body?.cancel().catch(() => {}); return null; }
     try {
-      const res = await fetch(String(actorUrl).replace(/#.*$/, ''), {
-        headers: { accept: AP_CT }, redirect: 'follow',
-      });
-      if (!res.ok) return null;
-      const doc = await res.json();
+      const doc = await res.json(); // consumes the body
       return doc.inbox || doc.endpoints?.sharedInbox || null;
-    } catch { return null; }
+    } catch {
+      await res.body?.cancel().catch(() => {});
+      return null;
+    }
   }
 
   // ================================================================= routes
@@ -370,9 +550,14 @@ export async function activate(api) {
 
     // Phase 1: storing needs no crypto. Inbound HTTP Signature VERIFICATION
     // (fetch the sender's actor key, verify the signature) is the Phase-2
-    // boundary — see README. We persist every activity to the inbox log.
+    // boundary — see README. The inbox therefore remains UNAUTHENTICATED BY
+    // DESIGN in Phase 1; the SSRF gate on outbound delivery (fetchActorInbox /
+    // signAndDeliver) plus the caps below (maxInbox trim, follower dedupe) are
+    // the mitigation for the abuse surface that opens. We persist every
+    // activity to the inbox log, bounded to the most recent cfg.maxInbox.
     const state = loadState(user);
     state.inbox.push({ receivedAt: new Date().toISOString(), activity });
+    if (state.inbox.length > cfg.maxInbox) state.inbox = state.inbox.slice(-cfg.maxInbox);
 
     if (activity.type === 'Follow') {
       const follower = typeof activity.actor === 'string' ? activity.actor : activity.actor?.id;
