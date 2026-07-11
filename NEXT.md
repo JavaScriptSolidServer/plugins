@@ -34,13 +34,71 @@ plugin), `NOTES.md` (the findings/seams — the real deliverable), and
    (`@noble/curves`, `ws`), and `javascript-solid-server/auth.js`. **Never
    `javascript-solid-server/src/...`.** A wall you can't cross without an
    internal *is a finding* — document it, approximate honestly, move on.
-2. **Do NOT modify the JavaScriptSolidServer core repo** (no commits,
-   branches, or PRs there). Everything goes in *this* repo. (The maintainer
-   set this explicitly. Two core PRs — #590 `api.mountApp`, #591
-   `/idp/refresh` — are already open and awaiting their call; leave them.)
+2. **The core-freeze is LIFTED (2026-07-11).** Core changes are now on the
+   table — the four seams from REPORT.md are filed (core #601–#604) and
+   #601 `api.serverInfo` is **merged** (core #605). Still: one seam per PR,
+   each independently evidenced, following core's convention (feature
+   branch → squash PR to `gh-pages` → version bump). Don't bundle; the
+   value of this experiment is that every seam is separately proven.
+   (Earlier waves ran under a strict no-core rule — that's why the plugins
+   are honest approximations; keep them that way until a seam actually
+   lands and is *published*.)
 3. Core is at `~/remote/github.com/JavaScriptSolidServer/JavaScriptSolidServer`,
-   pinned to 0.0.215 on `gh-pages`. You may **read** it for reference; keep
-   it clean.
+   at 0.0.217 on `gh-pages` (serverInfo merged on top, unversioned as of
+   writing). This repo still consumes the **published npm** JSS, pinned
+   `^0.0.215` — see the Stage-3 plan below for why that pin blocks
+   consuming merged-but-unpublished seams.
+
+## Stage 3: consuming the merged seams (the upstream loop)
+
+The point of filing the seams was never the issues — it's closing the
+loop: **seam lands in core → plugins get simpler/faithful, proven**.
+`api.serverInfo` (#601) is merged (#605); this is how to consume it. The
+same shape applies to each seam as it lands.
+
+### What `serverInfo` gives you
+
+`api.serverInfo() → { baseUrl, protocol, host, port, listening }`. A
+**function**, called lazily (per-request or in an `onListen` hook via
+`api.fastify`) — *not* cached at activate, because with an ephemeral port
+the real port only exists after listen. `idpIssuer` wins as the canonical
+public `baseUrl`. One call collapses **both** config values most plugins
+carry: `.baseUrl` replaces the public-origin config, and
+`http://${host}:${port}` replaces `loopbackUrl` (the callable bind).
+
+### Two blockers before a retrofit can go green
+
+1. **Not published.** #605 merged but didn't bump the version — core is
+   still 0.0.217 and npm has 0.0.215. serverInfo exists only on the branch.
+   Core must bump → `npm publish` (say 0.0.218) first.
+2. **The pin is a trap.** This repo pins `^0.0.215`, and **caret on a
+   `0.0.x` version locks to the exact patch** (`^0.0.215` = `>=0.0.215
+   <0.0.216`, i.e. *only* 0.0.215 — which is why we're still on 215 despite
+   216/217 shipping). Publishing 0.0.218 is **not** enough; the dependency
+   string itself must change to `^0.0.218`/`0.0.218`, then `npm install`.
+   Miss this and it looks like "the seam isn't there" when it's the range.
+
+To validate *before* a publish: `npm link` (or a `file:` dep) against the
+local core tree on a throwaway branch, then flip to the real version once
+it's out.
+
+### The retrofit is NOT a find-replace
+
+Plugins that capture `baseUrl`/`loopbackUrl` at activate and `throw` if
+missing (the fail-loud pattern) must **move the `serverInfo()` call to
+request time** — at activate the port may be unresolved. Keep
+`config.baseUrl` as an *optional override* where a plugin genuinely needs
+a public origin different from the server's (reverse-proxy edge cases),
+rather than deleting it everywhere.
+
+### Recommended first move
+
+Don't retrofit all ~16 at once. Do **`nip05/` + `webfinger/`** first — the
+two where a wrong origin fails *silently* (nip05 serves an empty identity
+map), so the before/after story is strongest. One plugins-repo PR against
+a locally-linked core, proving the loop closes; once core publishes, flip
+the pin and merge. The rest follow the same shape. Then the next seam:
+`reservePath` (#602) → `events` (#603) → `authorize` (#604).
 
 ## Wave 7 status
 
@@ -109,7 +167,9 @@ each. Current top four (keep this current as you add consumers):
    prefix and can't self-exempt; didweb needs a *parameterized* form.
    (micropub/ is the counter-witness: client-discovered endpoints need no
    reservation — the seam is about protocol-fixed paths.)
-4. **`api.serverInfo`** — broadest (~12 plugins hand-roll their origin).
+4. **`api.serverInfo`** — broadest (~16 plugins hand-roll their origin).
+   **FILED #601, MERGED as core #605** — see the Stage-3 plan above for
+   consuming it. reservePath #602, events #603, authorize #604 still open.
 
 Plus: the unconsumed-body-**stream** primitive (#583), `api.mcp.registerTool`
 (blocks the MCP-tool issues #495/#496/#500/#501), can't-set-server-options,
