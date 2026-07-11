@@ -46,7 +46,7 @@ describe('composition: every plugin on one server', () => {
 
   after(async () => { if (jss) await jss.close(); });
 
-  it('boots pods + idp + twenty-eight plugins from config', async () => {
+  it('boots pods + idp + thirty-one plugins from config', async () => {
     const port = await probePort();
     base = `http://127.0.0.1:${port}`;
     wsBase = `ws://127.0.0.1:${port}`;
@@ -95,6 +95,17 @@ describe('composition: every plugin on one server', () => {
         { id: 's3', module: at('s3/plugin.js'), prefix: '/s3', config: { baseUrl: base, loopbackUrl: base } },
         { id: 'micropub', module: at('micropub/plugin.js'), prefix: '/micropub', config: { baseUrl: base, loopbackUrl: base } },
         { id: 'backup', module: at('backup/plugin.js'), prefix: '/backup', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'oembed', module: at('oembed/plugin.js'), prefix: '/oembed', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'jmap', module: at('jmap/plugin.js'), prefix: '/jmap', config: { baseUrl: base, loopbackUrl: base } },
+        {
+          id: 'remotestorage',
+          module: at('remotestorage/plugin.js'),
+          prefix: '/remotestorage',
+          // webfinger/ already owns /.well-known/webfinger on this server —
+          // the witnessed collision (see remotestorage/README.md) — so this
+          // instance stands down and serves only its own-prefix JRD.
+          config: { baseUrl: base, loopbackUrl: base, claimWellKnown: false },
+        },
         { id: 'metrics', module: at('metrics/plugin.js'), prefix: '/metrics', config: { loopbackUrl: base } },
         {
           id: 'dashboard',
@@ -308,6 +319,23 @@ describe('composition: every plugin on one server', () => {
   it('backup: bare GET is 400 with usage (no whole-server export)', async () => {
     const res = await fetch(`${base}/backup`);
     assert.strictEqual(res.status, 400);
+  });
+
+  it('oembed: missing url is 400 (endpoint alive, never fetches external)', async () => {
+    const res = await fetch(`${base}/oembed`);
+    assert.strictEqual(res.status, 400);
+  });
+
+  it('jmap: anonymous session is 401; /.well-known/jmap redirects to it', async () => {
+    let res = await fetch(`${base}/jmap/session`);
+    assert.strictEqual(res.status, 401);
+    res = await fetch(`${base}/.well-known/jmap`, { redirect: 'manual' });
+    assert.strictEqual(res.status, 301);
+  });
+
+  it('remotestorage: own-prefix webfinger answers (well-known stood down to webfinger/)', async () => {
+    const res = await fetch(`${base}/remotestorage/webfinger`);
+    assert.strictEqual(res.status, 400); // missing ?resource — endpoint alive
   });
 
   it('metrics: healthz is ok and the exposition names the process gauges', async () => {

@@ -39,9 +39,13 @@ evidence. Legend:
 | — | `backup/` | pod → `.tar.gz` export (incremental backup → 🔩 `api.events`) |
 | — | `metrics/` | `/healthz` + Prometheus exporter (core-pipeline metrics → 🔩 gated hooks) |
 | — | `dashboard/` | plugin status page (sibling discovery → 🔩 app-registry #463/#464) |
+| — | `oembed/` | oEmbed provider (discovery injection → 🔩 header/content hooks) |
+| — | `jmap/` | JMAP mail over the pod (push/delta → 🔩 `api.events`; blobs → 🔩 #583) |
+| #163 | `remotestorage/` | remoteStorage server — 7th port; witnessed the webfinger collision |
 
-Plus six **ports of bundled features** proving the migration path for #564 /
-#164: `relay/` `webrtc/` `terminal/` `tunnel/` `notifications/`, and `pay/`
+Plus seven **ports of bundled features** proving the migration path for
+#564 / #164: `relay/` `webrtc/` `terminal/` `tunnel/` `notifications/`
+`remotestorage/`, and `pay/`
 (the wall-report — it can't be a plugin, which is the point).
 
 ## Shipped upstream this line of work 🚢
@@ -99,15 +103,17 @@ exists.
 
 ## Tally
 
-Of ~40 plugin-tagged issues: **13 built as plugins here** (plus `rss/`,
+Of ~40 plugin-tagged issues: **14 built as plugins here** (plus `rss/`,
 `matrix/`, `search/`, `didweb/`, `s3/`, `micropub/`, `backup/`, `metrics/`,
-`dashboard/` — capability
-demonstrations with no single issue), **6 ported**, **5 shipped upstream**,
+`dashboard/`, `oembed/`, `jmap/` — capability
+demonstrations with no single issue), **7 ported**, **5 shipped upstream**,
 **2 more plugin-able with no blocker**, **6 clusters blocked on a named
 seam** (each with a proof-of-need consumer), the rest core-by-nature or
-product-scale. **28 plugins total, 282 tests.** The plugin api reaches most
+product-scale. **31 plugins total, 332 tests.** The plugin api reaches most
 of the backlog today; ranked by demand, the seams that would unlock the
-most next are `api.authorize` (3 blocking consumers), `api.events` (5
-consumers — matrix `/sync` needs live push, backup can only pull-on-demand),
-`api.reservePath` (API-shims + didweb's parameterized case), and
-`api.serverInfo` (broadest: ~12 plugins hand-roll their own origin).
+most next are `api.authorize` (3 blocking consumers), `api.events` (7
+consumers — matrix `/sync` needs live push, jmap can't do push or delta
+sync, backup can only pull-on-demand),
+`api.reservePath` (API-shims + didweb's parameterized case + the
+**witnessed** webfinger collision), and
+`api.serverInfo` (broadest: ~16 plugins hand-roll their own origin).

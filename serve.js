@@ -66,6 +66,11 @@ const fastify = createServer({
     { id: 's3', module: at('s3/plugin.js'), prefix: '/s3', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
     { id: 'micropub', module: at('micropub/plugin.js'), prefix: '/micropub', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
     { id: 'backup', module: at('backup/plugin.js'), prefix: '/backup', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    { id: 'oembed', module: at('oembed/plugin.js'), prefix: '/oembed', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    { id: 'jmap', module: at('jmap/plugin.js'), prefix: '/jmap', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    // webfinger/ above owns /.well-known/webfinger — the witnessed collision
+    // (remotestorage/README.md) — so remotestorage stands down here.
+    { id: 'remotestorage', module: at('remotestorage/plugin.js'), prefix: '/remotestorage', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}`, claimWellKnown: false } },
     { id: 'metrics', module: at('metrics/plugin.js'), prefix: '/metrics', config: { loopbackUrl: `http://127.0.0.1:${PORT}`, ...(process.env.METRICS_TOKEN ? { token: process.env.METRICS_TOKEN } : {}) } },
     {
       id: 'dashboard',
@@ -95,6 +100,9 @@ const fastify = createServer({
           { id: 's3', probe: '/s3/bucket/key', expect: [403] },
           { id: 'micropub', probe: '/micropub?q=config', expect: [200] },
           { id: 'backup', probe: '/backup', expect: [400] },
+          { id: 'oembed', probe: '/oembed', expect: [400] },
+          { id: 'jmap', probe: '/jmap/session', expect: [401] },
+          { id: 'remotestorage', probe: '/remotestorage/webfinger', expect: [400] },
           { id: 'metrics', probe: '/metrics/healthz', expect: [200] },
         ],
       },
@@ -138,5 +146,8 @@ console.log(`  did:web:        GET ${PUBLIC_URL}/.well-known/did.json`);
 console.log(`  s3:             ${PUBLIC_URL}/s3/<bucket>/<key>  (aws-cli/rclone, SigV4)`);
 console.log(`  micropub:       POST ${PUBLIC_URL}/micropub  (IndieWeb clients; pod bearer as token)`);
 console.log(`  backup:         GET ${PUBLIC_URL}/backup/<pod>/  → .tar.gz of what you can read`);
+console.log(`  oembed:         GET ${PUBLIC_URL}/oembed?url=<pod-resource-url>  (link unfurling)`);
+console.log(`  jmap:           GET ${PUBLIC_URL}/jmap/session  (JMAP mail over the pod)`);
+console.log(`  remotestorage:  ${PUBLIC_URL}/remotestorage/<user>/<category>/…  (rS clients)`);
 console.log(`  metrics:        GET ${PUBLIC_URL}/metrics/healthz | /metrics/metrics  (Prometheus${process.env.METRICS_TOKEN ? ', token-guarded' : ''})`);
 console.log(`  dashboard:      GET ${PUBLIC_URL}/dashboard/  (live plugin status)`);

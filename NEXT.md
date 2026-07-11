@@ -8,18 +8,19 @@ plugin), `NOTES.md` (the findings/seams — the real deliverable), and
 
 ## Where things stand
 
-- **28 plugins, 282 tests, all green** (`npm test`), all pushed to
+- **31 plugins, 332 tests, all green** (`npm test`), all pushed to
   `github.com/JavaScriptSolidServer/plugins` (branch `gh-pages`).
-- `compose.test.js` boots all 28 on **one** JSS from pure config; `serve.js`
+- `compose.test.js` boots all 31 on **one** JSS from pure config; `serve.js`
   is the runnable demo. Both must be updated when you add a plugin.
-- Built so far: 6 ports (relay, webrtc, terminal, tunnel, notifications,
-  pay) + 22 features (nip05, corsproxy, capability, webdav, sparql,
-  gitscratch, otp, carddav, mastodon, bluesky, caldav, webfinger,
+- Built so far: 7 ports (relay, webrtc, terminal, tunnel, notifications,
+  remotestorage, pay) + 24 features (nip05, corsproxy, capability, webdav,
+  sparql, gitscratch, otp, carddav, mastodon, bluesky, caldav, webfinger,
   activitypub, rss, matrix, search, didweb, s3, micropub, backup,
-  metrics, dashboard).
+  metrics, dashboard, oembed, jmap).
 - Capability classes covered: realtime, WebDAV family, fediverse/social/chat
   (5 shims), IndieWeb publishing, identity, data/query/search, object
-  storage, proxy, dev, pay, data portability, ops/observability.
+  storage, proxy, dev, pay, data portability, ops/observability, mail,
+  link-embeds, remoteStorage.
 - **REPORT.md exists** — the maintainer-facing summary (ranked seams, each
   fileable nearly verbatim). Keep its consumer counts current as plugins
   land.
@@ -72,13 +73,13 @@ Verify each with `node --test --test-concurrency=1 <name>/test.js`, then:
 ## Wave 8+ backlog (unbuilt ideas, roughly by value)
 
 Still genuinely plugin-shaped and distinct:
-- **JMAP** email API over pod messages (HTTP/JSON, unlike stateful IMAP).
-- **oEmbed** provider for pod resources (link unfurling).
 - **feed ingest** — subscribe to external RSS/Atom, store items in the pod
-  (the inverse of `rss/`; uses a corsproxy-style fetch).
-- **link-shortener**, **WebSub/PubSubHubbub** (needs `api.events`),
+  (the inverse of `rss/`; uses a corsproxy-style fetch — outbound fetches:
+  same careful-session caveat as webhooks/webmention).
+- **link-shortener**, **WebSub/PubSubHubbub** (needs `api.events` +
+  outbound POSTs — deferred),
   **SPARQL UPDATE** (extends `sparql/`), **CalDAV scheduling/free-busy**
-  (extends `caldav/`), **remoteStorage** (another bundled-feature port).
+  (extends `caldav/`).
 - **Bluesky/Mastodon/Matrix Phase-2** (federation, `/sync` live push) —
   these are blocked on `api.events` + `api.reservePath`; good once those
   seams exist, otherwise document the wall.

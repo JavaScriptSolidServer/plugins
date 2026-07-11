@@ -1,4 +1,4 @@
-# The plugin api, 28 plugins later — a report for the maintainer
+# The plugin api, 31 plugins later — a report for the maintainer
 
 This document is the actionable summary of the whole experiment: what the
 #206 plugin api can already do, what it can't, and — ranked with evidence —
@@ -14,11 +14,14 @@ want it.
 ## Executive summary
 
 - The api as shipped in 0.0.215 (`createServer({ plugins })` + `prefix` +
-  `getAgent` + `pluginDir` + `ws.route`) is **sufficient for 28 real
-  plugins across twelve capability classes** — realtime, DAV,
+  `getAgent` + `pluginDir` + `ws.route`) is **sufficient for 31 real
+  plugins across fifteen capability classes** — realtime, DAV,
   fediverse/chat shims, IndieWeb publishing, identity, query/search,
   object storage, proxy, dev tooling, pay, data portability,
-  ops/observability — with zero core changes.
+  ops/observability, mail (JMAP), link-embeds (oEmbed), remoteStorage —
+  with zero core changes. Seven of those are ports of bundled features;
+  remoteStorage in particular still ships always-on in core and could
+  move out-of-tree behind the loader.
 - Of the ~40 `plugin`-tagged backlog issues, **13 are built here**, 6
   bundled features are ported, 5 shipped upstream during this line of work,
   2 more are unblocked, and **6 clusters are blocked on exactly four
@@ -27,9 +30,10 @@ want it.
   `api.events.onResourceChange`, `api.reservePath`, and `api.serverInfo`.
   Adding the first three moves essentially every remaining plugin-shaped
   issue from "honest approximation" to "faithful implementation".
-- Three small loader/core bugs are worth fixing regardless
+- Four small loader/core bugs are worth fixing regardless
   (generic-basename id derivation; dotted-prefix WS validation;
-  `logger: false` breaking every plugin `onResponse` hook).
+  `logger: false` breaking every plugin `onResponse` hook; the loader's
+  error wrap dropping `err.code`).
 - One measured surprise: **plugins are not isolated from each other** —
   all entries share one Fastify register scope, so any plugin can hook
   every other plugin's routes (never core's). Worth a deliberate
@@ -53,9 +57,14 @@ Validated by use, not opinion:
    right contract; test suites lean on it.
 5. **The loopback pattern removes a class of seams.** A plugin that needs
    "would WAC allow this *for the requester*?" asks the server itself over
-   HTTP with the client's own credentials. Nine plugins run a whole data
-   plane this way. This is why `api.wac.check(agent, path, mode)` is *not*
-   on the ask list — only the cases loopback structurally can't cover are.
+   HTTP with the client's own credentials. A dozen plugins run a whole
+   data plane this way. This is why `api.wac.check(agent, path, mode)` is
+   *not* on the ask list — only the cases loopback structurally can't
+   cover are.
+6. **Conditional writes survive loopback intact** (measured by
+   `remotestorage/`): forwarded `If-Match`/`If-None-Match` are honored by
+   the host end-to-end (412 on stale, 304 on match, atomic). A protocol
+   that needs optimistic concurrency gets it for free.
 
 ## The seams to add, ranked by independent demand
 
@@ -87,14 +96,23 @@ into the loader's `api` object.
 
 ### 2. `api.events.onResourceChange(cb)` — every "react to writes" app
 
-**Consumers (five, rising sharpness):** `notifications/` (a miss = late
+**Consumers (seven, rising sharpness):** `notifications/` (a miss = late
 notification), `sparql/` (a miss = wrong query result), `search/` (stale
 results — the most user-visible), `matrix/` (its `/sync` long-poll needs
 live push; a stateless bridge can only do full-state sync without it),
 `backup/` (no change hook + no plugin-owned read authority means
 incremental and scheduled backup are both unbuildable — every backup is a
-caller-driven full crawl). Every unbuilt "react to writes" idea —
+caller-driven full crawl), `jmap/` (push and delta sync refused
+in-protocol: no `eventSourceUrl`, `cannotCalculateChanges`), and
+`remotestorage/` (descendant-version propagation needs a write-time
+index). Every unbuilt "react to writes" idea —
 webhooks, WebSub, write-time indexing — joins this list on day one.
+
+A sharpening from `jmap/` worth keeping: what makes a protocol bridgeable
+is not its domain but the absence of server push — JMAP (email redesigned
+stateless by the IETF) bridges with zero approximation where IMAP never
+could. This seam is exactly what turns the "stateless slice" of matrix,
+jmap, and remotestorage into full implementations.
 
 **Sketch:** `api.events.onResourceChange(({ path, method }) => {})`,
 fired post-commit on PUT/PATCH/DELETE. Core already has the emitter
@@ -120,12 +138,19 @@ outside its prefix, but only its one `prefix` is WAC-exempt:
   `appPaths` matches literal prefixes, so a **parameterized** reservation
   is the only fix (the DID method pins the URL; there's no fake root to
   escape to).
-- None of it has collision detection — a future core route at a
-  plugin-claimed path is a boot-time `FST_ERR_DUPLICATED_ROUTE`.
-- The counter-witness that sharpens the scope: `micropub/` is a protocol
-  shim that needed *no* reservation, because its endpoint is
-  client-discovered rather than protocol-fixed. The seam is for protocols
-  that pin absolute paths — not API shims per se.
+- Collision behavior is now **witnessed, both ways**: `webfinger/` and
+  `remotestorage/` both legitimately own parts of
+  `/.well-known/webfinger`. Load one order → boot fails with a wrapped
+  duplicate-route error (the loader drops `err.code`, bug 4 below); the
+  other order → the try/catch-guarded claimant **silently loses** its
+  links. Loud failure or silent loss — both wrong. For shared discovery
+  documents the reservation primitive isn't enough; a link/JRD registry
+  (`api.webfinger.addLink`) is the real fix.
+- The counter-witnesses that sharpen the scope: `micropub/` and `jmap/`
+  are protocol shims that needed *no* reservation, because their
+  endpoints are client-/session-discovered rather than protocol-fixed
+  (jmap's `/.well-known/jmap` rides the blanket exemption). The seam is
+  for protocols that pin absolute paths — not API shims per se.
 
 **Sketch:** `api.reservePath('/xrpc')`, `api.reservePath('/:user/did.json')`
 (or `paths: [...]` on the entry): loader WAC-exempts *and* claims each,
@@ -136,9 +161,9 @@ exists, moving it from operator config to plugin declaration.
 
 ### 4. `api.serverInfo` — the broadest, and the cheapest
 
-**~14 consumers** — every plugin that mints absolute URLs or loopbacks
+**~16 consumers** — every plugin that mints absolute URLs or loopbacks
 (the DAV family, the shims, rss, sparql, nip05, webfinger, notifications,
-micropub, backup, metrics, dashboard…)
+micropub, backup, metrics, dashboard, oembed, jmap, remotestorage…)
 repeats `baseUrl`/`loopbackUrl` in config today. A wrong value fails
 *quietly* (nip05 serves an empty map). Test suites all need a
 probe-port-then-boot dance for the same reason.
@@ -172,7 +197,7 @@ probe-port-then-boot dance for the same reason.
   Deliberately *not* asked for as a default-on hook: it's a bigger grant
   than route ownership. If ever, gate it: `capabilities: ['hooks']`.
 
-## Three loader/core bugs worth fixing regardless
+## Four loader/core bugs worth fixing regardless
 
 1. **Generic-basename id derivation.** Every plugin follows
    `<name>/plugin.js`, so every derived id is `plugin` and the (correct)
@@ -189,6 +214,11 @@ probe-port-then-boot dance for the same reason.
    which doesn't exist on Fastify's null logger; the per-request throw
    aborts the downstream hook chain, so plugin `onResponse` hooks never
    fire (found by `metrics/`). One-line guard fixes it.
+4. **The loader's activate-failure wrap drops `err.code`.** A route
+   collision inside `activate` surfaces as `plugin <id>: activate()
+   failed: <message>` with `FST_ERR_DUPLICATED_ROUTE` stripped — callers
+   can only string-match. Preserve `code` (or use `cause`) when
+   re-wrapping (found by `remotestorage/`).
 
 ## A measured surprise: plugins are not isolated from each other
 

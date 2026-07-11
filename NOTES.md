@@ -23,6 +23,12 @@ are candidates, each with a consumer in this repo attached.
   client's own credentials. Slower than an internal check but definitionally
   correct. This removes a whole class of would-be seams (`api.wac.check`)
   from the *necessary* list, leaving them merely *nice*.
+- **Conditional writes pass through loopback intact** (remotestorage/,
+  measured): `If-Match`/`If-None-Match` forwarded verbatim are honored by
+  the host end-to-end — stale `If-Match` PUT/DELETE → 412,
+  `If-None-Match: *` on an existing resource → 412 with the body proven
+  not to land, `If-None-Match` GET → 304. Atomic at the host; no
+  plugin-side conditional logic needed.
 
 ## Candidate seams (ranked by how many independent plugins demanded them)
 
@@ -38,8 +44,10 @@ ports reached for it without coordinating.
    #382), or a capability exercising the *issuer's* authority
    (capability #506). This is the most-requested seam and the one that
    moves the most backlog issues from "plugin-approximation" to "faithful".
-2. **`api.events.onResourceChange(cb)`** — **five consumers now:
-   notifications/, sparql/, search/, matrix/, backup/**, in rising
+2. **`api.events.onResourceChange(cb)`** — **seven consumers now:
+   notifications/, sparql/, search/, matrix/, backup/, jmap/,
+   remotestorage/** (plus oembed/ as a soft eighth: a write-time image-
+   dimension cache would replace per-unfurl byte parsing), in rising
    sharpness: notifications (a miss is a *late* notification), sparql (a
    miss is a *wrong* query result), search (a miss is *stale results*, the
    property users most expect to be fresh — the most user-visible
@@ -48,7 +56,11 @@ ports reached for it without coordinating.
    — so a stateless bridge can only do full-state `/sync` at all), and
    backup (with no change hook *and* no plugin-owned read authority,
    incremental and scheduled/server-initiated backup are both unbuildable —
-   every backup is a caller-driven full crawl). Core already has the
+   every backup is a caller-driven full crawl), jmap (JMAP push
+   (`eventSourceUrl`) and delta sync (`*/changes`, `Email/queryChanges`)
+   are omitted/refused in-protocol), and remotestorage (rS's
+   descendant-version propagation at depth ≥ 2 needs a write-time index).
+   Core already has the
    emitter internally (`src/notifications/events.js`); this is the seam
    every "react to pod writes" app (webhooks, indexing, sync, search, live
    chat) will want, and it's now clearly the #2 most-demanded after
@@ -56,7 +68,7 @@ ports reached for it without coordinating.
 3. **`api.serverInfo` (`{ baseUrl, port }` at listen)** — **a dozen+
    consumers: notifications/, webdav/, carddav/, caldav/, sparql/, rss/,
    nip05/, webfinger/, mastodon/, bluesky/, activitypub/, micropub/,
-   backup/** — essentially
+   backup/, dashboard/, oembed/, jmap/, remotestorage/** — essentially
    every plugin that mints absolute URLs or reaches the host over loopback.
    All repeat the origin in config today; a wrong value fails quietly (nip05
    serves an empty identity map). The single most *broadly* needed seam
@@ -65,7 +77,9 @@ ports reached for it without coordinating.
    gitscratch/ sharpened it; micropub/ adds a blocked one. tunnel/ needed
    the raw *buffer*; git needs the raw *stream* piped to a subprocess
    gzip-and-all; micropub's **media endpoint** (multipart file upload) is
-   simply not implemented until a plugin can pipe an un-drained body.
+   simply not implemented until a plugin can pipe an un-drained body;
+   jmap/ likewise omits blobs/attachments (`uploadUrl` absent,
+   `maxSizeUpload: 0` advertised honestly).
    Whatever `api.mountApp` / raw-body mode ships must hand back the
    un-drained stream, not just a buffered body. (This is exactly what the
    merged loader's scoped pass-through parser does — the finding is to
@@ -97,10 +111,18 @@ ports reached for it without coordinating.
      an API shim, did:web can't escape to a fake root (the DID id is fixed
      by the method). It works only where the pod grants public Read. This is
      the sharpest form and needs a **parameterized** `api.reservePath`.
-   - none of it has conflict detection: a future core route at a
-     plugin-claimed path throws `FST_ERR_DUPLICATED_ROUTE` at boot (and a
-     link registry — `api.webfinger.addLink` — is missing, so two plugins
-     contributing `.well-known/webfinger` links would collide silently).
+   - conflict detection: **the collision is now WITNESSED, both ways**
+     (remotestorage/ + webfinger/ both own `/.well-known/webfinger`).
+     Unguarded claim second → boot fails: `plugin remotestorage:
+     activate() failed: Method 'GET' already declared for route
+     '/.well-known/webfinger'` (Fastify's `FST_ERR_DUPLICATED_ROUTE`, but
+     the loader's error wrap **drops `err.code`** — only the message
+     identifies it). Reverse order → boot *succeeds* and webfinger/'s
+     try/catch-guarded claim **silently loses**: its profile/actor/issuer
+     links vanish with no error. Loud failure or silent loss — both wrong,
+     because both plugins legitimately own *parts* of one discovery
+     document. The missing seam is a link/JRD registry
+     (`api.webfinger.addLink`).
    The seam: `api.reservePath('/xrpc')` / `api.reservePath('/:user/did.json')`
    (or `paths: [...]` in the entry) — the loader exempts *and* claims each
    deliberately and reports collisions. The seam **every API-shim plugin**
@@ -118,11 +140,16 @@ ports reached for it without coordinating.
    (`src/nostr/event.js` NIP-01 verify), pay/ (`src/mrc20.js`). Pure crypto.
    Export like auth.js (`javascript-solid-server/nostr.js`) or bless
    vendoring.
-8. **Response-header injection on core routes** — **two consumers:
-   notifications/** (`Updates-Via` discovery) and **micropub/** (clients
+8. **Response-header injection on core routes** — **three consumers:
+   notifications/** (`Updates-Via` discovery), **micropub/** (clients
    find the endpoint via `<link rel="micropub">` on the user's homepage —
    a core-owned resource the plugin can't decorate; the operator must
-   advertise it by hand). A plugin can't add headers to routes it doesn't
+   advertise it by hand), and **oembed/** — the sharpest form: oEmbed
+   discovery wants a per-resource `<link>` in *every HTML resource's
+   head*, which even a gated header hook couldn't provide (in-HTML
+   injection is content rewriting — core's side of the #564 line; the
+   `Link:` header variant would cover the rest). A plugin can't add
+   headers to routes it doesn't
    own. NOT a default-on hook (bigger grant than route ownership); gate
    behind `capabilities: ['hooks']` if ever.
 9. **Plugin-to-plugin isolation is ZERO (measured — metrics/).** All
@@ -173,6 +200,7 @@ MODIFIES the request pipeline of routes it doesn't own.**
 
 | Feature | Shape | Verdict | Evidence |
 |---|---|---|---|
+| remoteStorage | owns `/storage/:user/*` | ✅ plugin | remotestorage/ — 7th port; core's bundled copy could move out-of-tree |
 | nostr relay | owns `/relay` ws | ✅ plugin | relay/ — parity + persistence |
 | webrtc | owns `/webrtc` ws | ✅ plugin | webrtc/ — full parity, zero imports |
 | terminal | owns a ws | ✅ plugin | terminal/ — hardened beyond core |
@@ -205,6 +233,11 @@ this repo is its proof.
   candidate: when the basename is generic (`plugin`, `index`), derive from
   the parent directory (`relay/plugin.js` → `relay`). Small, backward-
   compatible, removes the most common footgun. **Filed-worthy.**
+- **The loader's activate-failure wrap drops `err.code`**
+  (remotestorage/): a route collision inside `activate` surfaces as
+  `plugin <id>: activate() failed: <message>` with the original
+  `FST_ERR_DUPLICATED_ROUTE` code stripped — callers can only string-match
+  the message. Preserve `code` (or `cause`) when re-wrapping.
 - **`logger: false` silently kills every plugin `onResponse` hook**
   (metrics/): core's access-log hook calls
   `request.log.isLevelEnabled('info')`, which doesn't exist on Fastify's

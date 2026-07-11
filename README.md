@@ -59,6 +59,7 @@ README and NOTES.md, ship the closest honest approximation.
 | `tunnel/` | `src/tunnel/` | ✅ parity | one deviation: single-prefix forces `{prefix}/connect` control path |
 | `notifications/` | `src/notifications/` | ✅ parity | **the seam-forcer** — WAC via loopback; forces `api.events`, `api.serverInfo` |
 | `pay/` | pay mode | 📋 wall-report | pipeline-modifying → **stays core**; draws the #564 line |
+| `remotestorage/` | `src/remotestorage.js` | ✅ parity | 7th port; **witnessed** the `/.well-known/webfinger` two-plugin collision, both directions |
 
 **New features built straight onto the api** (from the `plugin`-tagged issue backlog):
 
@@ -86,9 +87,11 @@ README and NOTES.md, ship the closest honest approximation.
 | `backup/` | — | pod container → `.tar.gz` download (data portability) |
 | `metrics/` | — | `/healthz` + Prometheus exporter; measured the plugin-hook scope |
 | `dashboard/` | — | live plugin-status page; first consumer of the #463/#464 registry seam |
+| `oembed/` | — | oEmbed provider for pod resources (link unfurling; XSS-refusing) |
+| `jmap/` | — | JMAP mail over pod messages — the stateless/push line, sharpened |
 
-**282 tests, all green** (`npm test`), including `compose.test.js` — all
-twenty-eight plugins on one server from pure config, pods + WAC intact
+**332 tests, all green** (`npm test`), including `compose.test.js` — all
+thirty-one plugins on one server from pure config, pods + WAC intact
 beside them. Findings consolidated in [NOTES.md](./NOTES.md); the full
 plugin-tagged backlog triaged in [ISSUES.md](./ISSUES.md); the build guide
 is [AGENT.md](./AGENT.md); the maintainer-facing summary — what to add
