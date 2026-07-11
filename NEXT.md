@@ -100,6 +100,25 @@ a locally-linked core, proving the loop closes; once core publishes, flip
 the pin and merge. The rest follow the same shape. Then the next seam:
 `reservePath` (#602) → `events` (#603) → `authorize` (#604).
 
+## Phase 1: a blessed read-only status console (`dashboard/`)
+
+The strategic goal beyond simplifying plugins: get one **blessed official
+plugin** upstream. `dashboard/` is the phase-1 target — read-only, probes
+anonymously (a 401 = "alive", so **no operator/auth seam needed**), and
+gated on exactly **one** seam: `api.plugins` (**filed core #610**), so its
+inventory stops being a hand-copied `config.plugins` list that silently
+drifts.
+
+Steps: (1) land core #610 → (2) bump+publish core → (3) flip this repo's
+pin → (4) retrofit `dashboard/` to read `api.plugins` (drop the hand-fed
+list) + `serverInfo` (drop `loopbackUrl`) → (5) finalize README/screenshot
+→ (6) bless via core docs + the `--plugin` CLI opt-in (#595) → (7) announce.
+
+The richer `admin/` console (pod stats + an operator gate) is **phase 2** —
+it additionally needs an operator-identity seam (`api.isOperator`; three
+plugins answer "who's the operator?" three ways today), which is a real
+design decision, not a quick seam. Ship the status console first.
+
 ## Wave 7 status
 
 `micropub/` and `backup/` are **built and integrated**. Two remain

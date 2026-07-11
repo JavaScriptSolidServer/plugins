@@ -9,11 +9,12 @@ plugin's `README.md ## Findings`.
 
 **Both the bugs and the seams are now filed upstream** (2026-07-11): the
 five bugs as #596–#600, and the four ranked seams as **#601 (serverInfo),
-#602 (reservePath), #603 (events), #604 (authorize)**. The secondary asks
-below (`api.plugins`, `api.isOperator`, mcp.registerTool, per-route
-options, response-header injection, pure-utility exports) are *not* filed
-yet — they're lower-priority and better raised when a design discussion on
-the four opens.
+#602 (reservePath), #603 (events), #604 (authorize)**. `api.plugins` (the read-only loaded-plugin registry) is also filed —
+**#610** — as the phase-1 blocker for a blessed read-only status console
+(`dashboard/`). The remaining secondary asks (`api.isOperator`,
+mcp.registerTool, per-route options, response-header injection,
+pure-utility exports) are *not* filed yet — lower-priority, better raised
+when a design discussion on the primary seams opens.
 
 ## Executive summary
 
@@ -193,13 +194,16 @@ probe-port-then-boot dance for the same reason.
   property to preserve, not new work.
 - **`api.mcp.registerTool`** — blocks the four MCP-tool issues
   (#495/#496/#500/#501); no consumer here because it's impossible today.
-- **`api.plugins` (the #463/#464 app-registry)** — two consumers:
-  `dashboard/` and `admin/`, the plugins whose whole job is describing
-  the deployment, must each be handed a hand-copied duplicate of the
-  `createServer` plugins list (drift is silent; `serve.js` now maintains
+- **`api.plugins` — the read-only loaded-plugin registry (filed #610).**
+  Two consumers: `dashboard/` and `admin/`, the plugins whose whole job is
+  describing the deployment, must each be handed a hand-copied duplicate of
+  the `createServer` plugins list (drift is silent; `serve.js` now maintains
   a shared `INVENTORY` array beside the real list — the workaround that
   proves the seam). The loader already holds the needed data:
-  `api.plugins → [{ id, prefix, module }]`, read-only.
+  `api.plugins → [{ id, prefix, module }]`, read-only. Distinct from the
+  apps-as-pod-resources vision (#463/#464) and the marketplace
+  (#184/#194/#200) — this is the minimal loader primitive those could build
+  on. **The phase-1 blocker for a blessed read-only status console.**
 - **`api.isOperator` (an operator concept)** — terminal/, metrics/ and
   admin/ hold three incompatible answers to "who is the operator?"
   (shared token, optional bearer, WebID allowlist). A tiny seam — an
