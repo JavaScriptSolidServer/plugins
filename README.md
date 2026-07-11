@@ -97,7 +97,9 @@ thirty-three plugins on one server from pure config, pods + WAC intact
 beside them. Findings consolidated in [NOTES.md](./NOTES.md); the full
 plugin-tagged backlog triaged in [ISSUES.md](./ISSUES.md); the build guide
 is [AGENT.md](./AGENT.md); the maintainer-facing summary — what to add
-to the api next, ranked, with evidence — is [REPORT.md](./REPORT.md).
+to the api next, ranked, with evidence — is [REPORT.md](./REPORT.md);
+where this sits in the ecosystem and the realistic play is
+[STRATEGY.md](./STRATEGY.md).
 
 ```
 <name>/plugin.js   the port          <name>/test.js   real-JSS tests   <name>/README.md   findings
