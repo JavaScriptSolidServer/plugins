@@ -62,9 +62,18 @@ describe('caldav plugin', () => {
       port,
       idp: true,
       plugins: [{
+        id: 'caldav',
         module: path.join(__dirname, 'plugin.js'),
         prefix: '/caldav',
         config: { baseUrl: base },
+      }, {
+        // A second mount of the same bridge with a deliberately tiny
+        // maxResources, to exercise the DoS cap (member-walk / multiget
+        // truncation) without seeding 10 000 events.
+        id: 'caldavcap',
+        module: path.join(__dirname, 'plugin.js'),
+        prefix: '/caldavcap',
+        config: { baseUrl: base, maxResources: 3 },
       }],
     });
     const res = await fetch(`${base}/.pods`, {
@@ -388,5 +397,58 @@ describe('caldav plugin', () => {
 
     const bad = await fetch(cd('/freebusy/cal?start=banana&end=20260725T000000Z'), { headers: bearer() });
     assert.strictEqual(bad.status, 400);
+  });
+
+  // ------------------------------------------------------------- DoS cap
+  // Every member-walk / multiget is capped at config.maxResources so a single
+  // request over an attacker-grown collection can't drive unbounded loopback
+  // fetches + full-body buffers. The /caldavcap mount was booted with a tiny
+  // cap (3); the default /caldav mount proves normal collections are untouched.
+  it('maxResources cap truncates the member-walk and multiget instead of hanging', async () => {
+    const names = ['cap1.ics', 'cap2.ics', 'cap3.ics', 'cap4.ics', 'cap5.ics'];
+    for (const n of names) {
+      const put = await fetch(cd(`/cal/capcal/${n}`), {
+        method: 'PUT',
+        headers: { ...bearer(), 'content-type': 'text/calendar' },
+        body: vevent(n, 'DTSTART:20260720T090000Z', 'DTEND:20260720T100000Z', `SUMMARY:${n}`),
+      });
+      assert.ok([200, 201, 204].includes(put.status), `seed ${n}: ${put.status}`);
+    }
+
+    const icsHrefs = (xml) => (xml.match(/\.ics<\/D:href>/g) || []).length;
+
+    // Uncapped mount: all 5 members listed (normal behaviour preserved).
+    const full = await fetch(cd('/cal/capcal/'), {
+      method: 'PROPFIND',
+      headers: { ...bearer(), depth: '1', 'content-type': 'application/xml' },
+      body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:getetag/></D:prop></D:propfind>',
+    });
+    assert.strictEqual(full.status, 207);
+    assert.strictEqual(icsHrefs(await full.text()), 5, 'uncapped mount should list every member');
+
+    // Low-cap mount: the PROPFIND Depth 1 member-walk is truncated to the cap.
+    const capped = await fetch(`${base}/caldavcap/cal/capcal/`, {
+      method: 'PROPFIND',
+      headers: { ...bearer(), depth: '1', 'content-type': 'application/xml' },
+      body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:getetag/></D:prop></D:propfind>',
+    });
+    assert.strictEqual(capped.status, 207, 'capped PROPFIND still returns a valid multistatus');
+    const cappedCount = icsHrefs(await capped.text());
+    assert.ok(cappedCount <= 3, `member-walk not capped: listed ${cappedCount}`);
+    assert.ok(cappedCount < 5, `cap did not truncate: ${cappedCount}`);
+
+    // multiget: an over-long <href> list is capped the same way.
+    const hrefs = names.map((n) => `<D:href>/caldavcap/cal/capcal/${n}</D:href>`).join('');
+    const mg = await fetch(`${base}/caldavcap/cal/capcal/`, {
+      method: 'REPORT',
+      headers: { ...bearer(), 'content-type': 'application/xml' },
+      body: '<?xml version="1.0"?>'
+        + '<CAL:calendar-multiget xmlns:D="DAV:" xmlns:CAL="urn:ietf:params:xml:ns:caldav">'
+        + '<D:prop><D:getetag/><CAL:calendar-data/></D:prop>'
+        + `${hrefs}</CAL:calendar-multiget>`,
+    });
+    assert.strictEqual(mg.status, 207);
+    const mgCount = ((await mg.text()).match(/<CAL:calendar-data>/g) || []).length;
+    assert.ok(mgCount <= 3, `multiget not capped: returned ${mgCount} bodies`);
   });
 });

@@ -57,9 +57,18 @@ describe('carddav plugin', () => {
       port,
       idp: true,
       plugins: [{
+        id: 'carddav',
         module: path.join(__dirname, 'plugin.js'),
         prefix: '/carddav',
         config: { baseUrl: base },
+      }, {
+        // A second mount of the same bridge with a deliberately tiny
+        // maxResources, to exercise the DoS cap (member-walk / multiget
+        // truncation) without seeding 10 000 contacts.
+        id: 'carddavcap',
+        module: path.join(__dirname, 'plugin.js'),
+        prefix: '/carddavcap',
+        config: { baseUrl: base, maxResources: 3 },
       }],
     });
     const res = await fetch(`${base}/.pods`, {
@@ -216,5 +225,61 @@ describe('carddav plugin', () => {
       headers: { authorization: `Basic ${basic}`, depth: '0' },
     });
     assert.strictEqual(res.status, 207);
+  });
+
+  // ------------------------------------------------------------- DoS cap
+  // Every member-walk / multiget is capped at config.maxResources so a single
+  // request over an attacker-grown collection can't drive unbounded loopback
+  // fetches + full-body buffers. The /carddavcap mount was booted with a tiny
+  // cap (3); the default /carddav mount proves normal collections are untouched.
+  it('maxResources cap truncates the member-walk and multiget instead of hanging', async () => {
+    const vcard = (uid) => [
+      'BEGIN:VCARD', 'VERSION:3.0', `UID:urn:uuid:${uid}`, `FN:${uid}`, `N:${uid};;;;`, 'END:VCARD', '',
+    ].join('\r\n');
+    const names = ['cap1.vcf', 'cap2.vcf', 'cap3.vcf', 'cap4.vcf', 'cap5.vcf'];
+    for (const n of names) {
+      const put = await fetch(cd(`/cara/capbook/${n}`), {
+        method: 'PUT',
+        headers: { ...bearer(), 'content-type': 'text/vcard' },
+        body: vcard(n),
+      });
+      assert.ok([200, 201, 204].includes(put.status), `seed ${n}: ${put.status}`);
+    }
+
+    const vcfHrefs = (xml) => (xml.match(/\.vcf<\/D:href>/g) || []).length;
+
+    // Uncapped mount: all 5 members listed (normal behaviour preserved).
+    const full = await fetch(cd('/cara/capbook/'), {
+      method: 'PROPFIND',
+      headers: { ...bearer(), depth: '1', 'content-type': 'application/xml' },
+      body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:getetag/></D:prop></D:propfind>',
+    });
+    assert.strictEqual(full.status, 207);
+    assert.strictEqual(vcfHrefs(await full.text()), 5, 'uncapped mount should list every member');
+
+    // Low-cap mount: the PROPFIND Depth 1 member-walk is truncated to the cap.
+    const capped = await fetch(`${base}/carddavcap/cara/capbook/`, {
+      method: 'PROPFIND',
+      headers: { ...bearer(), depth: '1', 'content-type': 'application/xml' },
+      body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:getetag/></D:prop></D:propfind>',
+    });
+    assert.strictEqual(capped.status, 207, 'capped PROPFIND still returns a valid multistatus');
+    const cappedCount = vcfHrefs(await capped.text());
+    assert.ok(cappedCount <= 3, `member-walk not capped: listed ${cappedCount}`);
+    assert.ok(cappedCount < 5, `cap did not truncate: ${cappedCount}`);
+
+    // multiget: an over-long <href> list is capped the same way.
+    const hrefs = names.map((n) => `<D:href>/carddavcap/cara/capbook/${n}</D:href>`).join('');
+    const mg = await fetch(`${base}/carddavcap/cara/capbook/`, {
+      method: 'REPORT',
+      headers: { ...bearer(), 'content-type': 'application/xml' },
+      body: '<?xml version="1.0"?>'
+        + '<CARD:addressbook-multiget xmlns:D="DAV:" xmlns:CARD="urn:ietf:params:xml:ns:carddav">'
+        + '<D:prop><D:getetag/><CARD:address-data/></D:prop>'
+        + `${hrefs}</CARD:addressbook-multiget>`,
+    });
+    assert.strictEqual(mg.status, 207);
+    const mgCount = ((await mg.text()).match(/<CARD:address-data>/g) || []).length;
+    assert.ok(mgCount <= 3, `multiget not capped: returned ${mgCount} bodies`);
   });
 });

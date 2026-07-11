@@ -54,6 +54,16 @@ const DAV_ALLOW = 'OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, REPORT, MKCOL, MKC
 const XML_TYPE = 'application/xml; charset=utf-8';
 const ICAL_TYPE = 'text/calendar';
 
+// Cap the number of members a single member-walk / multiget touches, to bound
+// the loopback fan-out: each member is a full-body loopback GET, so an uncapped
+// walk over an attacker-grown collection (or a multiget with an arbitrarily
+// long <href> list) drives N fetches + N full-body buffers per request. A
+// collection larger than the cap gets a truncated but valid multistatus rather
+// than unbounded work — the same maxResources cap backup/, sparql/, rss/ and
+// search/ apply to their loopback walks. Config-overridable via
+// config.maxResources.
+const DEFAULT_MAX_RESOURCES = 10000;
+
 const xmlEscape = (s) => String(s).replace(/[<>&'"]/g, (c) => (
   { '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' }[c]
 ));
@@ -270,6 +280,10 @@ export async function activate(api) {
   const calName = api.config.calendar || 'calendar';
   // Optional Apple calendar colour, echoed as IC:calendar-color.
   const calColor = api.config.color || null;
+  // Upper bound on members touched by any single member-walk / multiget.
+  const maxResources = api.config.maxResources ?? DEFAULT_MAX_RESOURCES;
+  /** Truncate a member/href list to the cap, bounding loopback fan-out. */
+  const capMembers = (arr) => (arr.length > maxResources ? arr.slice(0, maxResources) : arr);
 
   // ---------------------------------------------------------------- auth
   function bridgeAuth(request) {
@@ -485,7 +499,7 @@ export async function activate(api) {
       const { props, missing } = collectionProps(path, want, pod);
       responses.push(response(prefix + path, props, missing));
       if (depth === 1 && listing) {
-        for (const childPath of childPaths(listing, path)) {
+        for (const childPath of capMembers(childPaths(listing, path))) {
           if (childPath === path) continue;
           if (childPath.endsWith('/')) {
             const { props: cp, missing: cm } = collectionProps(childPath, want, pod);
@@ -537,7 +551,7 @@ export async function activate(api) {
     if (res.status === 401) return unauthorized(reply);
     if (!res.ok) return reply.code(res.status).send();
     const periods = [];
-    for (const childPath of childPaths(listing, coll)) {
+    for (const childPath of capMembers(childPaths(listing, coll))) {
       if (childPath.endsWith('/') || !childPath.endsWith('.ics')) continue;
       const got = await getResource(childPath, auth); // unreadable → skipped, not busy
       if (!got.body) continue;
@@ -584,7 +598,7 @@ export async function activate(api) {
     if (multiget) {
       // multiget: the client lists exactly the hrefs it wants back.
       const hrefs = [...xml.matchAll(/<[A-Za-z]*:?href>\s*([^<]+?)\s*<\/[A-Za-z]*:?href>/gi)].map((m) => m[1]);
-      for (const href of hrefs) {
+      for (const href of capMembers(hrefs)) {
         const hp = hrefToHostPath(href.trim());
         if (!hp) {
           responses.push(`<D:response><D:href>${xmlEscape(href.trim())}</D:href>`
@@ -610,7 +624,7 @@ export async function activate(api) {
       const { res, listing } = await fetchListing(coll, auth);
       if (res.status === 401) return unauthorized(reply);
       if (!res.ok) return reply.code(res.status).send();
-      for (const childPath of childPaths(listing, coll)) {
+      for (const childPath of capMembers(childPaths(listing, coll))) {
         if (childPath.endsWith('/') || !childPath.endsWith('.ics')) continue;
         const got = await getResource(childPath, auth);
         if (!got.body) continue;
