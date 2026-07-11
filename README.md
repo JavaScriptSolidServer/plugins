@@ -65,9 +65,13 @@ README and NOTES.md, ship the closest honest approximation.
 | `carddav/` | #157 | contact sync (iOS/macOS/Thunderbird/DAVx5); the DAV bridge, generalized |
 | `mastodon/` | #515/#516 | Mastodon-API shim — a client logs into its own pod; needs `appPaths` widened |
 | `bluesky/` | #211 | AT-Protocol XRPC shim — same shape, `/xrpc` root; token bridge generalizes |
+| `caldav/` | #157-sib | calendar sync — completes the DAV family (webdav+carddav+caldav) |
+| `webfinger/` | #164 | `/.well-known/webfinger` — fediverse `acct:` resolution for the shims |
+| `activitypub/` | #51/#164 | federate a pod as an AS2 actor; outbound HTTP Signatures |
+| `rss/` | — | any pod container as an Atom/RSS feed |
 
-**~150 tests, all green** (`npm test`), including `compose.test.js` — all
-sixteen plugins on one server from pure config, pods + WAC intact beside
+**~200 tests, all green** (`npm test`), including `compose.test.js` — all
+twenty plugins on one server from pure config, pods + WAC intact beside
 them. Findings consolidated in [NOTES.md](./NOTES.md); the full
 plugin-tagged backlog triaged in [ISSUES.md](./ISSUES.md).
 

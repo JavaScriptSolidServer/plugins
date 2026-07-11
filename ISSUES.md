@@ -27,6 +27,10 @@ evidence. Legend:
 | #505 | `otp/` | one-time-password session flow (account *recovery* → 🔩 core auth) |
 | #157 | `carddav/` | CardDAV contact sync (iOS/macOS/Thunderbird/DAVx5) |
 | #211 | `bluesky/` | AT-Protocol XRPC shim — a client logs into its own pod (needs `appPaths` widened → 🔩) |
+| #157-sib | `caldav/` | CalDAV calendar sync — completes the DAV family |
+| #164 | `webfinger/` | `/.well-known/webfinger` — the WebFinger half of #164 |
+| #51/#164 | `activitypub/` | federate a pod as an AS2 actor (needs `appPaths` widened → 🔩) |
+| — | `rss/` | any pod container as an Atom/RSS feed |
 
 Plus six **ports of bundled features** proving the migration path for #564 /
 #164: `relay/` `webrtc/` `terminal/` `tunnel/` `notifications/`, and `pay/`
@@ -87,11 +91,12 @@ exists.
 
 ## Tally
 
-Of ~40 plugin-tagged issues: **10 built as plugins here**, **6 ported**, **5
-shipped upstream**, **2 more plugin-able with no blocker**, **6 clusters
-blocked on a named seam** (each with a proof-of-need consumer), the rest
-core-by-nature or product-scale. The plugin api reaches most of the backlog
-today; ranked by how many independent plugins demanded them, the seams that
-would unlock the most next are `api.authorize` (3 consumers), `api.events`
-(2, one where a miss means *wrong* answers), and multi-prefix/`appPaths.add`
-(every API-shim).
+Of ~40 plugin-tagged issues: **13 built as plugins here** (plus `rss/`, no
+issue), **6 ported**, **5 shipped upstream**, **2 more plugin-able with no
+blocker**, **6 clusters blocked on a named seam** (each with a proof-of-need
+consumer), the rest core-by-nature or product-scale. 20 plugins total, ~200
+tests. The plugin api reaches most of the backlog today; ranked by demand,
+the seams that would unlock the most next are `api.authorize` (3 blocking
+consumers), `api.reservePath` (3 API-shims can't self-exempt), `api.events`
+(2, one where a miss means *wrong* answers), and `api.serverInfo` (broadest:
+~10 plugins hand-roll their own origin).

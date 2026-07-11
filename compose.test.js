@@ -46,7 +46,7 @@ describe('composition: every plugin on one server', () => {
 
   after(async () => { if (jss) await jss.close(); });
 
-  it('boots pods + idp + sixteen plugins from config', async () => {
+  it('boots pods + idp + twenty plugins from config', async () => {
     const port = await probePort();
     base = `http://127.0.0.1:${port}`;
     wsBase = `ws://127.0.0.1:${port}`;
@@ -55,10 +55,10 @@ describe('composition: every plugin on one server', () => {
       port,
       root,
       idp: true,
-      // mastodon (/api,/oauth) and bluesky (/xrpc) own fixed roots outside
-      // their prefix; a plugin can't self-exempt them (finding), so the
-      // operator widens appPaths.
-      appPaths: ['/api', '/oauth', '/xrpc'],
+      // The protocol shims own fixed roots outside their prefix — mastodon
+      // (/api,/oauth), bluesky (/xrpc), activitypub (/ap) — which a plugin
+      // can't self-exempt (finding), so the operator widens appPaths.
+      appPaths: ['/api', '/oauth', '/xrpc', '/ap'],
       // Explicit ids: the <name>/plugin.js convention makes every basename
       // reduce to 'plugin' — the loader's duplicate-id guard requires ids
       // here (finding: derive from the parent dir for generic basenames).
@@ -84,6 +84,10 @@ describe('composition: every plugin on one server', () => {
         { id: 'carddav', module: at('carddav/plugin.js'), prefix: '/carddav', config: { baseUrl: base, loopbackUrl: base } },
         { id: 'mastodon', module: at('mastodon/plugin.js'), prefix: '/mastodon', config: { baseUrl: base, loopbackUrl: base } },
         { id: 'bluesky', module: at('bluesky/plugin.js'), prefix: '/bluesky', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'caldav', module: at('caldav/plugin.js'), prefix: '/caldav', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'webfinger', module: at('webfinger/plugin.js'), prefix: '/webfinger', config: { podsRoot: root, baseUrl: base } },
+        { id: 'activitypub', module: at('activitypub/plugin.js'), prefix: '/activitypub', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'rss', module: at('rss/plugin.js'), prefix: '/feed', config: { baseUrl: base, loopbackUrl: base } },
       ],
     });
     assert.ok(jss.base);
@@ -220,6 +224,30 @@ describe('composition: every plugin on one server', () => {
   it('bluesky: the XRPC describeServer answers (fixed /xrpc root)', async () => {
     const res = await fetch(`${base}/xrpc/com.atproto.server.describeServer`);
     assert.strictEqual(res.status, 200);
+  });
+
+  it('caldav: OPTIONS advertises calendar-access', async () => {
+    const res = await fetch(`${base}/caldav/`, { method: 'OPTIONS' });
+    assert.ok(res.status < 500);
+    assert.match(res.headers.get('dav') || '', /calendar-access/);
+  });
+
+  it('webfinger: missing resource is 400 (endpoint alive)', async () => {
+    const res = await fetch(`${base}/.well-known/webfinger`);
+    assert.strictEqual(res.status, 400);
+  });
+
+  it('activitypub: unauthenticated outbox POST is refused', async () => {
+    const res = await fetch(`${base}/ap/alice/outbox`, {
+      method: 'POST', headers: { 'content-type': 'application/activity+json' },
+      body: JSON.stringify({ type: 'Note', content: 'x' }),
+    });
+    assert.strictEqual(res.status, 401);
+  });
+
+  it('rss: missing container is 400 (endpoint alive)', async () => {
+    const res = await fetch(`${base}/feed/atom`);
+    assert.strictEqual(res.status, 400);
   });
 
   it('pods still work beside all of it (idp register + WAC)', async () => {

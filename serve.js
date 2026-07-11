@@ -28,10 +28,10 @@ const fastify = createServer({
   root: PODS,
   idp: true,
   idpIssuer: PUBLIC_URL,
-  // mastodon (/api,/oauth) and bluesky (/xrpc) own fixed roots outside
-  // their prefix; a plugin can't self-exempt them from WAC, so the
-  // operator widens appPaths.
-  appPaths: ['/api', '/oauth', '/xrpc'],
+  // The protocol shims own fixed roots outside their prefix — mastodon
+  // (/api,/oauth), bluesky (/xrpc), activitypub (/ap) — which a plugin
+  // can't self-exempt from WAC, so the operator widens appPaths.
+  appPaths: ['/api', '/oauth', '/xrpc', '/ap'],
   // Explicit ids — the <name>/plugin.js convention collides on basename.
   plugins: [
     { id: 'relay', module: at('relay/plugin.js'), prefix: '/relay' },
@@ -55,6 +55,10 @@ const fastify = createServer({
     { id: 'carddav', module: at('carddav/plugin.js'), prefix: '/carddav', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
     { id: 'mastodon', module: at('mastodon/plugin.js'), prefix: '/mastodon', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
     { id: 'bluesky', module: at('bluesky/plugin.js'), prefix: '/bluesky', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    { id: 'caldav', module: at('caldav/plugin.js'), prefix: '/caldav', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    { id: 'webfinger', module: at('webfinger/plugin.js'), prefix: '/webfinger', config: { podsRoot: PODS, baseUrl: PUBLIC_URL } },
+    { id: 'activitypub', module: at('activitypub/plugin.js'), prefix: '/activitypub', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    { id: 'rss', module: at('rss/plugin.js'), prefix: '/feed', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
   ],
 });
 
@@ -84,3 +88,7 @@ console.log(`  otp:            POST ${PUBLIC_URL}/otp/request`);
 console.log(`  carddav:        ${PUBLIC_URL}/carddav/  (contact sync)`);
 console.log(`  mastodon:       GET ${PUBLIC_URL}/api/v1/instance  (point a client here)`);
 console.log(`  bluesky:        GET ${PUBLIC_URL}/xrpc/com.atproto.server.describeServer`);
+console.log(`  caldav:         ${PUBLIC_URL}/caldav/  (calendar sync)`);
+console.log(`  webfinger:      GET ${PUBLIC_URL}/.well-known/webfinger?resource=acct:me@host`);
+console.log(`  activitypub:    GET ${PUBLIC_URL}/ap/<user>/actor`);
+console.log(`  rss/atom:       GET ${PUBLIC_URL}/feed/atom?container=<pod-container>`);

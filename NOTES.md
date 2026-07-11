@@ -45,40 +45,46 @@ ports reached for it without coordinating.
    has the emitter internally (`src/notifications/events.js`). The seam
    every "react to pod writes" app (webhooks, indexing, sync, full-text)
    will want.
-3. **`api.serverInfo` (`{ baseUrl, port }` at listen)** — **consumers:
-   notifications/, webdav/, sparql/, nip05/** (subdomain per-host
-   filtering). Every plugin that mints absolute URLs or reaches the host
-   over loopback repeats the origin in config today; a wrong value fails
-   quietly (nip05 serves an empty identity map). Cheap to provide.
+3. **`api.serverInfo` (`{ baseUrl, port }` at listen)** — **eight+
+   consumers: notifications/, webdav/, carddav/, caldav/, sparql/, rss/,
+   nip05/, webfinger/, mastodon/, bluesky/, activitypub/** — essentially
+   every plugin that mints absolute URLs or reaches the host over loopback.
+   All repeat the origin in config today; a wrong value fails quietly (nip05
+   serves an empty identity map). The single most *broadly* needed seam
+   (vs. api.authorize being the most *blocking*); trivially cheap to provide.
 4. **The unconsumed-body-**stream** primitive (#583)** — consumer:
    gitscratch/ sharpened it. tunnel/ needed the raw *buffer*; git needs the
    raw *stream* piped to a subprocess gzip-and-all. Whatever `api.mountApp`
    / raw-body mode ships must hand back the un-drained stream, not just a
    buffered body. (This is exactly what the merged loader's scoped
    pass-through parser does — the finding is to keep it that way.)
-5. **Routes/WAC-exemption outside the single prefix** — **four consumers:
-   nip05/, webdav/ & carddav/ (`/.well-known/*`), mastodon/ (`/api`,
-   `/oauth`).** A plugin can *register* absolute/exact routes outside its
-   prefix (the loader doesn't confine `api.fastify`), but the loader
-   WAC-exempts only its **one** `prefix` (`plugins.js` pushes `prefix` to
-   `appPaths`). Consequences, in increasing severity:
-   - nip05/webdav/carddav land on `/.well-known/*`, which core *happens* to
-     blanket-exempt — so they work **by luck**, not by contract.
-   - **mastodon** needs `/api` **and** `/oauth`, and **bluesky** needs
-     `/xrpc` — none of which core exempts, so **the plugin cannot serve its
-     own surface**: every call 401s at the WAC hook until the operator
-     hand-passes `appPaths: ['/api','/oauth','/xrpc']`. A plugin has no way
-     to exempt a path it owns. **Two independent confirmations** (two
-     protocol shims, built separately), and bluesky sharpens it: it needs
-     only *one* extra root and still can't reach it, so the seam is not
-     "more prefixes" but **"a plugin declares the paths it owns,
-     independent of its mount prefix."**
+5. **Routes/WAC-exemption outside the single prefix** — **the most-hit
+   finding: seven+ consumers.** A plugin can *register* absolute/exact
+   routes outside its prefix (the loader doesn't confine `api.fastify`), but
+   the loader WAC-exempts only its **one** `prefix`. Consequences, in
+   increasing severity:
+   - **`/.well-known/*` served by luck** — nip05/ (`nostr.json`),
+     webfinger/ (`webfinger`), webdav/carddav/caldav (`caldav`/`carddav`).
+     Core *happens* to blanket-exempt `/.well-known/*`, so they work but by
+     coincidence, not contract. Notably nip05 and webfinger are the **two
+     most-wanted `.well-known` docs a deployment serves**, both riding the
+     same undocumented luck.
+   - **fixed roots core does NOT exempt** — mastodon/ (`/api`,`/oauth`),
+     bluesky/ (`/xrpc`), activitypub/ (`/ap`). Here the plugin **cannot
+     serve its own surface**: every call 401s at the WAC hook until the
+     operator hand-passes `appPaths`. **Three independent protocol-shim
+     confirmations**, each built separately. bluesky sharpened it (one root,
+     still unreachable → the ask is "declare owned paths," not "more
+     prefixes"); activitypub sharpened it further — its natural layout wants
+     paths **interleaved with** the pod's own `/<user>/` namespace, which no
+     single mount prefix can carve out at all.
    - none of it has conflict detection: a future core route at a
-     plugin-claimed path throws `FST_ERR_DUPLICATED_ROUTE` at boot.
+     plugin-claimed path throws `FST_ERR_DUPLICATED_ROUTE` at boot (and a
+     link registry — `api.webfinger.addLink` — is missing, so two plugins
+     contributing `.well-known/webfinger` links would collide silently).
    The seam: `api.reservePath('/xrpc')` (or `paths: [...]` in the entry) —
    the loader exempts *and* claims each deliberately and reports collisions.
-   This is the seam **every API-shim plugin** (mastodon, bluesky, and any
-   future ActivityPub/Matrix/gateway) structurally requires; it's the third
+   The seam **every API-shim plugin** structurally requires; third
    most-demanded after `api.authorize` and `api.events`.
 6. **Can't set fastify server options** — consumer: capability/ hit
    `maxParamLength` (100) silently 404ing long tokens in named params;
