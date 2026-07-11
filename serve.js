@@ -41,6 +41,12 @@ const fastify = createServer({
       config: { podsRoot: PODS, baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` },
     },
     { id: 'pay', module: at('pay/plugin.js'), prefix: '/paid', config: { cost: 1, address: 'demo' } },
+    { id: 'nip05', module: at('nip05/plugin.js'), prefix: '/nip05', config: { podsRoot: PODS, relayUrl: `${PUBLIC_URL.replace(/^http/, 'ws')}/relay` } },
+    { id: 'corsproxy', module: at('corsproxy/plugin.js'), prefix: '/proxy', config: {} },
+    { id: 'capability', module: at('capability/plugin.js'), prefix: '/cap', config: {} },
+    { id: 'webdav', module: at('webdav/plugin.js'), prefix: '/webdav', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    { id: 'gitscratch', module: at('gitscratch/plugin.js'), prefix: '/git', config: {} },
+    { id: 'sparql', module: at('sparql/plugin.js'), prefix: '/sparql', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
   ],
 });
 
@@ -60,3 +66,9 @@ console.log(`  terminal:       ws  ${PUBLIC_URL}/terminal?token=${terminalToken}
 console.log(`  tunnel:         ws  ${PUBLIC_URL}/tunnel`);
 console.log(`  notifications:  ws  ${PUBLIC_URL}/.notifications`);
 console.log(`  paid demo:      GET ${PUBLIC_URL}/paid/demo`);
+console.log(`  nip05:          GET ${PUBLIC_URL}/.well-known/nostr.json`);
+console.log(`  cors-proxy:     GET ${PUBLIC_URL}/proxy?url=<url>`);
+console.log(`  capability:     POST ${PUBLIC_URL}/cap/issue  (auth)`);
+console.log(`  webdav:         ${PUBLIC_URL}/webdav/  (mount with a pod Bearer)`);
+console.log(`  git scratch:    git clone ${PUBLIC_URL}/git/<name>.git`);
+console.log(`  sparql:         POST ${PUBLIC_URL}/sparql  (auth)`);

@@ -40,6 +40,8 @@ README and NOTES.md, ship the closest honest approximation.
 
 ## What's here
 
+**Ports of bundled features** (does the public api reproduce core?):
+
 | Plugin | Ports | Status | Notable |
 |---|---|---|---|
 | `relay/` | `src/nostr/relay.js` | ✅ parity + | pluginDir persistence core lacks; vendored NIP-01 verify |
@@ -49,8 +51,20 @@ README and NOTES.md, ship the closest honest approximation.
 | `notifications/` | `src/notifications/` | ✅ parity | **the seam-forcer** — WAC via loopback; forces `api.events`, `api.serverInfo` |
 | `pay/` | pay mode | 📋 wall-report | pipeline-modifying → **stays core**; draws the #564 line |
 
-39 tests, all green (`npm test`), including `compose.test.js` — every plugin
-on one server from pure config. Findings consolidated in [NOTES.md](./NOTES.md).
+**New features built straight onto the api** (from the `plugin`-tagged issue backlog):
+
+| Plugin | Issue | Notable |
+|---|---|---|
+| `nip05/` | #445 | `/.well-known/nostr.json` from pods' public keys; well-known-path ownership is *accidental* today |
+| `corsproxy/` | #382/#379 | forward proxy with fail-closed SSRF defense; per-pod ACL needs `api.authorize` |
+| `capability/` | #506 | macaroon-lite scoped/time-bound/revocable capability URLs |
+| `webdav/` | #507 | mount a pod in Finder/Nautilus/Windows; WebDAV↔LDP over loopback, Basic→Bearer |
+| `sparql/` | #509 | read-time SPARQL SELECT over pod JSON-LD; write-index needs `api.events` |
+| `gitscratch/` | #322 | ephemeral Solid-authed git remotes via the `git-http-backend` CGI |
+
+**97 tests, all green** (`npm test`), including `compose.test.js` — all twelve
+plugins on one server from pure config, pods + WAC intact beside them.
+Findings consolidated in [NOTES.md](./NOTES.md).
 
 ```
 <name>/plugin.js   the port          <name>/test.js   real-JSS tests   <name>/README.md   findings

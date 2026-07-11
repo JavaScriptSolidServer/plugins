@@ -24,26 +24,72 @@ are candidates, each with a consumer in this repo attached.
   correct. This removes a whole class of would-be seams (`api.wac.check`)
   from the *necessary* list, leaving them merely *nice*.
 
-## Candidate seams (in value order, consumers attached)
+## Candidate seams (ranked by how many independent plugins demanded them)
 
-1. **`api.events.onResourceChange(cb)`** — consumer: notifications/.
-   Core has the emitter internally (`src/notifications/events.js`); today a
-   plugin must fs.watch a config-supplied path, which drifts and misses
-   non-fs backends. This is also the seam any future "react to pod writes"
-   app (webhooks, indexing, sync) wants — likely the most demanded seam of
-   the next wave of real apps.
-2. **`api.serverInfo` (`{ baseUrl, port }` resolved at listen)** — consumers:
-   notifications/ (pub URLs, origin checks, loopback), any plugin minting
-   absolute URLs. Today the operator repeats the origin in every plugin's
-   config.
-3. **Internal utility modules plugins re-vendor** — consumers: relay/
-   (`src/nostr/event.js` NIP-01 verify) and potentially pay/ (`src/mrc20.js`).
-   Both are pure, dependency-light crypto. Candidate: export like auth.js
-   (`javascript-solid-server/nostr.js`), or bless vendoring as the answer.
-4. **Response-header injection on core routes** — consumer: notifications/
-   (`Updates-Via` discovery). Explicitly NOT proposing a default-on hook:
-   a plugin rewriting every response is a bigger grant than route ownership.
-   If it ships, gate it (`capabilities: ['hooks']`).
+Twelve plugins in, the ranking is now empirical — a seam's rank is how many
+ports reached for it without coordinating.
+
+1. **`api.authorize(request, path, mode)`** — "would the host's WAC allow
+   this?" **Three independent consumers: notifications/, corsproxy/,
+   capability/.** The loopback trick (below) covers the case where the
+   *requester's own* credentials should decide (notifications, webdav,
+   sparql all use it), but it can't cover authorization the requester
+   doesn't drive: a proxy governed by a *pod owner's* `.acl` (corsproxy
+   #382), or a capability exercising the *issuer's* authority
+   (capability #506). This is the most-requested seam and the one that
+   moves the most backlog issues from "plugin-approximation" to "faithful".
+2. **`api.events.onResourceChange(cb)`** — **two consumers: notifications/,
+   sparql/**, and sparql is the *stronger* one: without a write hook a
+   plugin index returns **wrong** query results, not merely late
+   notifications, and `pluginDir` caching is uninvalidatable. Core already
+   has the emitter internally (`src/notifications/events.js`). The seam
+   every "react to pod writes" app (webhooks, indexing, sync, full-text)
+   will want.
+3. **`api.serverInfo` (`{ baseUrl, port }` at listen)** — **consumers:
+   notifications/, webdav/, sparql/, nip05/** (subdomain per-host
+   filtering). Every plugin that mints absolute URLs or reaches the host
+   over loopback repeats the origin in config today; a wrong value fails
+   quietly (nip05 serves an empty identity map). Cheap to provide.
+4. **The unconsumed-body-**stream** primitive (#583)** — consumer:
+   gitscratch/ sharpened it. tunnel/ needed the raw *buffer*; git needs the
+   raw *stream* piped to a subprocess gzip-and-all. Whatever `api.mountApp`
+   / raw-body mode ships must hand back the un-drained stream, not just a
+   buffered body. (This is exactly what the merged loader's scoped
+   pass-through parser does — the finding is to keep it that way.)
+5. **Reserved-path declaration** — consumers: nip05/ (`/.well-known/
+   nostr.json`), gitscratch/ (coexistence with core `git: true`). A plugin
+   can register absolute/exact paths outside its prefix, but only WAC-exempt
+   *by luck* (core blanket-exempts `/.well-known/*`) and with no conflict
+   detection — a future core route at the same path throws
+   `FST_ERR_DUPLICATED_ROUTE` at boot. Let entries declare reserved paths so
+   the loader claims them deliberately and reports collisions.
+6. **Can't set fastify server options** — consumer: capability/ hit
+   `maxParamLength` (100) silently 404ing long tokens in named params;
+   workaround is a wildcard route. A plugin has no way to raise per-route
+   limits. Minor, but sharp when it bites.
+7. **Internal utility modules plugins re-vendor** — consumer: relay/
+   (`src/nostr/event.js` NIP-01 verify), pay/ (`src/mrc20.js`). Pure crypto.
+   Export like auth.js (`javascript-solid-server/nostr.js`) or bless
+   vendoring.
+8. **Response-header injection on core routes** — consumer: notifications/
+   (`Updates-Via` discovery). A plugin can't add headers to routes it
+   doesn't own. NOT a default-on hook (bigger grant than route ownership);
+   gate behind `capabilities: ['hooks']` if ever.
+
+## Test-harness footguns (host quirks, not plugin api)
+
+Every multi-boot suite independently rediscovered these; worth a line in
+the plugin-author docs.
+
+- **Module-global `DATA_ROOT`**: JSS keeps the storage root (and IdP key
+  resolution) in a process-global env var that *every* `createServer`
+  repoints — a second boot in one process, **even a deliberately-failing
+  one**, poisons the first. Order validation-failure tests *before* the
+  long-lived boot. (notifications/, webdav/, sparql/ all hit this.)
+- **Ambient `~/.gitconfig`**: git-shelling plugins inherit the operator's
+  config — `init.defaultBranch = gh-pages` leaked dangling HEADs into
+  server-created bare repos (empty clones). Spawn git with
+  `GIT_CONFIG_NOSYSTEM=1` and no `HOME`. (gitscratch/.)
 
 ## The core/plugin line — answering #564 empirically
 

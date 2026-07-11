@@ -46,7 +46,7 @@ describe('composition: every plugin on one server', () => {
 
   after(async () => { if (jss) await jss.close(); });
 
-  it('boots pods + idp + six plugins from config', async () => {
+  it('boots pods + idp + twelve plugins from config', async () => {
     const port = await probePort();
     base = `http://127.0.0.1:${port}`;
     wsBase = `ws://127.0.0.1:${port}`;
@@ -70,6 +70,12 @@ describe('composition: every plugin on one server', () => {
           config: { podsRoot: root, baseUrl: base },
         },
         { id: 'pay', module: at('pay/plugin.js'), prefix: '/paid', config: { cost: 2, address: 'x' } },
+        { id: 'nip05', module: at('nip05/plugin.js'), prefix: '/nip05', config: { podsRoot: root } },
+        { id: 'corsproxy', module: at('corsproxy/plugin.js'), prefix: '/proxy', config: {} },
+        { id: 'capability', module: at('capability/plugin.js'), prefix: '/cap', config: {} },
+        { id: 'webdav', module: at('webdav/plugin.js'), prefix: '/webdav', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'gitscratch', module: at('gitscratch/plugin.js'), prefix: '/git', config: {} },
+        { id: 'sparql', module: at('sparql/plugin.js'), prefix: '/sparql', config: { baseUrl: base, loopbackUrl: base } },
       ],
     });
     assert.ok(jss.base);
@@ -147,6 +153,43 @@ describe('composition: every plugin on one server', () => {
     assert.strictEqual(res.status, 402);
     res = await fetch(`${base}/paid/demo`, { headers: { 'x-payment-proof': 'demo-proof-of-payment' } });
     assert.strictEqual(res.status, 200);
+  });
+
+  it('nip05: serves the discovery document', async () => {
+    const res = await fetch(`${base}/nip05/nostr.json`);
+    assert.strictEqual(res.status, 200);
+    assert.ok('names' in (await res.json()));
+  });
+
+  it('corsproxy: refuses a missing/blocked target but is alive', async () => {
+    const res = await fetch(`${base}/proxy`); // no ?url
+    assert.strictEqual(res.status, 400);
+  });
+
+  it('capability: minting requires identity (401 anon)', async () => {
+    const res = await fetch(`${base}/cap/issue`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ resource: '/cap/x', modes: ['read'], ttl: 60 }),
+    });
+    assert.strictEqual(res.status, 401);
+  });
+
+  it('webdav: OPTIONS advertises DAV class 1', async () => {
+    const res = await fetch(`${base}/webdav/`, { method: 'OPTIONS' });
+    assert.ok(res.status < 500);
+    assert.match(res.headers.get('dav') || '', /1/);
+  });
+
+  it('gitscratch: an anonymous push is refused', async () => {
+    const res = await fetch(`${base}/git/probe.git/info/refs?service=git-receive-pack`);
+    assert.strictEqual(res.status, 401);
+  });
+
+  it('sparql: rejects a non-sparql content type (415)', async () => {
+    const res = await fetch(`${base}/sparql`, {
+      method: 'POST', headers: { 'content-type': 'text/plain' }, body: 'nope',
+    });
+    assert.ok([400, 415].includes(res.status), `got ${res.status}`);
   });
 
   it('pods still work beside all of it (idp register + WAC)', async () => {
