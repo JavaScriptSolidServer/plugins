@@ -138,6 +138,18 @@ empirically in NOTES: **route-owning → plugin, pipeline-modifying → core**.
   anything with a socket. (`/.well-known/*` HTTP works, by core's blanket
   exemption — but that's the reserved-path finding, not a guarantee.)
 
+## Issue tracker (new — 2026-07)
+
+The repo now uses GitHub issues, not just these docs:
+- **#1–#6** — security accepted-risk from SECURITY.md (activitypub sig
+  verification, DNS-rebind TOCTOU, per-resource size cap, pluginDir
+  read-modify-write TOCTOU, s3 md5, relay rewrite).
+- **#7–#10** — `plugin-idea` contributor entry points (webhooks,
+  webmention, feed-ingest, WebSub — all need SSRF-gated outbound fetch).
+- **#11** — the roadmap/tracking umbrella (state of the repo + doc index).
+Keep new deferrals/ideas as issues going forward; these docs stay the
+narrative, issues are the actionable subset.
+
 ## Open items for the human (don't act without a nudge)
 
 - The repo exists and is public; keep pushing to it.
