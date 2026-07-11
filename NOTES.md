@@ -64,17 +64,22 @@ ports reached for it without coordinating.
    `appPaths`). Consequences, in increasing severity:
    - nip05/webdav/carddav land on `/.well-known/*`, which core *happens* to
      blanket-exempt — so they work **by luck**, not by contract.
-   - mastodon needs `/api` **and** `/oauth`, which core does **not** exempt,
-     so **the plugin cannot serve its own surface** — every call 401s at the
-     WAC hook until the operator hand-passes `appPaths: ['/api','/oauth']`.
-     A plugin has no `api.appPaths.add()` to fix this itself.
+   - **mastodon** needs `/api` **and** `/oauth`, and **bluesky** needs
+     `/xrpc` — none of which core exempts, so **the plugin cannot serve its
+     own surface**: every call 401s at the WAC hook until the operator
+     hand-passes `appPaths: ['/api','/oauth','/xrpc']`. A plugin has no way
+     to exempt a path it owns. **Two independent confirmations** (two
+     protocol shims, built separately), and bluesky sharpens it: it needs
+     only *one* extra root and still can't reach it, so the seam is not
+     "more prefixes" but **"a plugin declares the paths it owns,
+     independent of its mount prefix."**
    - none of it has conflict detection: a future core route at a
      plugin-claimed path throws `FST_ERR_DUPLICATED_ROUTE` at boot.
-   The seam: entries declare the paths they own (`paths: ['/api','/oauth']`
-   or a plural `prefix`), the loader exempts and claims them deliberately
-   and reports collisions. This is the seam **API-shim plugins**
-   (mastodon, and any future Bluesky/ActivityPub/gateway) structurally
-   require.
+   The seam: `api.reservePath('/xrpc')` (or `paths: [...]` in the entry) —
+   the loader exempts *and* claims each deliberately and reports collisions.
+   This is the seam **every API-shim plugin** (mastodon, bluesky, and any
+   future ActivityPub/Matrix/gateway) structurally requires; it's the third
+   most-demanded after `api.authorize` and `api.events`.
 6. **Can't set fastify server options** — consumer: capability/ hit
    `maxParamLength` (100) silently 404ing long tokens in named params;
    workaround is a wildcard route. A plugin has no way to raise per-route

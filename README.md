@@ -64,9 +64,10 @@ README and NOTES.md, ship the closest honest approximation.
 | `otp/` | #505 | one-time-password session flow; account recovery needs core auth |
 | `carddav/` | #157 | contact sync (iOS/macOS/Thunderbird/DAVx5); the DAV bridge, generalized |
 | `mastodon/` | #515/#516 | Mastodon-API shim — a client logs into its own pod; needs `appPaths` widened |
+| `bluesky/` | #211 | AT-Protocol XRPC shim — same shape, `/xrpc` root; token bridge generalizes |
 
-**~130 tests, all green** (`npm test`), including `compose.test.js` — all
-fifteen plugins on one server from pure config, pods + WAC intact beside
+**~150 tests, all green** (`npm test`), including `compose.test.js` — all
+sixteen plugins on one server from pure config, pods + WAC intact beside
 them. Findings consolidated in [NOTES.md](./NOTES.md); the full
 plugin-tagged backlog triaged in [ISSUES.md](./ISSUES.md).
 

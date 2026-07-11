@@ -46,7 +46,7 @@ describe('composition: every plugin on one server', () => {
 
   after(async () => { if (jss) await jss.close(); });
 
-  it('boots pods + idp + fifteen plugins from config', async () => {
+  it('boots pods + idp + sixteen plugins from config', async () => {
     const port = await probePort();
     base = `http://127.0.0.1:${port}`;
     wsBase = `ws://127.0.0.1:${port}`;
@@ -55,9 +55,10 @@ describe('composition: every plugin on one server', () => {
       port,
       root,
       idp: true,
-      // mastodon owns fixed roots outside its prefix; a plugin can't
-      // self-exempt them (finding), so the operator widens appPaths.
-      appPaths: ['/api', '/oauth'],
+      // mastodon (/api,/oauth) and bluesky (/xrpc) own fixed roots outside
+      // their prefix; a plugin can't self-exempt them (finding), so the
+      // operator widens appPaths.
+      appPaths: ['/api', '/oauth', '/xrpc'],
       // Explicit ids: the <name>/plugin.js convention makes every basename
       // reduce to 'plugin' — the loader's duplicate-id guard requires ids
       // here (finding: derive from the parent dir for generic basenames).
@@ -82,6 +83,7 @@ describe('composition: every plugin on one server', () => {
         { id: 'otp', module: at('otp/plugin.js'), prefix: '/otp', config: {} },
         { id: 'carddav', module: at('carddav/plugin.js'), prefix: '/carddav', config: { baseUrl: base, loopbackUrl: base } },
         { id: 'mastodon', module: at('mastodon/plugin.js'), prefix: '/mastodon', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'bluesky', module: at('bluesky/plugin.js'), prefix: '/bluesky', config: { baseUrl: base, loopbackUrl: base } },
       ],
     });
     assert.ok(jss.base);
@@ -213,6 +215,11 @@ describe('composition: every plugin on one server', () => {
     const res = await fetch(`${base}/api/v1/instance`);
     assert.strictEqual(res.status, 200);
     assert.ok('title' in (await res.json()));
+  });
+
+  it('bluesky: the XRPC describeServer answers (fixed /xrpc root)', async () => {
+    const res = await fetch(`${base}/xrpc/com.atproto.server.describeServer`);
+    assert.strictEqual(res.status, 200);
   });
 
   it('pods still work beside all of it (idp register + WAC)', async () => {

@@ -28,9 +28,10 @@ const fastify = createServer({
   root: PODS,
   idp: true,
   idpIssuer: PUBLIC_URL,
-  // mastodon owns fixed roots (/api, /oauth) outside its prefix; a plugin
-  // can't self-exempt them from WAC, so the operator widens appPaths.
-  appPaths: ['/api', '/oauth'],
+  // mastodon (/api,/oauth) and bluesky (/xrpc) own fixed roots outside
+  // their prefix; a plugin can't self-exempt them from WAC, so the
+  // operator widens appPaths.
+  appPaths: ['/api', '/oauth', '/xrpc'],
   // Explicit ids — the <name>/plugin.js convention collides on basename.
   plugins: [
     { id: 'relay', module: at('relay/plugin.js'), prefix: '/relay' },
@@ -53,6 +54,7 @@ const fastify = createServer({
     { id: 'otp', module: at('otp/plugin.js'), prefix: '/otp', config: {} },
     { id: 'carddav', module: at('carddav/plugin.js'), prefix: '/carddav', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
     { id: 'mastodon', module: at('mastodon/plugin.js'), prefix: '/mastodon', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    { id: 'bluesky', module: at('bluesky/plugin.js'), prefix: '/bluesky', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
   ],
 });
 
@@ -81,3 +83,4 @@ console.log(`  sparql:         POST ${PUBLIC_URL}/sparql  (auth)`);
 console.log(`  otp:            POST ${PUBLIC_URL}/otp/request`);
 console.log(`  carddav:        ${PUBLIC_URL}/carddav/  (contact sync)`);
 console.log(`  mastodon:       GET ${PUBLIC_URL}/api/v1/instance  (point a client here)`);
+console.log(`  bluesky:        GET ${PUBLIC_URL}/xrpc/com.atproto.server.describeServer`);

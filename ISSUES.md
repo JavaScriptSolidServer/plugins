@@ -26,6 +26,7 @@ evidence. Legend:
 | #515 / #516 | `mastodon/` | Mastodon-API shim — a client can log into its own pod (needs `appPaths` widened → 🔩) |
 | #505 | `otp/` | one-time-password session flow (account *recovery* → 🔩 core auth) |
 | #157 | `carddav/` | CardDAV contact sync (iOS/macOS/Thunderbird/DAVx5) |
+| #211 | `bluesky/` | AT-Protocol XRPC shim — a client logs into its own pod (needs `appPaths` widened → 🔩) |
 
 Plus six **ports of bundled features** proving the migration path for #564 /
 #164: `relay/` `webrtc/` `terminal/` `tunnel/` `notifications/`, and `pay/`
@@ -45,7 +46,6 @@ Plus six **ports of bundled features** proving the migration path for #564 /
 
 | Issue | Shape |
 |---|---|
-| #211 | Bluesky / AT-Protocol shim — same shape as `mastodon/`, different wire format |
 | #527 | Tunnel client mode — extends `tunnel/` to dial *out* to a relay |
 | #277 | MongoDB-backed relay — `relay/` with a Mongo store (needs the infra) |
 
@@ -58,7 +58,7 @@ Each names the seam and the consumer that proves it. Ranked in
 |---|---|
 | #509 (write-index), #501 | `api.events.onResourceChange` — react to pod writes |
 | #382 (per-pod ACL), #506 (pod grants) | `api.authorize(request, path, mode)` — ask the host's WAC |
-| #515/#516 (fixed roots), #211 | `api.appPaths.add()` / multi-prefix — an API-shim owns roots outside one prefix and can't self-exempt them from WAC |
+| #515/#516, #211 (both built, but need operator `appPaths`) | `api.reservePath()` — an API-shim owns fixed roots outside its prefix and can't self-exempt them from WAC; **two independent confirmations** |
 | #505 (recovery) | `api.auth.mintSession` / `api.identity.addAuthKey` — turn a proven channel into pod authority |
 | #495 #496 #500 #501 | `api.mcp.registerTool` — MCP has no plugin-tool seam; all four MCP issues want new tools a plugin can't add today |
 | #463 #464 | app-registry primitive — surfacing installed plugins as Solid resources |
@@ -87,8 +87,8 @@ exists.
 
 ## Tally
 
-Of ~40 plugin-tagged issues: **9 built as plugins here**, **6 ported**, **5
-shipped upstream**, **3 more plugin-able with no blocker**, **6 clusters
+Of ~40 plugin-tagged issues: **10 built as plugins here**, **6 ported**, **5
+shipped upstream**, **2 more plugin-able with no blocker**, **6 clusters
 blocked on a named seam** (each with a proof-of-need consumer), the rest
 core-by-nature or product-scale. The plugin api reaches most of the backlog
 today; ranked by how many independent plugins demanded them, the seams that
