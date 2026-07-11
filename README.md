@@ -30,8 +30,10 @@ applied to JSS's own feature set.
 
 **[AGENT.md](./AGENT.md)** is the comprehensive guide for adding plugins —
 the api, the five reusable patterns, the gaps and their workarounds, a
-copy-this-plugin map, and the footguns. Read it, then `NOTES.md` (findings)
-and `ISSUES.md` (backlog).
+copy-this-plugin map, and the footguns. **[NEXT.md](./NEXT.md)** is the
+handoff for whoever (LLM or human) continues the work: current state, the
+next wave, the per-plugin loop, and the backlog. Read those, then `NOTES.md`
+(findings) and `ISSUES.md` (backlog triage).
 
 ## The rule
 
