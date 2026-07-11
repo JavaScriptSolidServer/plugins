@@ -12,7 +12,7 @@ answers `402 PaymentRequired` *instead of* 401/403 on LDP routes), with
 MRC20 token deposits verified by `src/mrc20.js` and balance/deposit
 endpoints alongside.
 
-## Why a plugin can't be that
+## Findings — why a plugin can't be that
 
 The plugin api grants routes *under your own prefix*. Pay's essence is
 modifying the host's handling of routes it **doesn't** own — every LDP
