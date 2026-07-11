@@ -53,7 +53,10 @@ that can send one.
 VEVENT `.ics` (ETag returned) → `PROPFIND Depth 1` lists it with that ETag +
 `text/calendar` → `GET` returns the VEVENT → `REPORT calendar-multiget` returns
 it inside `<CAL:calendar-data>` → `DELETE` → it's gone from the next `PROPFIND`.
-All driven with a real pod Bearer through real WAC in `test.js` (15 tests).
+Plus the free-busy slice: seed overlapping/adjacent/out-of-range/transparent/
+recurring/WAC-hidden events → `REPORT free-busy-query` → exactly the merged
+busy set comes back. All driven with a real pod Bearer through real WAC in
+`test.js` (22 tests).
 
 ## What maps
 
@@ -64,11 +67,54 @@ All driven with a real pod Bearer through real WAC in `test.js` (15 tests).
 | `PROPFIND` discovery | derives pod from `api.auth.getAgent` | `current-user-principal`, `principal-URL`, `calendar-home-set` |
 | `REPORT` `calendar-multiget` | `GET` per `<D:href>` | returns `getetag` + `<CAL:calendar-data>` |
 | `REPORT` `calendar-query` | lists the collection | returns **all** events (filter not evaluated — below) |
+| `REPORT` `free-busy-query` | lists the collection, `GET` per event | 200 `text/calendar` VFREEBUSY; merged busy periods from the VEVENTs in range (below) |
+| `GET <prefix>/freebusy/<pod>?start=…&end=…` | same as free-busy-query | **non-standard extension**; same VFREEBUSY without XML |
 | `GET`/`HEAD` `.ics` | `GET`/`HEAD`, body passthrough | `text/calendar`, content-hash `ETag` header |
 | `PUT` `.ics` | `PUT` (auto-creates the container) | stores the VEVENT, returns content-hash `ETag` |
 | `DELETE` `.ics` | `DELETE` | 204 |
 | `MKCALENDAR` / `MKCOL` / extended MKCOL | `PUT` to the trailing-slash URL | 201; host 409 "exists" → 405; body accepted but its props dropped |
 | `/.well-known/caldav` | 301 → `<prefix>/` (guarded attempt) | PROPFIND there serves discovery |
+
+## Free-busy
+
+`REPORT` with a `<CAL:free-busy-query>` body on the calendar collection
+(RFC 4791 §7.10) answers **200 `text/calendar`** with a VFREEBUSY whose
+`FREEBUSY` lines are the merged busy periods computed from the collection's
+VEVENTs:
+
+```xml
+REPORT /caldav/alice/calendar/ HTTP/1.1
+Content-Type: application/xml
+
+<CAL:free-busy-query xmlns:CAL="urn:ietf:params:xml:ns:caldav">
+  <CAL:time-range start="20260720T000000Z" end="20260725T000000Z"/>
+</CAL:free-busy-query>
+```
+
+Semantics (all exercised in `test.js`):
+
+- overlapping and adjacent busy periods are **merged**; everything is clamped
+  to the requested range; periods are emitted sorted;
+- `TRANSP:TRANSPARENT` and `STATUS:CANCELLED` events are free (per §7.10);
+- an event without `DTEND` uses `DURATION`, else the RFC 5545 defaults
+  (one day for all-day `DTSTART`s, zero — i.e. not busy — for date-times);
+- **recurrence**: `RRULE` with `FREQ=DAILY` or `FREQ=WEEKLY` (plus
+  `INTERVAL`/`COUNT`/`UNTIL`) is expanded within the range. Any other `FREQ`
+  or any `BY*` part is **not expanded** — only the master occurrence is
+  counted, an honest under-report (see "What doesn't map");
+- **privacy**: every event is fetched over loopback with the *caller's*
+  credentials, so an event WAC hides from the caller contributes **no** busy
+  time — unreadable events are invisible, not busy (Findings, below);
+- a missing/malformed/non-UTC/inverted `<CAL:time-range>` → **400**.
+
+**Extension (non-standard):** `GET <prefix>/freebusy/<pod>?start=…&end=…`
+returns the same VFREEBUSY over `<pod>/<calendar>/` — handy for dashboards
+and scripts that don't speak REPORT. Stamps accept iCalendar basic format
+(`20260720T000000Z`) or ISO 8601. The route only intercepts GETs that carry a
+`start`/`end` query param, so a pod actually named `freebusy` keeps its plain
+GETs — but it *is* a shadowed name; pick a different pod name if you need
+both. The collection's `<D:supported-report-set>` advertises
+`calendar-query`, `calendar-multiget` and `free-busy-query`.
 
 ## What doesn't map
 
@@ -77,11 +123,14 @@ All driven with a real pod Bearer through real WAC in `test.js` (15 tests).
   returns every VEVENT in the collection and the client filters locally. Correct
   but not selective — the filter/time-range engine is a sensible follow-up, not
   "minimum usable sync".
-- **Recurrence, free-busy, scheduling** — `RRULE` expansion, `calendar-data`
-  with `<CAL:expand>`, `free-busy-query` REPORT, and the iTIP/iMIP scheduling
-  inbox/outbox (RFC 6638) are all **out of scope**. Events are stored and served
-  as opaque `.ics` bodies; a recurring VEVENT round-trips verbatim but the bridge
-  does not expand or compute occurrences.
+- **Full recurrence & scheduling** — `free-busy-query` is now in (above), but
+  `calendar-data` with `<CAL:expand>`, the general RRULE grammar (`MONTHLY`/
+  `YEARLY`, any `BY*` part, `EXDATE`/`RDATE`, `RECURRENCE-ID` overrides) and
+  the iTIP/iMIP scheduling inbox/outbox (RFC 6638) remain **out of scope**.
+  Events are stored and served as opaque `.ics` bodies; a recurring VEVENT
+  round-trips verbatim, and free-busy expands only the simple
+  `DAILY`/`WEEKLY` shapes. Likewise free-busy treats `TZID`-qualified and
+  floating times as UTC — VTIMEZONE is not evaluated.
 - **`sync-collection` / CTag** — no incremental sync token. Clients fall back to
   a full `PROPFIND` + ETag diff each poll, which works but is chattier. A real
   CTag/sync-token needs a change feed the plugin api doesn't expose
@@ -166,3 +215,67 @@ All driven with a real pod Bearer through real WAC in `test.js` (15 tests).
    `carddav/`, covered by the public auth seam with no reach into `src/`. (A
    `did:…` WebID has no pod path segment; there the discovery props fall back to
    echoing the requested path.)
+
+7. **Free-busy is read-time O(N) over the whole collection, per query — the
+   `api.events` seam again, not a new consumer.** Every `free-busy-query` (and
+   the `/freebusy/` GET) lists the calendar and loopback-`GET`s **every**
+   `.ics` in it, parses it, and recomputes the merge from scratch — even for a
+   one-hour range over a ten-year calendar. The obvious fix is a write-time
+   index (per-event `[start, end)` intervals maintained on PUT/DELETE, queried
+   in O(log N)), and that is precisely `api.events.onResourceChange` — the
+   same seam this plugin already wants for CTag/`sync-token` (finding in "What
+   doesn't map") and that `sparql/`, `rss/`, `search/` et al. document. Count
+   this as **another face of the existing caldav consumer**, sharpening the
+   seam, not a new entry in the tally: one plugin, two features (sync tokens
+   and free-busy), both blocked on the same missing hook. A wrinkle an index
+   design must face that plain staleness doesn't: the index is computed under
+   *whose* authority? A shared index leaks WAC-hidden events into busy time
+   unless it's per-agent or re-filtered at query time — the read-time walk
+   gets that for free (next finding).
+
+8. **WAC-filtered busy time is correct by construction — a free emergent
+   property of the loopback data plane.** The busy walk fetches each event
+   with the *caller's* forwarded `Authorization`, so an event the caller
+   cannot read returns 403 over loopback and is silently skipped: **unreadable
+   events are invisible, not busy**. Nobody wrote a privacy policy for
+   free-busy; the composition of "loopback with forwarded creds" and "skip
+   what you can't read" *is* the policy, and it can't drift from the server's
+   WAC because it is the server's WAC. (`test.js` proves it: a resource `.acl`
+   granting Read to a different WebID makes even the owner's token skip that
+   event's period.) Note the classic CalDAV deployment choice this makes:
+   hiding an event hides its busy time too. "Show as busy but not details" —
+   what Schedule-Inbox deployments often want — would need a *weaker-than-
+   Read* WAC mode or an owner-authority query, which is `api.authorize`
+   territory again.
+
+9. **Scheduling (RFC 6638 iTIP/iMIP, Schedule-Inbox/Outbox) needs cross-user
+   delivery — a seam this api genuinely does not have.** Free-busy *reporting*
+   (this feature) is the read half of scheduling; the write half is: Alice
+   POSTs an invitation to her Schedule-Outbox and the server **delivers** a
+   copy into Bob's Schedule-Inbox — a write into *another user's* pod that
+   Alice herself has no WAC right to make. The loopback pattern is structurally
+   unable to express it: forwarding Alice's credentials to write into Bob's
+   inbox correctly 403s. What would cover it, honestly ranked: (a) the
+   **issuer/owner-authority case of `api.authorize`** — the plugin acts under
+   the *recipient's* standing grant ("scheduling may append to my inbox"), the
+   exact shape `capability/` and `corsproxy/` already document, plus an
+   append-with-that-authority primitive; or (b) **server-mediated delivery** —
+   core owns a deliver-to-inbox operation (the LDP inbox, `ldp:inbox` /
+   Solid notifications) and the plugin merely requests it, keeping all
+   authority in core. (b) is the smaller grant and matches how `activitypub/`
+   already treats inbox delivery; either way it is the first CalDAV feature
+   where the bridge cannot borrow the caller's authority, because the whole
+   point is acting on someone who isn't the caller.
+
+10. **First read of the stored bytes — the "opaque body" boundary crossed with
+    no new seam, but two honest lies documented.** Until free-busy, the bridge
+    never parsed iCalendar; ~90 lines of vendored RFC 5545 (unfold, VEVENT
+    props, DATE/DATE-TIME, DURATION, DAILY/WEEKLY RRULE) sufficed, with no new
+    import and no internal reach — the import rule held. The two places the
+    minimal parser is honestly wrong rather than incomplete: `TZID`/floating
+    times are treated as UTC (no VTIMEZONE evaluation), and non-`DAILY`/
+    `WEEKLY` or `BY*` recurrences count only their master occurrence — both
+    **under-report** busy time, which for free-busy is the bad direction (a
+    scheduler may book over a hidden occurrence). A real deployment wants a
+    vendored full RRULE/timezone engine; the plugin api itself was not the
+    limit here.

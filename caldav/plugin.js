@@ -24,6 +24,11 @@
 //     optional `calendar-color`);
 //   - REPORT `calendar-query` / `calendar-multiget` return the VCALENDAR bodies
 //     inside `<CAL:calendar-data>`;
+//   - REPORT `free-busy-query` (RFC 4791 §7.10) computes merged busy periods
+//     from the VEVENTs in range and answers 200 `text/calendar` with a
+//     VFREEBUSY; events the caller cannot read are simply not busy-counted
+//     (WAC over loopback = privacy for free). A non-standard convenience
+//     `GET <prefix>/freebusy/<pod>?start=…&end=…` returns the same VFREEBUSY;
 //   - discovery props (`current-user-principal`, `calendar-home-set`) point a
 //     phone/Thunderbird at the calendar; `/.well-known/caldav` 301s to it;
 //   - MKCALENDAR (RFC 4791's extended MKCOL) creates the calendar collection.
@@ -40,7 +45,7 @@
 // is bridged to `Bearer <password>` — use any username and a pod token as the
 // password.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 const CAL_NS = 'urn:ietf:params:xml:ns:caldav';
 const CS_NS = 'http://calendarserver.org/ns/';
@@ -89,6 +94,164 @@ function response(href, props, notFound = []) {
       + '<D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>';
   }
   return out + '</D:response>';
+}
+
+// ------------------------------------------------------------------ iCalendar
+// Free-busy is the first place the bridge *reads* the iCalendar bytes it
+// otherwise stores verbatim; the parser below is deliberately minimal — just
+// enough of RFC 5545 to compute busy periods (unfold, VEVENT properties,
+// date/date-time, DURATION, DAILY/WEEKLY RRULE). See README "Findings".
+
+/** RFC 5545 §3.1 unfolding: a line starting with SP/HTAB continues the previous. */
+function unfoldIcal(text) {
+  const out = [];
+  for (const line of String(text).split(/\r?\n/)) {
+    if ((line.startsWith(' ') || line.startsWith('\t')) && out.length) {
+      out[out.length - 1] += line.slice(1);
+    } else {
+      out.push(line);
+    }
+  }
+  return out;
+}
+
+/**
+ * Parse an iCalendar DATE ('20260720') or DATE-TIME ('20260720T090000[Z]').
+ * TZID-qualified and floating times are treated as UTC — the bridge does not
+ * evaluate VTIMEZONE (documented limitation). Returns { ms, dateOnly } | null.
+ */
+function parseIcalStamp(value) {
+  let m = /^(\d{4})(\d{2})(\d{2})$/.exec(value || '');
+  if (m) return { ms: Date.UTC(+m[1], +m[2] - 1, +m[3]), dateOnly: true };
+  m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z?$/.exec(value || '');
+  if (m) return { ms: Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]), dateOnly: false };
+  return null;
+}
+
+/** RFC 5545 DURATION ('P1DT2H30M', 'PT1H', 'P2W', '-PT15M') → milliseconds | null. */
+function parseIcalDuration(value) {
+  const m = /^([+-]?)P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/.exec(value || '');
+  if (!m || /^[+-]?P$/.test(value)) return null;
+  const [, sign, w, d, h, min, s] = m;
+  const ms = ((+(w || 0) * 7 + +(d || 0)) * 86400 + +(h || 0) * 3600 + +(min || 0) * 60 + +(s || 0)) * 1000;
+  return sign === '-' ? -ms : ms;
+}
+
+/** RRULE value ('FREQ=DAILY;COUNT=3') → uppercased { FREQ, COUNT, … }. */
+function parseRrule(value) {
+  const rule = {};
+  for (const part of String(value || '').split(';')) {
+    const eq = part.indexOf('=');
+    if (eq > 0) rule[part.slice(0, eq).trim().toUpperCase()] = part.slice(eq + 1).trim();
+  }
+  return rule;
+}
+
+/** Every VEVENT in an iCalendar body as [{ name, value }] property lists. */
+function parseVevents(ics) {
+  const events = [];
+  let current = null;
+  for (const line of unfoldIcal(ics)) {
+    if (/^BEGIN:VEVENT$/i.test(line.trim())) {
+      current = [];
+      continue;
+    }
+    if (/^END:VEVENT$/i.test(line.trim())) {
+      if (current) events.push(current);
+      current = null;
+      continue;
+    }
+    if (!current) continue;
+    // NAME[;param=value…]:VALUE — params (TZID, VALUE=DATE) are not needed:
+    // the stamp grammar distinguishes DATE from DATE-TIME by shape.
+    const m = /^([A-Za-z0-9-]+)(?:;[^:]*)?:(.*)$/.exec(line);
+    if (m) current.push({ name: m[1].toUpperCase(), value: m[2] });
+  }
+  return events;
+}
+
+/**
+ * Busy periods (clamped to [rangeStart, rangeEnd) ms) contributed by one
+ * VEVENT. Transparent and cancelled events are free (RFC 4791 §7.10).
+ * Recurrence: FREQ=DAILY|WEEKLY with INTERVAL/COUNT/UNTIL is expanded; any
+ * other FREQ or a BY* part falls back to the master occurrence only — an
+ * honest under-report, documented in the README.
+ */
+function veventBusyPeriods(props, rangeStart, rangeEnd) {
+  const get = (name) => props.find((p) => p.name === name);
+  if ((get('TRANSP')?.value || '').trim().toUpperCase() === 'TRANSPARENT') return [];
+  if ((get('STATUS')?.value || '').trim().toUpperCase() === 'CANCELLED') return [];
+  const start = parseIcalStamp(get('DTSTART')?.value);
+  if (!start) return [];
+
+  let durMs = null;
+  const end = parseIcalStamp(get('DTEND')?.value);
+  if (end) durMs = end.ms - start.ms;
+  else if (get('DURATION')) durMs = parseIcalDuration(get('DURATION').value);
+  if (durMs == null) durMs = start.dateOnly ? 86400000 : 0; // RFC 5545 §3.6.1 defaults
+  if (durMs <= 0) return [];
+
+  const starts = [];
+  const rrule = get('RRULE') ? parseRrule(get('RRULE').value) : null;
+  const expandable = rrule
+    && (rrule.FREQ === 'DAILY' || rrule.FREQ === 'WEEKLY')
+    && !Object.keys(rrule).some((k) => k.startsWith('BY'));
+  if (expandable) {
+    const interval = Math.max(1, parseInt(rrule.INTERVAL || '1', 10) || 1);
+    const stepMs = (rrule.FREQ === 'WEEKLY' ? 7 : 1) * 86400000 * interval;
+    const count = rrule.COUNT ? parseInt(rrule.COUNT, 10) : Infinity;
+    const until = rrule.UNTIL ? (parseIcalStamp(rrule.UNTIL)?.ms ?? -Infinity) : Infinity;
+    for (let i = 0, t = start.ms; i < count && t <= until && t < rangeEnd && i < 10000; i += 1, t += stepMs) {
+      starts.push(t);
+    }
+  } else {
+    starts.push(start.ms);
+  }
+
+  const periods = [];
+  for (const s of starts) {
+    const cs = Math.max(s, rangeStart);
+    const ce = Math.min(s + durMs, rangeEnd);
+    if (cs < ce) periods.push([cs, ce]);
+  }
+  return periods;
+}
+
+/** Sort + merge overlapping/adjacent [startMs, endMs] periods. */
+function mergePeriods(periods) {
+  const sorted = [...periods].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const out = [];
+  for (const [s, e] of sorted) {
+    if (out.length && s <= out[out.length - 1][1]) {
+      out[out.length - 1][1] = Math.max(out[out.length - 1][1], e);
+    } else {
+      out.push([s, e]);
+    }
+  }
+  return out;
+}
+
+/** ms epoch → iCalendar UTC date-time ('20260720T090000Z'). */
+function fmtIcalUtc(ms) {
+  return new Date(ms).toISOString().replace(/[-:]|\.\d{3}/g, '');
+}
+
+/** The VFREEBUSY response body (CRLF, RFC 4791 §7.10.8-style). */
+function buildVfreebusy(rangeStart, rangeEnd, merged) {
+  return [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//JSS caldav bridge//EN',
+    'BEGIN:VFREEBUSY',
+    `UID:${randomUUID()}`,
+    `DTSTAMP:${fmtIcalUtc(Date.now())}`,
+    `DTSTART:${fmtIcalUtc(rangeStart)}`,
+    `DTEND:${fmtIcalUtc(rangeEnd)}`,
+    ...merged.map(([s, e]) => `FREEBUSY:${fmtIcalUtc(s)}/${fmtIcalUtc(e)}`),
+    'END:VFREEBUSY',
+    'END:VCALENDAR',
+    '',
+  ].join('\r\n');
 }
 
 export async function activate(api) {
@@ -215,7 +378,7 @@ export async function activate(api) {
       'current-user-principal', 'principal-URL', 'calendar-home-set',
       'calendar-data', 'calendar-description', 'supported-calendar-component-set',
       'supported-calendar-data', 'calendar-color', 'calendar-timezone',
-      'getctag', 'sync-token',
+      'getctag', 'sync-token', 'supported-report-set',
     ]) {
       if (new RegExp(`[:<]${p}\\b`, 'i').test(xml)) want.add(p);
     }
@@ -273,6 +436,12 @@ export async function activate(api) {
     }
     if (want.has('calendar-color') && cal && calColor) {
       found.push(`<IC:calendar-color>${xmlEscape(calColor)}</IC:calendar-color>`);
+    }
+    if (want.has('supported-report-set')) {
+      const reports = ['<CAL:calendar-query/>', '<CAL:calendar-multiget/>', '<CAL:free-busy-query/>'];
+      found.push('<D:supported-report-set>'
+        + reports.map((r) => `<D:supported-report><D:report>${r}</D:report></D:supported-report>`).join('')
+        + '</D:supported-report-set>');
     }
     // A container has no body, hence no ETag; treat getetag as "not found".
     const missing = [];
@@ -356,11 +525,58 @@ export async function activate(api) {
     return response(prefix + path, props, missing);
   }
 
+  /**
+   * Compute merged busy periods over every readable VEVENT in `collPath` and
+   * answer 200 text/calendar with a VFREEBUSY (RFC 4791 §7.10). Each event is
+   * fetched over loopback with the CALLER's credentials, so an event WAC hides
+   * from the caller is skipped — invisible, not busy (correct privacy).
+   */
+  async function handleFreeBusy(reply, collPath, rangeStart, rangeEnd, auth) {
+    const coll = collPath.endsWith('/') ? collPath : collPath + '/';
+    const { res, listing } = await fetchListing(coll, auth);
+    if (res.status === 401) return unauthorized(reply);
+    if (!res.ok) return reply.code(res.status).send();
+    const periods = [];
+    for (const childPath of childPaths(listing, coll)) {
+      if (childPath.endsWith('/') || !childPath.endsWith('.ics')) continue;
+      const got = await getResource(childPath, auth); // unreadable → skipped, not busy
+      if (!got.body) continue;
+      for (const props of parseVevents(got.body.toString('utf8'))) {
+        periods.push(...veventBusyPeriods(props, rangeStart, rangeEnd));
+      }
+    }
+    return reply.code(200)
+      .header('content-type', ICAL_TYPE)
+      .send(buildVfreebusy(rangeStart, rangeEnd, mergePeriods(periods)));
+  }
+
+  /** The <CAL:time-range start end/> of a free-busy-query; null if malformed. */
+  function freeBusyRange(xml) {
+    const tr = /<[A-Za-z]*:?time-range\b([^>]*)\/?>/i.exec(xml);
+    if (!tr) return null;
+    const attr = (name) => new RegExp(`\\b${name}="([^"]*)"`).exec(tr[1])?.[1];
+    const rawStart = attr('start');
+    const rawEnd = attr('end');
+    // RFC 4791 §9.9: start/end MUST be UTC date-times.
+    if (!/Z$/.test(rawStart || '') || !/Z$/.test(rawEnd || '')) return null;
+    const start = parseIcalStamp(rawStart);
+    const end = parseIcalStamp(rawEnd);
+    if (!start || !end || start.dateOnly || end.dateOnly || start.ms >= end.ms) return null;
+    return { start: start.ms, end: end.ms };
+  }
+
   async function handleReport(request, reply) {
     const auth = bridgeAuth(request);
     const path = hostPath(request.raw.url);
     if (!path) return reply.code(400).send();
     const xml = readBody(request);
+
+    if (/<[A-Za-z]*:?free-busy-query\b/i.test(xml)) {
+      const range = freeBusyRange(xml);
+      if (!range) return reply.code(400).send(); // missing/malformed time-range
+      return handleFreeBusy(reply, path, range.start, range.end, auth);
+    }
+
     const multiget = /<[A-Za-z:]*calendar-multiget\b/i.test(xml);
     // Both report types return calendar-data + getetag for the matched events.
 
@@ -412,6 +628,27 @@ export async function activate(api) {
     const auth = bridgeAuth(request);
     const path = hostPath(request.raw.url);
     if (!path) return reply.code(400).send();
+
+    // Non-standard convenience (documented extension): GET
+    // <prefix>/freebusy/<pod>?start=…&end=… returns the same VFREEBUSY as the
+    // free-busy-query REPORT over <pod>/<calName>/. Stamps accept iCalendar
+    // basic ('20260720T000000Z') or anything Date.parse takes (ISO 8601).
+    // Only intercepts when a start/end param is present, so a pod literally
+    // named 'freebusy' keeps its plain GETs.
+    const fb = /^\/freebusy\/([^/]+)\/?$/.exec(path);
+    if (request.raw.method === 'GET' && fb && (request.query?.start || request.query?.end)) {
+      const stamp = (v) => {
+        const p = typeof v === 'string' ? parseIcalStamp(v) : null;
+        if (p) return p.ms;
+        const t = typeof v === 'string' ? Date.parse(v) : NaN;
+        return Number.isNaN(t) ? null : t;
+      };
+      const start = stamp(request.query.start);
+      const end = stamp(request.query.end);
+      if (start == null || end == null || start >= end) return reply.code(400).send();
+      return handleFreeBusy(reply, `/${fb[1]}/${calName}/`, start, end, auth);
+    }
+
     const fwd = {};
     for (const h of ['if-match', 'if-none-match']) {
       if (request.headers[h]) fwd[h] = request.headers[h];

@@ -226,4 +226,167 @@ describe('caldav plugin', () => {
     });
     assert.strictEqual(res.status, 207);
   });
+
+  // ------------------------------------------------------------- free-busy
+  // RFC 4791 §7.10 free-busy-query over the range 2026-07-20 → 2026-07-25.
+
+  const vevent = (uid, ...lines) => [
+    'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//JSS caldav bridge//EN',
+    'BEGIN:VEVENT', `UID:urn:uuid:${uid}`, 'DTSTAMP:20260710T120000Z',
+    ...lines,
+    'END:VEVENT', 'END:VCALENDAR', '',
+  ].join('\r\n');
+
+  const putIcs = async (name, body) => {
+    const res = await fetch(cd(`/cal/calendar/${name}`), {
+      method: 'PUT',
+      headers: { ...bearer(), 'content-type': 'text/calendar' },
+      body,
+    });
+    assert.ok([200, 201, 204].includes(res.status), `PUT ${name}: ${res.status}`);
+  };
+
+  /** FREEBUSY period values from a VFREEBUSY body (folded lines handled). */
+  const freebusyPeriods = (ics) => ics
+    .split(/\r?\n/)
+    .reduce((acc, l) => { // unfold
+      if ((l.startsWith(' ') || l.startsWith('\t')) && acc.length) acc[acc.length - 1] += l.slice(1);
+      else acc.push(l);
+      return acc;
+    }, [])
+    .filter((l) => l.startsWith('FREEBUSY'))
+    .map((l) => l.slice(l.indexOf(':') + 1).trim());
+
+  const EXPECTED_BUSY = [
+    '20260720T090000Z/20260720T120000Z', // a+b overlap, c adjacent → one block
+    '20260720T150000Z/20260720T160000Z', // d (DURATION:PT1H)
+    '20260721T080000Z/20260721T083000Z', // recur day 1
+    '20260722T080000Z/20260722T083000Z', // recur day 2
+    '20260723T080000Z/20260723T083000Z', // recur day 3
+  ];
+
+  it('seeds overlapping/adjacent/out-of-range/transparent/recurring/WAC-hidden events', async () => {
+    await putIcs('fb-a.ics', vevent('fb-a', 'DTSTART:20260720T090000Z', 'DTEND:20260720T100000Z', 'SUMMARY:a'));
+    await putIcs('fb-b.ics', vevent('fb-b', 'DTSTART:20260720T093000Z', 'DTEND:20260720T110000Z', 'SUMMARY:b (overlaps a)'));
+    await putIcs('fb-c.ics', vevent('fb-c', 'DTSTART:20260720T110000Z', 'DTEND:20260720T120000Z', 'SUMMARY:c (adjacent to b)'));
+    await putIcs('fb-d.ics', vevent('fb-d', 'DTSTART:20260720T150000Z', 'DURATION:PT1H', 'SUMMARY:d (duration)'));
+    await putIcs('fb-e.ics', vevent('fb-e', 'DTSTART:20260801T090000Z', 'DTEND:20260801T100000Z', 'SUMMARY:e (outside range)'));
+    await putIcs('fb-f.ics', vevent('fb-f', 'DTSTART:20260720T180000Z', 'DTEND:20260720T190000Z', 'TRANSP:TRANSPARENT', 'SUMMARY:f (transparent = free)'));
+    await putIcs('fb-r.ics', vevent('fb-r', 'DTSTART:20260721T080000Z', 'DTEND:20260721T083000Z', 'RRULE:FREQ=DAILY;COUNT=3', 'SUMMARY:r (daily x3)'));
+
+    // An event the caller cannot read: a resource .acl granting Read to a
+    // DIFFERENT WebID only overrides the pod owner's inherited default (WAC
+    // resource ACLs are not additive), so even the owner's own token can no
+    // longer read it — cheap way to seed an unreadable-but-listed event.
+    await putIcs('secret.ics', vevent('fb-s', 'DTSTART:20260720T200000Z', 'DTEND:20260720T210000Z', 'SUMMARY:secret'));
+    const acl = await fetch(`${base}/cal/calendar/secret.ics.acl`, {
+      method: 'PUT',
+      headers: { ...bearer(), 'content-type': 'application/ld+json' },
+      body: JSON.stringify({
+        '@context': { acl: 'http://www.w3.org/ns/auth/acl#' },
+        '@graph': [{
+          '@id': '#restricted',
+          '@type': 'acl:Authorization',
+          'acl:agent': { '@id': `${base}/somebody-else/profile/card.jsonld#me` },
+          'acl:accessTo': { '@id': `${base}/cal/calendar/secret.ics` },
+          'acl:mode': { '@id': 'acl:Read' },
+        }],
+      }),
+    });
+    assert.ok([200, 201, 204].includes(acl.status), `PUT secret.ics.acl: ${acl.status}`);
+    // Prove the owner genuinely cannot read it any more.
+    const denied = await fetch(cd('/cal/calendar/secret.ics'), { headers: bearer() });
+    assert.strictEqual(denied.status, 403, `secret.ics should be unreadable: ${denied.status}`);
+  });
+
+  it('REPORT free-busy-query returns 200 text/calendar with exactly the merged busy set', async () => {
+    const res = await fetch(cd('/cal/calendar/'), {
+      method: 'REPORT',
+      headers: { ...bearer(), 'content-type': 'application/xml' },
+      body: '<?xml version="1.0"?>'
+        + '<CAL:free-busy-query xmlns:CAL="urn:ietf:params:xml:ns:caldav">'
+        + '<CAL:time-range start="20260720T000000Z" end="20260725T000000Z"/>'
+        + '</CAL:free-busy-query>',
+    });
+    assert.strictEqual(res.status, 200);
+    assert.match(res.headers.get('content-type') || '', /text\/calendar/);
+    const body = await res.text();
+    assert.ok(body.includes('BEGIN:VFREEBUSY'), body);
+    assert.ok(body.includes('DTSTART:20260720T000000Z'), body);
+    assert.ok(body.includes('DTEND:20260725T000000Z'), body);
+    // Exact merged set: a+b+c merged, d kept, e out of range, f transparent,
+    // r expanded 3×, secret WAC-hidden (invisible, NOT busy).
+    assert.deepStrictEqual(freebusyPeriods(body), EXPECTED_BUSY);
+  });
+
+  it('free-busy: WAC-hidden and transparent events are absent, out-of-range clamped', async () => {
+    const res = await fetch(cd('/cal/calendar/'), {
+      method: 'REPORT',
+      headers: { ...bearer(), 'content-type': 'application/xml' },
+      body: '<CAL:free-busy-query xmlns:CAL="urn:ietf:params:xml:ns:caldav">'
+        + '<CAL:time-range start="20260720T000000Z" end="20260802T000000Z"/>'
+        + '</CAL:free-busy-query>',
+    });
+    assert.strictEqual(res.status, 200);
+    const periods = freebusyPeriods(await res.text());
+    assert.ok(!periods.some((p) => p.startsWith('20260720T2000')), `secret leaked into busy: ${periods}`);
+    assert.ok(!periods.some((p) => p.startsWith('20260720T1800')), `transparent counted busy: ${periods}`);
+    assert.ok(periods.includes('20260801T090000Z/20260801T100000Z'), `wider range should include e: ${periods}`);
+  });
+
+  it('REPORT free-busy-query with a malformed or missing time-range is 400', async () => {
+    const report = (body) => fetch(cd('/cal/calendar/'), {
+      method: 'REPORT',
+      headers: { ...bearer(), 'content-type': 'application/xml' },
+      body,
+    });
+    const noRange = await report('<CAL:free-busy-query xmlns:CAL="urn:ietf:params:xml:ns:caldav"/>');
+    assert.strictEqual(noRange.status, 400);
+    const garbage = await report('<CAL:free-busy-query xmlns:CAL="urn:ietf:params:xml:ns:caldav">'
+      + '<CAL:time-range start="banana" end="20260725T000000Z"/></CAL:free-busy-query>');
+    assert.strictEqual(garbage.status, 400);
+    const inverted = await report('<CAL:free-busy-query xmlns:CAL="urn:ietf:params:xml:ns:caldav">'
+      + '<CAL:time-range start="20260725T000000Z" end="20260720T000000Z"/></CAL:free-busy-query>');
+    assert.strictEqual(inverted.status, 400);
+    const notUtc = await report('<CAL:free-busy-query xmlns:CAL="urn:ietf:params:xml:ns:caldav">'
+      + '<CAL:time-range start="20260720T000000" end="20260725T000000Z"/></CAL:free-busy-query>');
+    assert.strictEqual(notUtc.status, 400);
+  });
+
+  it('REPORT free-busy-query without a token is 401 — WAC still rules', async () => {
+    const res = await fetch(cd('/cal/calendar/'), {
+      method: 'REPORT',
+      headers: { 'content-type': 'application/xml' },
+      body: '<CAL:free-busy-query xmlns:CAL="urn:ietf:params:xml:ns:caldav">'
+        + '<CAL:time-range start="20260720T000000Z" end="20260725T000000Z"/></CAL:free-busy-query>',
+    });
+    assert.strictEqual(res.status, 401);
+  });
+
+  it('PROPFIND supported-report-set advertises free-busy-query', async () => {
+    const res = await fetch(cd('/cal/calendar/'), {
+      method: 'PROPFIND',
+      headers: { ...bearer(), depth: '0', 'content-type': 'application/xml' },
+      body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:">'
+        + '<D:prop><D:supported-report-set/></D:prop></D:propfind>',
+    });
+    assert.strictEqual(res.status, 207);
+    const xml = await res.text();
+    assert.ok(xml.includes('<D:supported-report-set>'), xml);
+    assert.ok(xml.includes('<CAL:free-busy-query/>'), `free-busy-query not advertised: ${xml}`);
+    assert.ok(xml.includes('<CAL:calendar-multiget/>'), xml);
+  });
+
+  it('GET /caldav/freebusy/<pod>?start&end (extension) returns the same VFREEBUSY', async () => {
+    const res = await fetch(
+      cd('/freebusy/cal?start=20260720T000000Z&end=20260725T000000Z'),
+      { headers: bearer() },
+    );
+    assert.strictEqual(res.status, 200);
+    assert.match(res.headers.get('content-type') || '', /text\/calendar/);
+    assert.deepStrictEqual(freebusyPeriods(await res.text()), EXPECTED_BUSY);
+
+    const bad = await fetch(cd('/freebusy/cal?start=banana&end=20260725T000000Z'), { headers: bearer() });
+    assert.strictEqual(bad.status, 400);
+  });
 });
