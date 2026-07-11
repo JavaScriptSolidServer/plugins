@@ -38,13 +38,14 @@ Twelve plugins in, the ranking is now empirical — a seam's rank is how many
 ports reached for it without coordinating.
 
 1. **`api.authorize(request, path, mode)`** — "would the host's WAC allow
-   this?" **Four independent consumers: notifications/, corsproxy/,
-   capability/, caldav/.** The loopback trick (below) covers the case where
+   this?" **Four independent consumers: corsproxy/, capability/, pay/,
+   caldav/.** The loopback trick (below) covers the case where
    the *requester's own* credentials should decide (notifications, webdav,
    sparql all use it), but it can't cover authorization the requester
    doesn't drive: a proxy governed by a *pod owner's* `.acl` (corsproxy
    #382), a capability exercising the *issuer's* authority
-   (capability #506), or CalDAV scheduling (RFC 6638), where Outbox→Inbox
+   (capability #506), pay/'s 402 gate (which wants to *compose with* WAC
+   rather than replace it), or CalDAV scheduling (RFC 6638), where Outbox→Inbox
    delivery is a write into the *recipient's* pod the sender has no WAC
    right to make — loopback structurally cannot express it (a
    server-mediated deliver-to-inbox primitive is the narrower
@@ -78,13 +79,18 @@ ports reached for it without coordinating.
    every "react to pod writes" app (webhooks, indexing, sync, search, live
    chat) will want, and it's now clearly the #2 most-demanded after
    `api.authorize`.
-3. **`api.serverInfo` (`{ baseUrl, port }` at listen)** — **a dozen+
+3. **`api.serverInfo` (`{ baseUrl, port }` at listen)** — **23
    consumers: notifications/, webdav/, carddav/, caldav/, sparql/, rss/,
-   nip05/, webfinger/, mastodon/, bluesky/, activitypub/, micropub/,
-   backup/, dashboard/, oembed/, jmap/, remotestorage/** — essentially
+   webfinger/, mastodon/, bluesky/, activitypub/, matrix/, micropub/,
+   backup/, metrics/, dashboard/, oembed/, jmap/, remotestorage/, s3/,
+   search/, shortlink/, didweb/, admin/** — essentially
    every plugin that mints absolute URLs or reaches the host over loopback.
-   All repeat the origin in config today; a wrong value fails quietly (nip05
-   serves an empty identity map). The single most *broadly* needed seam
+   All repeat the origin in config today; a wrong value fails quietly
+   (webfinger mints WebIDs on the wrong origin; didweb serves a `did.json`
+   whose `id` doesn't match its URL). (nip05/ was once listed here —
+   wrongly: its README finding is that NIP-05 documents carry no absolute
+   self-URLs; its config repetition is the *data-root* class, `podsRoot`,
+   which serverInfo doesn't cover.) The single most *broadly* needed seam
    (vs. api.authorize being the most *blocking*); trivially cheap to provide.
 4. **The unconsumed-body-**stream** primitive (#583)** — consumers:
    gitscratch/ sharpened it; micropub/ adds a blocked one. tunnel/ needed
@@ -109,9 +115,10 @@ ports reached for it without coordinating.
      most-wanted `.well-known` docs a deployment serves**, both riding the
      same undocumented luck.
    - **fixed roots core does NOT exempt** — mastodon/ (`/api`,`/oauth`),
-     bluesky/ (`/xrpc`), activitypub/ (`/ap`). Here the plugin **cannot
+     bluesky/ (`/xrpc`), activitypub/ (`/ap`), matrix/ (`/_matrix`). Here
+     the plugin **cannot
      serve its own surface**: every call 401s at the WAC hook until the
-     operator hand-passes `appPaths`. **Three independent protocol-shim
+     operator hand-passes `appPaths`. **Four independent protocol-shim
      confirmations**, each built separately. bluesky sharpened it (one root,
      still unreachable → the ask is "declare owned paths," not "more
      prefixes"); activitypub sharpened it further — its natural layout wants

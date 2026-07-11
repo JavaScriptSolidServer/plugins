@@ -176,11 +176,13 @@ exists, moving it from operator config to plugin declaration.
 
 ### 4. `api.serverInfo` — the broadest, and the cheapest (#601)
 
-**~16 consumers** — every plugin that mints absolute URLs or loopbacks
-(the DAV family, the shims, rss, sparql, nip05, webfinger, notifications,
-micropub, backup, metrics, dashboard, oembed, jmap, remotestorage…)
+**23 consumers** — every plugin that mints absolute URLs or loopbacks
+(the DAV family, the four shims, rss, sparql, webfinger, notifications,
+micropub, backup, metrics, dashboard, oembed, jmap, remotestorage, s3,
+search, shortlink, didweb, admin)
 repeats `baseUrl`/`loopbackUrl` in config today. A wrong value fails
-*quietly* (nip05 serves an empty map). Test suites all need a
+*quietly* (webfinger mints WebIDs on the wrong origin; didweb serves a
+`did.json` whose `id` doesn't match its URL). Test suites all need a
 probe-port-then-boot dance for the same reason.
 
 **Sketch:** `{ baseUrl, port }` available by `activate`-time or via an
@@ -335,7 +337,7 @@ hooks capability.
 
 If effort is scarce, this order maximizes unblocked value per unit cost:
 
-1. `api.serverInfo` (trivial; tidies ~16 plugins' config and every test
+1. `api.serverInfo` (trivial; tidies ~23 plugins' config and every test
    harness),
 2. `api.reservePath` (small-medium; makes four existing shims
    self-contained and didweb *possible* — pair it with a webfinger link

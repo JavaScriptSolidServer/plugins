@@ -78,21 +78,21 @@ Full ranking in `NOTES.md`. The ones you'll hit:
   allow this?" for authority the *requester* doesn't drive (a proxy governed
   by a pod owner's `.acl`, a capability exercising the *issuer's* right).
   Workaround: loopback with the requester's own creds covers the common
-  case; the issuer-authority case has no workaround — document it. (3
+  case; the issuer-authority case has no workaround — document it. (4
   consumers; the top blocking seam.)
 - **No `api.reservePath()`** — you can register routes outside your one
   `prefix`, but only `prefix` is WAC-exempt. `/.well-known/*` works by luck
   (core blanket-exempts it). Fixed roots like `/api`, `/xrpc`, `/ap` do
   **not** work until the operator passes `appPaths: ['/api',...]` to
   `createServer`. **If you build an API shim, your `test.js` must pass those
-  `appPaths`, and your README must say the operator does too.** (3 shim
+  `appPaths`, and your README must say the operator does too.** (4 shim
   consumers.)
 - **No `api.events.onResourceChange`** — you can't react to pod writes, so a
   write-time index / cached feed is impossible; do read-time work (walk the
   container per request) and note the O(N) cost. See `sparql/`, `rss/`.
 - **No `api.serverInfo`** — a plugin can't learn its own origin at
   `activate` time. Take `config.baseUrl` (and `loopbackUrl`), and `throw` if
-  missing. ~10 plugins do this.
+  missing. ~23 plugins do this.
 - **No `api.mcp.registerTool`** — MCP tools can't be added by a plugin
   (that's why #495/#496/#500/#501 aren't here).
 - **Can't set Fastify server options** — e.g. `maxParamLength` (100) 404s

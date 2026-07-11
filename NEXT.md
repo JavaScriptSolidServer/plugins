@@ -8,7 +8,9 @@ plugin), `NOTES.md` (the findings/seams — the real deliverable), and
 
 ## Where things stand
 
-- **33 plugins, 374 tests, all green** (`npm test`), all pushed to
+- **33 plugins, 386 tests, all green** (`npm test`; the three
+  `notifications/` fs.watch tests need a free inotify instance — see
+  Footguns), all pushed to
   `github.com/JavaScriptSolidServer/plugins` (branch `gh-pages`).
 - `compose.test.js` boots all 33 on **one** JSS from pure config; `serve.js`
   is the runnable demo — its front door is now `admin/` (`/admin/`), the
@@ -93,9 +95,14 @@ rather than deleting it everywhere.
 
 ### Recommended first move
 
-Don't retrofit all ~16 at once. Do **`nip05/` + `webfinger/`** first — the
-two where a wrong origin fails *silently* (nip05 serves an empty identity
-map), so the before/after story is strongest. One plugins-repo PR against
+Don't retrofit all ~23 at once. Do **`webfinger/` + `didweb/`** first — the
+two where a wrong origin fails *silently* (webfinger mints WebIDs/JRD links
+on the wrong origin; didweb serves a `did.json` whose `id` doesn't match
+the URL it's fetched from), so the before/after story is strongest. (An
+earlier draft named nip05/ here — wrongly: its own README finding says
+NIP-05 documents contain no absolute self-URLs, so it needs no `baseUrl`;
+its silent-empty-map failure is the *data-root* repetition class,
+`config.podsRoot`, which `serverInfo` does not cover.) One plugins-repo PR against
 a locally-linked core, proving the loop closes; once core publishes, flip
 the pin and merge. The rest follow the same shape. Then the next seam:
 `reservePath` (#602) → `events` (#603) → `authorize` (#604).
@@ -174,8 +181,8 @@ it sharpens the case.
 `NOTES.md` ranks candidate seams by how many independent plugins demanded
 each. Current top four (keep this current as you add consumers):
 
-1. **`api.authorize(request, path, mode)`** — 4 consumers (caldav
-   scheduling joined); the top
+1. **`api.authorize(request, path, mode)`** — 4 consumers (corsproxy,
+   capability, pay, caldav — caldav scheduling joined); the top
    *blocking* seam (authority the requester doesn't drive).
 2. **`api.events.onResourceChange`** — 7 consumers (backup, jmap,
    remotestorage joined); matrix `/sync` needs
@@ -186,7 +193,7 @@ each. Current top four (keep this current as you add consumers):
    prefix and can't self-exempt; didweb needs a *parameterized* form.
    (micropub/ is the counter-witness: client-discovered endpoints need no
    reservation — the seam is about protocol-fixed paths.)
-4. **`api.serverInfo`** — broadest (~16 plugins hand-roll their origin).
+4. **`api.serverInfo`** — broadest (~23 plugins hand-roll their origin).
    **FILED #601, MERGED as core #605** — see the Stage-3 plan above for
    consuming it. reservePath #602, events #603, authorize #604 still open.
 
@@ -216,6 +223,11 @@ empirically in NOTES: **route-owning → plugin, pipeline-modifying → core**.
 - Dotted prefixes (`/.foo`) fail the WS upgrade — use plain prefixes for
   anything with a socket. (`/.well-known/*` HTTP works, by core's blanket
   exemption — but that's the reserved-path finding, not a guarantee.)
+- `fs.watch` needs a free inotify instance: when the machine is at
+  `fs.inotify.max_user_instances`, watch creation fails (EMFILE) and the
+  three `notifications/` fan-out tests time out. An environment failure,
+  not a regression — check `sysctl fs.inotify.max_user_instances` before
+  debugging the plugin.
 
 ## Issue tracker (new — 2026-07)
 
@@ -237,6 +249,6 @@ narrative, issues are the actionable subset.
   #596–#600, four seams as core **#601 (serverInfo), #602 (reservePath),
   #603 (events), #604 (authorize)**. Next upstream step (Stage 3, needs
   the core-freeze lifted): ship `serverInfo` (#601) end-to-end as the
-  reference PR — cheapest seam, ~16 consumers — then retrofit the plugins
+  reference PR — cheapest seam, ~23 consumers — then retrofit the plugins
   that hand-roll their origin. Secondary asks (api.plugins, api.isOperator)
   not filed yet; raise when a design discussion on the four opens.

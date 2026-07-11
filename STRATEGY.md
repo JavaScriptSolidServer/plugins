@@ -3,7 +3,7 @@
 Companion to [REPORT.md](./REPORT.md) (what to build into the api next).
 This file answers the other question: **where does a JSS + plugins stack
 sit in the ecosystem, what's missing, and what's the realistic play?**
-Written 2026-07, at 33 plugins / 374 tests.
+Written 2026-07, at 33 plugins / 386 tests.
 
 ## The one-line position
 

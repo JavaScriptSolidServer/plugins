@@ -111,11 +111,11 @@ Of ~40 plugin-tagged issues: **14 built as plugins here** (plus `rss/`,
 demonstrations with no single issue), **7 ported**, **5 shipped upstream**,
 **2 more plugin-able with no blocker**, **6 clusters blocked on a named
 seam** (each with a proof-of-need consumer), the rest core-by-nature or
-product-scale. **33 plugins total, 374 tests.** The plugin api reaches most
+product-scale. **33 plugins total, 386 tests.** The plugin api reaches most
 of the backlog today; ranked by demand, the seams that would unlock the
-most next are `api.authorize` (3 blocking consumers), `api.events` (7
+most next are `api.authorize` (4 consumers, 3 hard-blocked), `api.events` (7
 consumers — matrix `/sync` needs live push, jmap can't do push or delta
 sync, backup can only pull-on-demand),
 `api.reservePath` (API-shims + didweb's parameterized case + the
 **witnessed** webfinger collision), and
-`api.serverInfo` (broadest: ~16 plugins hand-roll their own origin).
+`api.serverInfo` (broadest: ~23 plugins hand-roll their own origin).
