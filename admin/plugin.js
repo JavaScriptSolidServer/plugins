@@ -565,6 +565,16 @@ ${NOT_POSSIBLE.map(([what, why]) => `      <li><strong>${esc(what)}</strong> —
     return snapshot();
   });
 
+  // Cheap, ungated liveness — no snapshot, no auth (conventional for a
+  // healthz, like metrics/). It lets another prober (e.g. dashboard/) confirm
+  // the admin plugin is alive WITHOUT triggering a full page-snapshot render,
+  // which probes every sibling and would otherwise blow the prober's timeout
+  // and read as 'down' — and, when two ops consoles probe each other, storm.
+  api.fastify.get(`${prefix}/healthz`, async (request, reply) => {
+    reply.header('cache-control', 'no-store');
+    return { status: 'ok', uptime_seconds: Math.round(process.uptime()) };
+  });
+
   if (!adminAgents) {
     api.log.warn(
       `admin: the admin surface at ${prefix}/ is OPEN — no config.adminAgents set, `

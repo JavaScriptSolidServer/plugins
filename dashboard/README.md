@@ -75,6 +75,13 @@ optionally refines a single plugin's probe as `{ probe?, expect?, kind? }`:
 - If the dashboard is the only plugin loaded, the page renders with a note
   explaining there are no siblings to show.
 
+![The dashboard auto-discovering and probing 32 plugins live on one server](./screenshot.png)
+
+*Live `/dashboard/` from `npm run serve` — 32 plugins auto-discovered via
+`api.plugins`, each probed over loopback. `up` = 2xx/3xx or a matched
+`expect`; `degraded` = a 4xx from a guarded surface (alive, but a bare-prefix
+probe can't say more — finding 1's residual); nothing `down`.*
+
 ### The page, in words
 
 A single narrow column, system font, honest table: **plugin | probe |

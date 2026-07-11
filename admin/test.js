@@ -181,6 +181,17 @@ describe('admin plugin', () => {
     }
   });
 
+  it('healthz is 200 and ungated — liveness needs no auth, even when the page is gated', async () => {
+    // The page and status.json are gated (above), but healthz must answer
+    // anonymously so another prober (dashboard/) can check liveness cheaply
+    // without triggering a full snapshot render.
+    const res = await get(`${base}/admin/healthz`);
+    assert.strictEqual(res.status, 200, `healthz: ${res.status}`);
+    const body = await res.json();
+    assert.strictEqual(body.status, 'ok');
+    assert.strictEqual(typeof body.uptime_seconds, 'number');
+  });
+
   // ------------------------------------------------------------- the page
 
   it('admin GET page → 200 self-contained HTML with plugin ids, pods count, sections', async () => {

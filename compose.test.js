@@ -136,6 +136,9 @@ describe('composition: every plugin on one server', () => {
             probes: {
               relay: { kind: 'ws' }, webrtc: { kind: 'ws' }, terminal: { kind: 'ws' },
               tunnel: { kind: 'ws' }, notifications: { kind: 'ws' },
+              // admin probes every plugin on page render; hit its cheap
+              // healthz so the two ops consoles don't storm each other.
+              admin: { probe: '/admin/healthz', expect: [200] },
             },
           },
         },

@@ -157,6 +157,9 @@ const fastify = createServer({
           relay: { kind: 'ws' }, webrtc: { kind: 'ws' }, terminal: { kind: 'ws' },
           tunnel: { kind: 'ws' }, notifications: { kind: 'ws' },
           pay: { probe: '/paid/demo', expect: [402] },
+          // admin's page probes every plugin on render; hit its cheap healthz
+          // instead so the probe is fast and the two consoles don't storm.
+          admin: { probe: '/admin/healthz', expect: [200] },
         },
       },
     },
