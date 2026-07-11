@@ -37,6 +37,8 @@ evidence. Legend:
 | — | `s3/` | S3-compatible object-storage gateway |
 | — | `micropub/` | IndieWeb Micropub endpoint (media upload → 🔩 raw-body stream #583) |
 | — | `backup/` | pod → `.tar.gz` export (incremental backup → 🔩 `api.events`) |
+| — | `metrics/` | `/healthz` + Prometheus exporter (core-pipeline metrics → 🔩 gated hooks) |
+| — | `dashboard/` | plugin status page (sibling discovery → 🔩 app-registry #463/#464) |
 
 Plus six **ports of bundled features** proving the migration path for #564 /
 #164: `relay/` `webrtc/` `terminal/` `tunnel/` `notifications/`, and `pay/`
@@ -71,7 +73,7 @@ Each names the seam and the consumer that proves it. Ranked in
 | #515/#516, #211 (both built, but need operator `appPaths`) | `api.reservePath()` — an API-shim owns fixed roots outside its prefix and can't self-exempt them from WAC; **two independent confirmations** |
 | #505 (recovery) | `api.auth.mintSession` / `api.identity.addAuthKey` — turn a proven channel into pod authority |
 | #495 #496 #500 #501 | `api.mcp.registerTool` — MCP has no plugin-tool seam; all four MCP issues want new tools a plugin can't add today |
-| #463 #464 | app-registry primitive — surfacing installed plugins as Solid resources |
+| #463 #464 | app-registry primitive — surfacing installed plugins as Solid resources; `dashboard/` is the live proof-of-need (it must be handed a hand-copied duplicate of the `createServer` list) |
 
 ## Core, not a plugin 🏛️ (a finding, not a gap)
 
@@ -98,11 +100,12 @@ exists.
 ## Tally
 
 Of ~40 plugin-tagged issues: **13 built as plugins here** (plus `rss/`,
-`matrix/`, `search/`, `didweb/`, `s3/`, `micropub/`, `backup/` — capability
+`matrix/`, `search/`, `didweb/`, `s3/`, `micropub/`, `backup/`, `metrics/`,
+`dashboard/` — capability
 demonstrations with no single issue), **6 ported**, **5 shipped upstream**,
 **2 more plugin-able with no blocker**, **6 clusters blocked on a named
 seam** (each with a proof-of-need consumer), the rest core-by-nature or
-product-scale. **26 plugins total, 264 tests.** The plugin api reaches most
+product-scale. **28 plugins total, 282 tests.** The plugin api reaches most
 of the backlog today; ranked by demand, the seams that would unlock the
 most next are `api.authorize` (3 blocking consumers), `api.events` (5
 consumers — matrix `/sync` needs live push, backup can only pull-on-demand),

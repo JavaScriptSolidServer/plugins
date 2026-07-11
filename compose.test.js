@@ -46,7 +46,7 @@ describe('composition: every plugin on one server', () => {
 
   after(async () => { if (jss) await jss.close(); });
 
-  it('boots pods + idp + twenty-six plugins from config', async () => {
+  it('boots pods + idp + twenty-eight plugins from config', async () => {
     const port = await probePort();
     base = `http://127.0.0.1:${port}`;
     wsBase = `ws://127.0.0.1:${port}`;
@@ -95,6 +95,22 @@ describe('composition: every plugin on one server', () => {
         { id: 's3', module: at('s3/plugin.js'), prefix: '/s3', config: { baseUrl: base, loopbackUrl: base } },
         { id: 'micropub', module: at('micropub/plugin.js'), prefix: '/micropub', config: { baseUrl: base, loopbackUrl: base } },
         { id: 'backup', module: at('backup/plugin.js'), prefix: '/backup', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'metrics', module: at('metrics/plugin.js'), prefix: '/metrics', config: { loopbackUrl: base } },
+        {
+          id: 'dashboard',
+          module: at('dashboard/plugin.js'),
+          prefix: '/dashboard',
+          config: {
+            loopbackUrl: base,
+            // A hand-copied slice of this very list — a plugin can't see its
+            // siblings (the #463/#464 app-registry finding).
+            plugins: [
+              { id: 'nip05', probe: '/nip05/nostr.json', expect: [200] },
+              { id: 'rss', probe: '/feed/atom', expect: [400] },
+              { id: 'relay', probe: '/relay', kind: 'ws' },
+            ],
+          },
+        },
       ],
     });
     assert.ok(jss.base);
@@ -292,6 +308,27 @@ describe('composition: every plugin on one server', () => {
   it('backup: bare GET is 400 with usage (no whole-server export)', async () => {
     const res = await fetch(`${base}/backup`);
     assert.strictEqual(res.status, 400);
+  });
+
+  it('metrics: healthz is ok and the exposition names the process gauges', async () => {
+    let res = await fetch(`${base}/metrics/healthz`);
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual((await res.json()).status, 'ok');
+    res = await fetch(`${base}/metrics/metrics`);
+    assert.strictEqual(res.status, 200);
+    assert.match(await res.text(), /process_uptime_seconds/);
+  });
+
+  it('dashboard: the page names the declared plugins; status.json probes live', async () => {
+    let res = await fetch(`${base}/dashboard/`);
+    assert.strictEqual(res.status, 200);
+    const page = await res.text();
+    for (const id of ['nip05', 'rss', 'relay']) assert.ok(page.includes(id), id);
+    res = await fetch(`${base}/dashboard/status.json`);
+    assert.strictEqual(res.status, 200);
+    const status = await res.json();
+    assert.strictEqual(status.server.alive, true);
+    assert.ok(status.plugins.every((p) => p.alive), JSON.stringify(status.plugins));
   });
 
   it('pods still work beside all of it (idp register + WAC)', async () => {

@@ -1,4 +1,4 @@
-# The plugin api, 26 plugins later — a report for the maintainer
+# The plugin api, 28 plugins later — a report for the maintainer
 
 This document is the actionable summary of the whole experiment: what the
 #206 plugin api can already do, what it can't, and — ranked with evidence —
@@ -14,11 +14,11 @@ want it.
 ## Executive summary
 
 - The api as shipped in 0.0.215 (`createServer({ plugins })` + `prefix` +
-  `getAgent` + `pluginDir` + `ws.route`) is **sufficient for 26 real
-  plugins across eleven capability classes** — realtime, DAV,
+  `getAgent` + `pluginDir` + `ws.route`) is **sufficient for 28 real
+  plugins across twelve capability classes** — realtime, DAV,
   fediverse/chat shims, IndieWeb publishing, identity, query/search,
-  object storage, proxy, dev tooling, pay, data portability — with zero
-  core changes.
+  object storage, proxy, dev tooling, pay, data portability,
+  ops/observability — with zero core changes.
 - Of the ~40 `plugin`-tagged backlog issues, **13 are built here**, 6
   bundled features are ported, 5 shipped upstream during this line of work,
   2 more are unblocked, and **6 clusters are blocked on exactly four
@@ -27,8 +27,13 @@ want it.
   `api.events.onResourceChange`, `api.reservePath`, and `api.serverInfo`.
   Adding the first three moves essentially every remaining plugin-shaped
   issue from "honest approximation" to "faithful implementation".
-- Two small loader bugs are worth fixing regardless (generic-basename id
-  derivation; dotted-prefix WS validation).
+- Three small loader/core bugs are worth fixing regardless
+  (generic-basename id derivation; dotted-prefix WS validation;
+  `logger: false` breaking every plugin `onResponse` hook).
+- One measured surprise: **plugins are not isolated from each other** —
+  all entries share one Fastify register scope, so any plugin can hook
+  every other plugin's routes (never core's). Worth a deliberate
+  decision, not an inherited one.
 
 ## What already works — decisions worth keeping
 
@@ -131,9 +136,9 @@ exists, moving it from operator config to plugin declaration.
 
 ### 4. `api.serverInfo` — the broadest, and the cheapest
 
-**~12 consumers** — every plugin that mints absolute URLs or loopbacks
+**~14 consumers** — every plugin that mints absolute URLs or loopbacks
 (the DAV family, the shims, rss, sparql, nip05, webfinger, notifications,
-micropub, backup…)
+micropub, backup, metrics, dashboard…)
 repeats `baseUrl`/`loopbackUrl` in config today. A wrong value fails
 *quietly* (nip05 serves an empty map). Test suites all need a
 probe-port-then-boot dance for the same reason.
@@ -149,6 +154,11 @@ probe-port-then-boot dance for the same reason.
   property to preserve, not new work.
 - **`api.mcp.registerTool`** — blocks the four MCP-tool issues
   (#495/#496/#500/#501); no consumer here because it's impossible today.
+- **`api.plugins` (the #463/#464 app-registry)** — first live consumer:
+  `dashboard/`, the plugin whose whole job is describing the deployment,
+  must be handed a hand-copied duplicate of the `createServer` plugins
+  list (drift is silent). The loader already holds the needed data:
+  `api.plugins → [{ id, prefix, module }]`, read-only.
 - **Export pure utility modules** the way `auth.js` is blessed —
   `relay/` re-vendors NIP-01 verify, `pay/` re-vendors mrc20. A
   `javascript-solid-server/nostr.js` export (or explicit vendoring
@@ -162,7 +172,7 @@ probe-port-then-boot dance for the same reason.
   Deliberately *not* asked for as a default-on hook: it's a bigger grant
   than route ownership. If ever, gate it: `capabilities: ['hooks']`.
 
-## Two loader bugs worth fixing regardless
+## Three loader/core bugs worth fixing regardless
 
 1. **Generic-basename id derivation.** Every plugin follows
    `<name>/plugin.js`, so every derived id is `plugin` and the (correct)
@@ -174,6 +184,36 @@ probe-port-then-boot dance for the same reason.
    can't accept WebSocket connections (host-reserved dotted paths), while
    `/terminal` works. Either validate/refuse dotted prefixes at load or
    document the reservation.
+3. **`logger: false` silently disables every plugin `onResponse` hook.**
+   Core's access-log hook calls `request.log.isLevelEnabled('info')`,
+   which doesn't exist on Fastify's null logger; the per-request throw
+   aborts the downstream hook chain, so plugin `onResponse` hooks never
+   fire (found by `metrics/`). One-line guard fixes it.
+
+## A measured surprise: plugins are not isolated from each other
+
+`metrics/` needed request counters, so it added an `onResponse` hook on
+`api.fastify` and measured what the hook can see (both entry orders,
+core routes probed too). Result: **the hook fires for every plugin's
+routes and never for core's.** All loader entries are activated against
+one shared `fastify.register` scope, while core routes live on the
+parent instance behind Fastify encapsulation.
+
+Two readings, both true:
+
+- The #564 line **holds against core** — a plugin cannot observe or
+  modify the pipeline of core routes, exactly as intended.
+- Plugins can already observe **and intercept** each other, ungated. A
+  hostile or buggy plugin can shadow-log or rewrite a sibling's traffic
+  today.
+
+This is worth a deliberate decision rather than an inherited one:
+per-plugin encapsulation (each entry in its own `register` scope) is the
+safer default, but note it would break the one legitimate cross-plugin
+consumer found (a metrics exporter counting all plugin traffic) — if
+hooks are ever capability-gated (`capabilities: ['hooks']` /
+`['observe']`), the shared scope could become the *granted* behavior and
+isolation the default.
 
 ## The core/plugin line (#564, answered empirically)
 

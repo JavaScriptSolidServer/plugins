@@ -66,6 +66,39 @@ const fastify = createServer({
     { id: 's3', module: at('s3/plugin.js'), prefix: '/s3', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
     { id: 'micropub', module: at('micropub/plugin.js'), prefix: '/micropub', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
     { id: 'backup', module: at('backup/plugin.js'), prefix: '/backup', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    { id: 'metrics', module: at('metrics/plugin.js'), prefix: '/metrics', config: { loopbackUrl: `http://127.0.0.1:${PORT}`, ...(process.env.METRICS_TOKEN ? { token: process.env.METRICS_TOKEN } : {}) } },
+    {
+      id: 'dashboard',
+      module: at('dashboard/plugin.js'),
+      prefix: '/dashboard',
+      config: {
+        loopbackUrl: `http://127.0.0.1:${PORT}`,
+        // Hand-copied from the very list above — a plugin can't enumerate
+        // its co-loaded siblings (the #463/#464 app-registry finding), so
+        // this duplicate can silently drift. Keep it in sync by hand.
+        plugins: [
+          { id: 'relay', probe: '/relay', kind: 'ws' },
+          { id: 'webrtc', probe: '/webrtc', kind: 'ws' },
+          { id: 'terminal', probe: '/terminal', kind: 'ws' },
+          { id: 'tunnel', probe: '/tunnel', kind: 'ws' },
+          { id: 'notifications', probe: '/.notifications', kind: 'ws' },
+          { id: 'pay', probe: '/paid/demo', expect: [402] },
+          { id: 'nip05', probe: '/nip05/nostr.json', expect: [200] },
+          { id: 'corsproxy', probe: '/proxy', expect: [400] },
+          { id: 'gitscratch', probe: '/git/probe.git/info/refs?service=git-receive-pack', expect: [401] },
+          { id: 'webfinger', probe: '/.well-known/webfinger', expect: [400] },
+          { id: 'mastodon', probe: '/api/v1/instance', expect: [200] },
+          { id: 'bluesky', probe: '/xrpc/com.atproto.server.describeServer', expect: [200] },
+          { id: 'matrix', probe: '/_matrix/client/versions', expect: [200] },
+          { id: 'rss', probe: '/feed/atom', expect: [400] },
+          { id: 'search', probe: '/search', expect: [400] },
+          { id: 's3', probe: '/s3/bucket/key', expect: [403] },
+          { id: 'micropub', probe: '/micropub?q=config', expect: [200] },
+          { id: 'backup', probe: '/backup', expect: [400] },
+          { id: 'metrics', probe: '/metrics/healthz', expect: [200] },
+        ],
+      },
+    },
   ],
 });
 
@@ -105,3 +138,5 @@ console.log(`  did:web:        GET ${PUBLIC_URL}/.well-known/did.json`);
 console.log(`  s3:             ${PUBLIC_URL}/s3/<bucket>/<key>  (aws-cli/rclone, SigV4)`);
 console.log(`  micropub:       POST ${PUBLIC_URL}/micropub  (IndieWeb clients; pod bearer as token)`);
 console.log(`  backup:         GET ${PUBLIC_URL}/backup/<pod>/  → .tar.gz of what you can read`);
+console.log(`  metrics:        GET ${PUBLIC_URL}/metrics/healthz | /metrics/metrics  (Prometheus${process.env.METRICS_TOKEN ? ', token-guarded' : ''})`);
+console.log(`  dashboard:      GET ${PUBLIC_URL}/dashboard/  (live plugin status)`);

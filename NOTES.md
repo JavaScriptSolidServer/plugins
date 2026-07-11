@@ -125,6 +125,27 @@ ports reached for it without coordinating.
    advertise it by hand). A plugin can't add headers to routes it doesn't
    own. NOT a default-on hook (bigger grant than route ownership); gate
    behind `capabilities: ['hooks']` if ever.
+9. **Plugin-to-plugin isolation is ZERO (measured — metrics/).** All
+   loader entries are activated against **one shared Fastify register
+   scope**: a hook added on `api.fastify` (`onRequest`, `preHandler`,
+   `onResponse`, `onSend`) fires for **every plugin's routes, whichever
+   order the entries load** — and **never** for core routes (`/`, LDP,
+   `/.well-known/*`), which live on the parent instance behind Fastify
+   encapsulation. So the #564 line holds against *core* (a plugin cannot
+   observe or modify core's pipeline), but plugins can already observe
+   *and intercept* each other with no capability gate. Design tension for
+   any future `capabilities: ['hooks']`: per-plugin encapsulation would be
+   the safer default, but it would break the one legitimate consumer found
+   (metrics/' cross-plugin request counters) — a scoped-vs-shared choice
+   the loader should make deliberately, not inherit from `register`.
+10. **`api.plugins` (the #463/#464 app-registry) — first live consumer:
+    dashboard/.** The one plugin whose job is describing the deployment
+    cannot enumerate its co-loaded siblings; the operator hands it a
+    hand-copied duplicate of the `createServer` plugins list, and the two
+    silently drift (an added plugin never appears; a removed one keeps
+    probing). The loader already holds exactly the needed data:
+    `api.plugins → [{ id, prefix, module }]`, read-only, plus optional
+    probe/health hints per entry.
 
 ## Test-harness footguns (host quirks, not plugin api)
 
@@ -184,6 +205,15 @@ this repo is its proof.
   candidate: when the basename is generic (`plugin`, `index`), derive from
   the parent directory (`relay/plugin.js` → `relay`). Small, backward-
   compatible, removes the most common footgun. **Filed-worthy.**
+- **`logger: false` silently kills every plugin `onResponse` hook**
+  (metrics/): core's access-log hook calls
+  `request.log.isLevelEnabled('info')`, which doesn't exist on Fastify's
+  null logger under `logger: false` — the hook throws per-request and the
+  aborted chain means downstream *plugin* `onResponse` hooks never run
+  (earlier stages are unaffected). Workaround: boot with `logger: true,
+  logLevel: 'silent'`. One-line core fix; **filed-worthy.** (helpers.js
+  defaults to `logger: false`, so any plugin using `onResponse` in tests
+  hits this.)
 - **Dotted prefixes fail the ws upgrade** — a plugin mounted at
   `/.terminal` cannot accept WebSocket connections (immediate upgrade
   error), while `/terminal` and even `/.notifications` HTTP work. Core

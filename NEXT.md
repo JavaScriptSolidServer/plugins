@@ -8,17 +8,18 @@ plugin), `NOTES.md` (the findings/seams — the real deliverable), and
 
 ## Where things stand
 
-- **26 plugins, 264 tests, all green** (`npm test`), all pushed to
+- **28 plugins, 282 tests, all green** (`npm test`), all pushed to
   `github.com/JavaScriptSolidServer/plugins` (branch `gh-pages`).
-- `compose.test.js` boots all 26 on **one** JSS from pure config; `serve.js`
+- `compose.test.js` boots all 28 on **one** JSS from pure config; `serve.js`
   is the runnable demo. Both must be updated when you add a plugin.
 - Built so far: 6 ports (relay, webrtc, terminal, tunnel, notifications,
-  pay) + 20 features (nip05, corsproxy, capability, webdav, sparql,
+  pay) + 22 features (nip05, corsproxy, capability, webdav, sparql,
   gitscratch, otp, carddav, mastodon, bluesky, caldav, webfinger,
-  activitypub, rss, matrix, search, didweb, s3, micropub, backup).
+  activitypub, rss, matrix, search, didweb, s3, micropub, backup,
+  metrics, dashboard).
 - Capability classes covered: realtime, WebDAV family, fediverse/social/chat
   (5 shims), IndieWeb publishing, identity, data/query/search, object
-  storage, proxy, dev, pay, data portability.
+  storage, proxy, dev, pay, data portability, ops/observability.
 - **REPORT.md exists** — the maintainer-facing summary (ranked seams, each
   fileable nearly verbatim). Keep its consumer counts current as plugins
   land.
@@ -75,8 +76,6 @@ Still genuinely plugin-shaped and distinct:
 - **oEmbed** provider for pod resources (link unfurling).
 - **feed ingest** — subscribe to external RSS/Atom, store items in the pod
   (the inverse of `rss/`; uses a corsproxy-style fetch).
-- **healthz / Prometheus `/metrics`** and a **plugin status dashboard**
-  (ops; the dashboard is a nice meta-demo listing all loaded plugins).
 - **link-shortener**, **WebSub/PubSubHubbub** (needs `api.events`),
   **SPARQL UPDATE** (extends `sparql/`), **CalDAV scheduling/free-busy**
   (extends `caldav/`), **remoteStorage** (another bundled-feature port).

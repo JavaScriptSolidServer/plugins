@@ -11,7 +11,7 @@ Out-of-tree plugins for [JavaScript Solid
 Server](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer),
 built on its **#206 loader** (`createServer({ plugins })`, JSS ≥ 0.0.215).
 It is an *experiment*: prove the plugin api by using it, and treat every
-wall you hit as a finding, not a blocker. **26 plugins, 264 tests today.**
+wall you hit as a finding, not a blocker. **28 plugins, 282 tests today.**
 
 ### The one rule that makes the experiment valid
 
@@ -151,6 +151,8 @@ Full ranking in `NOTES.md`. The ones you'll hit:
 | a dev/tooling subsystem | `gitscratch/` | shell a system binary via CGI |
 | a posting protocol (IndieWeb-style, client-discovered endpoint) | `micropub/` | pod bearer as the protocol token + loopback writes |
 | a data-export / archive download | `backup/` | loopback container walk streamed into a hand-rolled format |
+| an ops/observability endpoint | `metrics/` | node builtins + an `api.fastify` hook (scope: all plugins, never core) |
+| a meta/status page over siblings | `dashboard/` | anonymous loopback probes + an operator-declared list (no registry) |
 
 ## Footguns (every multi-boot suite rediscovered these)
 
@@ -165,10 +167,14 @@ Full ranking in `NOTES.md`. The ones you'll hit:
   pass an explicit `id` in `compose.test.js`/`serve.js`.
 - **Dotted prefixes** (`/.foo`) fail the WS upgrade — core reserves dotted
   paths. Use a plain prefix for anything with a socket.
+- **`logger: false` kills plugin `onResponse` hooks**: core's access-log
+  hook throws on the null logger and aborts the downstream chain. If your
+  plugin uses `onResponse`, boot tests with `logger: true, logLevel:
+  'silent'` (helpers.js defaults to `logger: false`).
 
 ## Current state
 
-26 plugins (6 ports + 20 features), 264 tests, all green (`npm test`).
+28 plugins (6 ports + 22 features), 282 tests, all green (`npm test`).
 `compose.test.js` runs every one on a single server from pure config. Two
 core PRs (#590 `api.mountApp`, #591 `/idp/refresh`) sit upstream, unmerged,
 for the maintainer's call. Everything else lives here, by design.

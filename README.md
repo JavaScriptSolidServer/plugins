@@ -84,9 +84,11 @@ README and NOTES.md, ship the closest honest approximation.
 | `s3/` | — | S3-compatible object-storage gateway (SigV4) |
 | `micropub/` | — | IndieWeb Micropub endpoint — posts land in the author's pod |
 | `backup/` | — | pod container → `.tar.gz` download (data portability) |
+| `metrics/` | — | `/healthz` + Prometheus exporter; measured the plugin-hook scope |
+| `dashboard/` | — | live plugin-status page; first consumer of the #463/#464 registry seam |
 
-**264 tests, all green** (`npm test`), including `compose.test.js` — all
-twenty-six plugins on one server from pure config, pods + WAC intact
+**282 tests, all green** (`npm test`), including `compose.test.js` — all
+twenty-eight plugins on one server from pure config, pods + WAC intact
 beside them. Findings consolidated in [NOTES.md](./NOTES.md); the full
 plugin-tagged backlog triaged in [ISSUES.md](./ISSUES.md); the build guide
 is [AGENT.md](./AGENT.md); the maintainer-facing summary — what to add
