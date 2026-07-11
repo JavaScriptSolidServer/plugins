@@ -7,9 +7,9 @@ repo; nothing is speculative. Detail lives in [NOTES.md](./NOTES.md)
 (findings), [ISSUES.md](./ISSUES.md) (per-issue disposition), and each
 plugin's `README.md ## Findings`.
 
-**Nothing has been filed upstream from this work** (per your rule); each
-proposal below is drafted so it *could* be filed nearly verbatim if you
-want it.
+**The five bugs below are now filed upstream** (#596–#600, 2026-07-11, at
+the maintainer's request). The four *seams* remain unfiled; each is
+drafted so it could be filed nearly verbatim if wanted.
 
 ## Executive summary
 
@@ -208,6 +208,13 @@ probe-port-then-boot dance for the same reason.
   than route ownership. If ever, gate it: `capabilities: ['hooks']`.
 
 ## Five loader/core bugs worth fixing regardless
+
+All five filed 2026-07-11: [#596](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer/issues/596)
+(id derivation), [#597](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer/issues/597)
+(dotted-prefix WS), [#598](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer/issues/598)
+(`logger: false` vs onResponse), [#599](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer/issues/599)
+(error wrap drops `err.code`), [#600](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer/issues/600)
+(non-atomic conditional write).
 
 1. **Generic-basename id derivation.** Every plugin follows
    `<name>/plugin.js`, so every derived id is `plugin` and the (correct)

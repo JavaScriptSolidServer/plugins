@@ -140,4 +140,7 @@ empirically in NOTES: **route-owning → plugin, pipeline-modifying → core**.
 
 - The repo exists and is public; keep pushing to it.
 - Core PRs #590 / #591 are unmerged — the maintainer's call.
-- Whether to ever file the seam issues upstream — ask first.
+- **The five bugs are FILED** (core issues #596–#600, 2026-07-11, at the
+  maintainer's request). The four *seam* proposals (authorize, events,
+  reservePath, serverInfo) are still unfiled — ask before filing;
+  REPORT.md is the draft.
