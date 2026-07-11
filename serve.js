@@ -9,6 +9,7 @@
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'javascript-solid-server/src/server.js';
@@ -16,7 +17,39 @@ import { createServer } from 'javascript-solid-server/src/server.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const at = (p) => path.join(__dirname, p);
 
-const PORT = Number(process.env.PORT || 3240);
+// Is `port` bindable on 0.0.0.0 right now? (A quick listen-then-close probe.)
+function portFree(port) {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once('error', () => resolve(false));
+    probe.listen(port, '0.0.0.0', () => probe.close(() => resolve(true)));
+  });
+}
+
+// An OS-assigned free port (bind to 0, read it back, release).
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once('error', reject);
+    probe.listen(0, '0.0.0.0', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+}
+
+// Prefer the requested port; if it's busy, hop to a free one and say so.
+// (The plugin configs bake the origin in before listen, so the port has to
+// be settled up front — a retry-on-EADDRINUSE loop around listen() can't fix
+// the loopback/baseUrl already handed to every plugin.)
+async function pickPort(preferred) {
+  if (await portFree(preferred)) return preferred;
+  const hopped = await freePort();
+  console.warn(`port ${preferred} is in use — hopping to ${hopped} (set PORT= to pin one)`);
+  return hopped;
+}
+
+const PORT = await pickPort(Number(process.env.PORT || 3240));
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
 const DATA = process.env.DATA || path.join(__dirname, 'data');
 const PODS = path.join(DATA, 'pods');
