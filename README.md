@@ -61,10 +61,14 @@ README and NOTES.md, ship the closest honest approximation.
 | `webdav/` | #507 | mount a pod in Finder/Nautilus/Windows; WebDAV↔LDP over loopback, Basic→Bearer |
 | `sparql/` | #509 | read-time SPARQL SELECT over pod JSON-LD; write-index needs `api.events` |
 | `gitscratch/` | #322 | ephemeral Solid-authed git remotes via the `git-http-backend` CGI |
+| `otp/` | #505 | one-time-password session flow; account recovery needs core auth |
+| `carddav/` | #157 | contact sync (iOS/macOS/Thunderbird/DAVx5); the DAV bridge, generalized |
+| `mastodon/` | #515/#516 | Mastodon-API shim — a client logs into its own pod; needs `appPaths` widened |
 
-**97 tests, all green** (`npm test`), including `compose.test.js` — all twelve
-plugins on one server from pure config, pods + WAC intact beside them.
-Findings consolidated in [NOTES.md](./NOTES.md).
+**~130 tests, all green** (`npm test`), including `compose.test.js` — all
+fifteen plugins on one server from pure config, pods + WAC intact beside
+them. Findings consolidated in [NOTES.md](./NOTES.md); the full
+plugin-tagged backlog triaged in [ISSUES.md](./ISSUES.md).
 
 ```
 <name>/plugin.js   the port          <name>/test.js   real-JSS tests   <name>/README.md   findings

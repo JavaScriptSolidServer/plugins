@@ -56,13 +56,25 @@ ports reached for it without coordinating.
    / raw-body mode ships must hand back the un-drained stream, not just a
    buffered body. (This is exactly what the merged loader's scoped
    pass-through parser does — the finding is to keep it that way.)
-5. **Reserved-path declaration** — consumers: nip05/ (`/.well-known/
-   nostr.json`), gitscratch/ (coexistence with core `git: true`). A plugin
-   can register absolute/exact paths outside its prefix, but only WAC-exempt
-   *by luck* (core blanket-exempts `/.well-known/*`) and with no conflict
-   detection — a future core route at the same path throws
-   `FST_ERR_DUPLICATED_ROUTE` at boot. Let entries declare reserved paths so
-   the loader claims them deliberately and reports collisions.
+5. **Routes/WAC-exemption outside the single prefix** — **four consumers:
+   nip05/, webdav/ & carddav/ (`/.well-known/*`), mastodon/ (`/api`,
+   `/oauth`).** A plugin can *register* absolute/exact routes outside its
+   prefix (the loader doesn't confine `api.fastify`), but the loader
+   WAC-exempts only its **one** `prefix` (`plugins.js` pushes `prefix` to
+   `appPaths`). Consequences, in increasing severity:
+   - nip05/webdav/carddav land on `/.well-known/*`, which core *happens* to
+     blanket-exempt — so they work **by luck**, not by contract.
+   - mastodon needs `/api` **and** `/oauth`, which core does **not** exempt,
+     so **the plugin cannot serve its own surface** — every call 401s at the
+     WAC hook until the operator hand-passes `appPaths: ['/api','/oauth']`.
+     A plugin has no `api.appPaths.add()` to fix this itself.
+   - none of it has conflict detection: a future core route at a
+     plugin-claimed path throws `FST_ERR_DUPLICATED_ROUTE` at boot.
+   The seam: entries declare the paths they own (`paths: ['/api','/oauth']`
+   or a plural `prefix`), the loader exempts and claims them deliberately
+   and reports collisions. This is the seam **API-shim plugins**
+   (mastodon, and any future Bluesky/ActivityPub/gateway) structurally
+   require.
 6. **Can't set fastify server options** — consumer: capability/ hit
    `maxParamLength` (100) silently 404ing long tokens in named params;
    workaround is a wildcard route. A plugin has no way to raise per-route

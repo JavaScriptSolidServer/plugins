@@ -28,6 +28,9 @@ const fastify = createServer({
   root: PODS,
   idp: true,
   idpIssuer: PUBLIC_URL,
+  // mastodon owns fixed roots (/api, /oauth) outside its prefix; a plugin
+  // can't self-exempt them from WAC, so the operator widens appPaths.
+  appPaths: ['/api', '/oauth'],
   // Explicit ids — the <name>/plugin.js convention collides on basename.
   plugins: [
     { id: 'relay', module: at('relay/plugin.js'), prefix: '/relay' },
@@ -47,6 +50,9 @@ const fastify = createServer({
     { id: 'webdav', module: at('webdav/plugin.js'), prefix: '/webdav', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
     { id: 'gitscratch', module: at('gitscratch/plugin.js'), prefix: '/git', config: {} },
     { id: 'sparql', module: at('sparql/plugin.js'), prefix: '/sparql', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    { id: 'otp', module: at('otp/plugin.js'), prefix: '/otp', config: {} },
+    { id: 'carddav', module: at('carddav/plugin.js'), prefix: '/carddav', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    { id: 'mastodon', module: at('mastodon/plugin.js'), prefix: '/mastodon', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
   ],
 });
 
@@ -72,3 +78,6 @@ console.log(`  capability:     POST ${PUBLIC_URL}/cap/issue  (auth)`);
 console.log(`  webdav:         ${PUBLIC_URL}/webdav/  (mount with a pod Bearer)`);
 console.log(`  git scratch:    git clone ${PUBLIC_URL}/git/<name>.git`);
 console.log(`  sparql:         POST ${PUBLIC_URL}/sparql  (auth)`);
+console.log(`  otp:            POST ${PUBLIC_URL}/otp/request`);
+console.log(`  carddav:        ${PUBLIC_URL}/carddav/  (contact sync)`);
+console.log(`  mastodon:       GET ${PUBLIC_URL}/api/v1/instance  (point a client here)`);

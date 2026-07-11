@@ -46,7 +46,7 @@ describe('composition: every plugin on one server', () => {
 
   after(async () => { if (jss) await jss.close(); });
 
-  it('boots pods + idp + twelve plugins from config', async () => {
+  it('boots pods + idp + fifteen plugins from config', async () => {
     const port = await probePort();
     base = `http://127.0.0.1:${port}`;
     wsBase = `ws://127.0.0.1:${port}`;
@@ -55,6 +55,9 @@ describe('composition: every plugin on one server', () => {
       port,
       root,
       idp: true,
+      // mastodon owns fixed roots outside its prefix; a plugin can't
+      // self-exempt them (finding), so the operator widens appPaths.
+      appPaths: ['/api', '/oauth'],
       // Explicit ids: the <name>/plugin.js convention makes every basename
       // reduce to 'plugin' — the loader's duplicate-id guard requires ids
       // here (finding: derive from the parent dir for generic basenames).
@@ -76,6 +79,9 @@ describe('composition: every plugin on one server', () => {
         { id: 'webdav', module: at('webdav/plugin.js'), prefix: '/webdav', config: { baseUrl: base, loopbackUrl: base } },
         { id: 'gitscratch', module: at('gitscratch/plugin.js'), prefix: '/git', config: {} },
         { id: 'sparql', module: at('sparql/plugin.js'), prefix: '/sparql', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'otp', module: at('otp/plugin.js'), prefix: '/otp', config: {} },
+        { id: 'carddav', module: at('carddav/plugin.js'), prefix: '/carddav', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'mastodon', module: at('mastodon/plugin.js'), prefix: '/mastodon', config: { baseUrl: base, loopbackUrl: base } },
       ],
     });
     assert.ok(jss.base);
@@ -190,6 +196,23 @@ describe('composition: every plugin on one server', () => {
       method: 'POST', headers: { 'content-type': 'text/plain' }, body: 'nope',
     });
     assert.ok([400, 415].includes(res.status), `got ${res.status}`);
+  });
+
+  it('otp: whoami without a session token is 401', async () => {
+    const res = await fetch(`${base}/otp/whoami`);
+    assert.strictEqual(res.status, 401);
+  });
+
+  it('carddav: OPTIONS advertises the addressbook', async () => {
+    const res = await fetch(`${base}/carddav/`, { method: 'OPTIONS' });
+    assert.ok(res.status < 500);
+    assert.match(res.headers.get('dav') || '', /addressbook/);
+  });
+
+  it('mastodon: the instance endpoint answers (fixed /api root, appPaths-widened)', async () => {
+    const res = await fetch(`${base}/api/v1/instance`);
+    assert.strictEqual(res.status, 200);
+    assert.ok('title' in (await res.json()));
   });
 
   it('pods still work beside all of it (idp register + WAC)', async () => {
