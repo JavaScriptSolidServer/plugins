@@ -64,7 +64,6 @@
 //      no weaker than Bearer, but it is NOT a true secret — documented.
 
 import crypto from 'node:crypto';
-import { Readable } from 'node:stream';
 
 const XML_TYPE = 'application/xml';
 const S3_MAX_KEYS = 1000; // hard cap on a single ListObjectsV2 page

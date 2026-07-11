@@ -261,7 +261,10 @@ describe('s3 plugin', () => {
     it('a tampered signature is refused with SignatureDoesNotMatch (403)', async () => {
       const url = s3('/sigbucket/obj.txt');
       const headers = sign({ method: 'GET', url, host, token });
-      headers.authorization = headers.authorization.replace(/Signature=./, 'Signature=0');
+      // flip (not overwrite) the first hex char — a fixed replacement is a
+      // no-op 1 time in 16, when the real signature already starts with it
+      headers.authorization = headers.authorization.replace(
+        /Signature=(.)/, (_, c) => `Signature=${c === '0' ? '1' : '0'}`);
       const res = await fetch(url, { headers });
       assert.strictEqual(res.status, 403);
       assert.ok((await res.text()).includes('<Code>SignatureDoesNotMatch</Code>'));
