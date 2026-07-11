@@ -24,6 +24,45 @@ fs.mkdirSync(PODS, { recursive: true });
 
 const terminalToken = process.env.TERMINAL_TOKEN || crypto.randomBytes(16).toString('hex');
 
+// One hand-copied inventory feeding both the admin home and the dashboard —
+// a plugin can't enumerate its co-loaded siblings (the #463/#464 app-registry
+// finding), so this duplicate of the plugins array below can silently drift.
+const INVENTORY = [
+  { id: 'relay', prefix: '/relay', description: 'nostr relay (ws)', probe: '/relay', kind: 'ws' },
+  { id: 'webrtc', prefix: '/webrtc', description: 'WebRTC signaling (ws)', probe: '/webrtc', kind: 'ws' },
+  { id: 'terminal', prefix: '/terminal', description: 'token-gated shell (ws)', probe: '/terminal', kind: 'ws' },
+  { id: 'tunnel', prefix: '/tunnel', description: 'HTTP tunnel (ws)', probe: '/tunnel', kind: 'ws' },
+  { id: 'notifications', prefix: '/.notifications', description: 'solid-0.1 notifications (ws)', probe: '/.notifications', kind: 'ws' },
+  { id: 'pay', prefix: '/paid', description: '402 pay gate demo', probe: '/paid/demo', expect: [402] },
+  { id: 'nip05', prefix: '/nip05', description: 'NIP-05 discovery', probe: '/nip05/nostr.json', expect: [200] },
+  { id: 'corsproxy', prefix: '/proxy', description: 'CORS forward proxy', probe: '/proxy', expect: [400] },
+  { id: 'capability', prefix: '/cap', description: 'capability URLs', probe: '/cap/issue', expect: [404, 401, 405] },
+  { id: 'webdav', prefix: '/webdav', description: 'WebDAV bridge', probe: '/webdav/', expect: [401, 207, 200] },
+  { id: 'gitscratch', prefix: '/git', description: 'Solid-authed git remotes', probe: '/git/probe.git/info/refs?service=git-receive-pack', expect: [401] },
+  { id: 'sparql', prefix: '/sparql', description: 'SPARQL SELECT + UPDATE', probe: '/sparql', expect: [400, 404, 405] },
+  { id: 'otp', prefix: '/otp', description: 'one-time-password sessions', probe: '/otp/whoami', expect: [401] },
+  { id: 'carddav', prefix: '/carddav', description: 'CardDAV contacts', probe: '/carddav/', expect: [401, 207, 200] },
+  { id: 'mastodon', prefix: '/mastodon', description: 'Mastodon API shim', probe: '/api/v1/instance', expect: [200] },
+  { id: 'bluesky', prefix: '/bluesky', description: 'AT-Proto XRPC shim', probe: '/xrpc/com.atproto.server.describeServer', expect: [200] },
+  { id: 'caldav', prefix: '/caldav', description: 'CalDAV calendars + free-busy', probe: '/caldav/', expect: [401, 207, 200] },
+  { id: 'webfinger', prefix: '/webfinger', description: 'WebFinger discovery', probe: '/.well-known/webfinger', expect: [400] },
+  { id: 'activitypub', prefix: '/activitypub', description: 'AS2 federation actor', probe: '/ap/alice/actor', expect: [200, 404] },
+  { id: 'rss', prefix: '/feed', description: 'container → Atom/RSS', probe: '/feed/atom', expect: [400] },
+  { id: 'matrix', prefix: '/matrix', description: 'Matrix client-server shim', probe: '/_matrix/client/versions', expect: [200] },
+  { id: 'search', prefix: '/search', description: 'full-text pod search', probe: '/search', expect: [400] },
+  { id: 'didweb', prefix: '/didweb', description: 'did:web resolver', probe: '/didweb/nobody/did.json', expect: [404] },
+  { id: 's3', prefix: '/s3', description: 'S3 gateway (SigV4)', probe: '/s3/bucket/key', expect: [403] },
+  { id: 'micropub', prefix: '/micropub', description: 'IndieWeb Micropub', probe: '/micropub?q=config', expect: [200] },
+  { id: 'backup', prefix: '/backup', description: 'pod → tar.gz export', probe: '/backup', expect: [400] },
+  { id: 'shortlink', prefix: '/short', description: 'pod link shortener', probe: '/short', expect: [401] },
+  { id: 'oembed', prefix: '/oembed', description: 'oEmbed provider', probe: '/oembed', expect: [400] },
+  { id: 'jmap', prefix: '/jmap', description: 'JMAP mail over the pod', probe: '/jmap/session', expect: [401] },
+  { id: 'remotestorage', prefix: '/remotestorage', description: 'remoteStorage server', probe: '/remotestorage/webfinger', expect: [400] },
+  { id: 'metrics', prefix: '/metrics', description: 'healthz + Prometheus', probe: '/metrics/healthz', expect: [200] },
+  { id: 'dashboard', prefix: '/dashboard', description: 'plugin liveness page', probe: '/dashboard/status.json', expect: [200] },
+  { id: 'admin', prefix: '/admin', description: 'operator home (this page)' },
+];
+
 const fastify = createServer({
   root: PODS,
   idp: true,
@@ -79,34 +118,25 @@ const fastify = createServer({
       prefix: '/dashboard',
       config: {
         loopbackUrl: `http://127.0.0.1:${PORT}`,
-        // Hand-copied from the very list above — a plugin can't enumerate
-        // its co-loaded siblings (the #463/#464 app-registry finding), so
-        // this duplicate can silently drift. Keep it in sync by hand.
-        plugins: [
-          { id: 'relay', probe: '/relay', kind: 'ws' },
-          { id: 'webrtc', probe: '/webrtc', kind: 'ws' },
-          { id: 'terminal', probe: '/terminal', kind: 'ws' },
-          { id: 'tunnel', probe: '/tunnel', kind: 'ws' },
-          { id: 'notifications', probe: '/.notifications', kind: 'ws' },
-          { id: 'pay', probe: '/paid/demo', expect: [402] },
-          { id: 'nip05', probe: '/nip05/nostr.json', expect: [200] },
-          { id: 'corsproxy', probe: '/proxy', expect: [400] },
-          { id: 'gitscratch', probe: '/git/probe.git/info/refs?service=git-receive-pack', expect: [401] },
-          { id: 'webfinger', probe: '/.well-known/webfinger', expect: [400] },
-          { id: 'mastodon', probe: '/api/v1/instance', expect: [200] },
-          { id: 'bluesky', probe: '/xrpc/com.atproto.server.describeServer', expect: [200] },
-          { id: 'matrix', probe: '/_matrix/client/versions', expect: [200] },
-          { id: 'rss', probe: '/feed/atom', expect: [400] },
-          { id: 'search', probe: '/search', expect: [400] },
-          { id: 's3', probe: '/s3/bucket/key', expect: [403] },
-          { id: 'micropub', probe: '/micropub?q=config', expect: [200] },
-          { id: 'backup', probe: '/backup', expect: [400] },
-          { id: 'shortlink', probe: '/short', expect: [401] },
-          { id: 'oembed', probe: '/oembed', expect: [400] },
-          { id: 'jmap', probe: '/jmap/session', expect: [401] },
-          { id: 'remotestorage', probe: '/remotestorage/webfinger', expect: [400] },
-          { id: 'metrics', probe: '/metrics/healthz', expect: [200] },
-        ],
+        // The shared INVENTORY minus itself (self-probes would recurse).
+        plugins: INVENTORY.filter((p) => p.id !== 'dashboard' && p.probe),
+      },
+    },
+    {
+      id: 'admin',
+      module: at('admin/plugin.js'),
+      prefix: '/admin',
+      config: {
+        loopbackUrl: `http://127.0.0.1:${PORT}`,
+        baseUrl: PUBLIC_URL,
+        podsRoot: PODS,
+        plugins: INVENTORY,
+        // Gate the operator home: ADMIN_AGENTS is a comma-separated list of
+        // WebIDs/agent ids. Without it the plugin serves OPEN and warns
+        // loudly (finding: the api has no operator concept).
+        ...(process.env.ADMIN_AGENTS
+          ? { adminAgents: process.env.ADMIN_AGENTS.split(',').map((s) => s.trim()).filter(Boolean) }
+          : {}),
       },
     },
   ],
@@ -154,3 +184,4 @@ console.log(`  jmap:           GET ${PUBLIC_URL}/jmap/session  (JMAP mail over t
 console.log(`  remotestorage:  ${PUBLIC_URL}/remotestorage/<user>/<category>/…  (rS clients)`);
 console.log(`  metrics:        GET ${PUBLIC_URL}/metrics/healthz | /metrics/metrics  (Prometheus${process.env.METRICS_TOKEN ? ', token-guarded' : ''})`);
 console.log(`  dashboard:      GET ${PUBLIC_URL}/dashboard/  (live plugin status)`);
+console.log(`  admin:          GET ${PUBLIC_URL}/admin/  (operator home${process.env.ADMIN_AGENTS ? ', gated' : ' — OPEN, set ADMIN_AGENTS'})`);

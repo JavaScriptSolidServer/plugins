@@ -179,14 +179,33 @@ ports reached for it without coordinating.
    the safer default, but it would break the one legitimate consumer found
    (metrics/' cross-plugin request counters) — a scoped-vs-shared choice
    the loader should make deliberately, not inherit from `register`.
-10. **`api.plugins` (the #463/#464 app-registry) — first live consumer:
-    dashboard/.** The one plugin whose job is describing the deployment
-    cannot enumerate its co-loaded siblings; the operator hands it a
-    hand-copied duplicate of the `createServer` plugins list, and the two
-    silently drift (an added plugin never appears; a removed one keeps
-    probing). The loader already holds exactly the needed data:
+10. **`api.plugins` (the #463/#464 app-registry) — two consumers:
+    dashboard/ and admin/.** The plugins whose job is describing the
+    deployment cannot enumerate their co-loaded siblings; the operator
+    hands each a
+    hand-copied duplicate of the `createServer` plugins list, and the
+    copies silently drift (an added plugin never appears; a removed one
+    keeps probing). serve.js now maintains ONE shared `INVENTORY` array
+    beside the real plugins array — the workaround that proves the
+    seam. The loader already holds exactly the needed data:
     `api.plugins → [{ id, prefix, module }]`, read-only, plus optional
     probe/health hints per entry.
+11. **No operator concept — `api.isOperator` (admin/).** Three plugins
+    now hold three incompatible answers to "who is the operator?":
+    terminal/ (shared token), metrics/ (optional bearer token), admin/
+    (`adminAgents` WebID allowlist). The host itself knows nothing of
+    operators, so every ops-facing plugin invents its own gate. A tiny
+    seam (`api.isOperator(agentId)` or an `operators: []` server option)
+    would unify them.
+12. **The admin-surface gaps, named (admin/).** The wp-admin pillars the
+    api cannot express, each measured by building the operator home:
+    runtime **enable/disable** (`deactivate()` exists but nothing calls
+    it after boot), **install** (#200 marketplace + post-boot loading),
+    **settings panels** (no contribute-a-panel affordance — the
+    `adminPage` link convention is the workaround), **log viewing**
+    (`api.log` is write-only), and **storage introspection** (pods/disk
+    stats need an operator-repeated `podsRoot` path — a filesystem
+    cousin of `api.serverInfo`). Full gap table in admin/README.md.
 
 ## Test-harness footguns (host quirks, not plugin api)
 

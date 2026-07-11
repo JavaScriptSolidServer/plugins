@@ -8,16 +8,18 @@ plugin), `NOTES.md` (the findings/seams — the real deliverable), and
 
 ## Where things stand
 
-- **32 plugins, 363 tests, all green** (`npm test`), all pushed to
+- **33 plugins, 374 tests, all green** (`npm test`), all pushed to
   `github.com/JavaScriptSolidServer/plugins` (branch `gh-pages`).
-- `compose.test.js` boots all 32 on **one** JSS from pure config; `serve.js`
-  is the runnable demo. Both must be updated when you add a plugin.
+- `compose.test.js` boots all 33 on **one** JSS from pure config; `serve.js`
+  is the runnable demo — its front door is now `admin/` (`/admin/`), the
+  capstone wp-admin-style operator home fed by a shared `INVENTORY` array.
+  All three must be updated when you add a plugin.
 - Built so far: 7 ports (relay, webrtc, terminal, tunnel, notifications,
-  remotestorage, pay) + 25 features (nip05, corsproxy, capability, webdav,
+  remotestorage, pay) + 26 features (nip05, corsproxy, capability, webdav,
   sparql — now with UPDATE, gitscratch, otp, carddav, mastodon, bluesky,
   caldav — now with free-busy, webfinger,
   activitypub, rss, matrix, search, didweb, s3, micropub, backup,
-  metrics, dashboard, oembed, jmap, shortlink).
+  metrics, dashboard, oembed, jmap, shortlink, admin).
 - Capability classes covered: realtime, WebDAV family, fediverse/social/chat
   (5 shims), IndieWeb publishing, identity, data/query/search, object
   storage, proxy, dev, pay, data portability, ops/observability, mail,

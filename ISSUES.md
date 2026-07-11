@@ -43,6 +43,7 @@ evidence. Legend:
 | — | `jmap/` | JMAP mail over the pod (push/delta → 🔩 `api.events`; blobs → 🔩 #583) |
 | #163 | `remotestorage/` | remoteStorage server — 7th port; witnessed the webfinger collision |
 | — | `shortlink/` | link shortener for pod URLs (pluginDir persistence, 11th witness) |
+| #463/#464-adj | `admin/` | operator home — the wp-admin gap analysis; every missing pillar names a seam |
 
 Plus seven **ports of bundled features** proving the migration path for
 #564 / #164: `relay/` `webrtc/` `terminal/` `tunnel/` `notifications/`
@@ -106,11 +107,11 @@ exists.
 
 Of ~40 plugin-tagged issues: **14 built as plugins here** (plus `rss/`,
 `matrix/`, `search/`, `didweb/`, `s3/`, `micropub/`, `backup/`, `metrics/`,
-`dashboard/`, `oembed/`, `jmap/`, `shortlink/` — capability
+`dashboard/`, `oembed/`, `jmap/`, `shortlink/`, `admin/` — capability
 demonstrations with no single issue), **7 ported**, **5 shipped upstream**,
 **2 more plugin-able with no blocker**, **6 clusters blocked on a named
 seam** (each with a proof-of-need consumer), the rest core-by-nature or
-product-scale. **32 plugins total, 363 tests.** The plugin api reaches most
+product-scale. **33 plugins total, 374 tests.** The plugin api reaches most
 of the backlog today; ranked by demand, the seams that would unlock the
 most next are `api.authorize` (3 blocking consumers), `api.events` (7
 consumers — matrix `/sync` needs live push, jmap can't do push or delta

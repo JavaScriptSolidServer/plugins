@@ -90,9 +90,10 @@ README and NOTES.md, ship the closest honest approximation.
 | `oembed/` | — | oEmbed provider for pod resources (link unfurling; XSS-refusing) |
 | `jmap/` | — | JMAP mail over pod messages — the stateless/push line, sharpened |
 | `shortlink/` | — | link shortener for pod URLs (deliberately not an open redirector) |
+| `admin/` | — | **the capstone**: wp-admin-style operator home; each missing pillar names its seam |
 
-**363 tests, all green** (`npm test`), including `compose.test.js` — all
-thirty-two plugins on one server from pure config, pods + WAC intact
+**374 tests, all green** (`npm test`), including `compose.test.js` — all
+thirty-three plugins on one server from pure config, pods + WAC intact
 beside them. Findings consolidated in [NOTES.md](./NOTES.md); the full
 plugin-tagged backlog triaged in [ISSUES.md](./ISSUES.md); the build guide
 is [AGENT.md](./AGENT.md); the maintainer-facing summary — what to add

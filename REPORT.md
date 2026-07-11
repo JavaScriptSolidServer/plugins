@@ -1,4 +1,4 @@
-# The plugin api, 32 plugins later — a report for the maintainer
+# The plugin api, 33 plugins later — a report for the maintainer
 
 This document is the actionable summary of the whole experiment: what the
 #206 plugin api can already do, what it can't, and — ranked with evidence —
@@ -14,7 +14,7 @@ drafted so it could be filed nearly verbatim if wanted.
 ## Executive summary
 
 - The api as shipped in 0.0.215 (`createServer({ plugins })` + `prefix` +
-  `getAgent` + `pluginDir` + `ws.route`) is **sufficient for 32 real
+  `getAgent` + `pluginDir` + `ws.route`) is **sufficient for 33 real
   plugins across fifteen capability classes** — realtime, DAV,
   fediverse/chat shims, IndieWeb publishing, identity, query/search,
   object storage, proxy, dev tooling, pay, data portability,
@@ -187,11 +187,17 @@ probe-port-then-boot dance for the same reason.
   property to preserve, not new work.
 - **`api.mcp.registerTool`** — blocks the four MCP-tool issues
   (#495/#496/#500/#501); no consumer here because it's impossible today.
-- **`api.plugins` (the #463/#464 app-registry)** — first live consumer:
-  `dashboard/`, the plugin whose whole job is describing the deployment,
-  must be handed a hand-copied duplicate of the `createServer` plugins
-  list (drift is silent). The loader already holds the needed data:
+- **`api.plugins` (the #463/#464 app-registry)** — two consumers:
+  `dashboard/` and `admin/`, the plugins whose whole job is describing
+  the deployment, must each be handed a hand-copied duplicate of the
+  `createServer` plugins list (drift is silent; `serve.js` now maintains
+  a shared `INVENTORY` array beside the real list — the workaround that
+  proves the seam). The loader already holds the needed data:
   `api.plugins → [{ id, prefix, module }]`, read-only.
+- **`api.isOperator` (an operator concept)** — terminal/, metrics/ and
+  admin/ hold three incompatible answers to "who is the operator?"
+  (shared token, optional bearer, WebID allowlist). A tiny seam — an
+  `operators: []` server option surfaced to plugins — would unify them.
 - **Export pure utility modules** the way `auth.js` is blessed —
   `relay/` re-vendors NIP-01 verify, `pay/` re-vendors mrc20. A
   `javascript-solid-server/nostr.js` export (or explicit vendoring
@@ -267,6 +273,30 @@ consumer found (a metrics exporter counting all plugin traffic) — if
 hooks are ever capability-gated (`capabilities: ['hooks']` /
 `['observe']`), the shared scope could become the *granted* behavior and
 isolation the default.
+
+## The wp-admin test (the capstone)
+
+`admin/` asks the question every plugin platform eventually answers: can
+the ecosystem build its own WordPress-style admin? The read side — server
+health, live plugin inventory with probes, pod/user and storage stats,
+an agent-allowlist gate — works today, **but only because the operator
+re-tells the plugin what the host already knows, three different ways**
+(origin, plugins list, data root). The write side is where the api's
+edges are exact:
+
+| wp-admin pillar | Today | The seam |
+|---|---|---|
+| Plugin inventory | hand-copied config, silent drift | `api.plugins` (#463/#464) |
+| Install from a store | impossible (boot-time config) | #200 + post-boot loading |
+| Enable / disable | impossible — `deactivate()` exists, nothing calls it at runtime | runtime lifecycle on the loader |
+| Per-plugin settings panels | `adminPage` link convention | a contribute-a-panel affordance |
+| Health | ✅ live probes | registry health hints would refine it |
+| Users / storage | ✅ via operator-repeated `podsRoot` | storage introspection (cousin of `serverInfo`) |
+| Logs | impossible — `api.log` is write-only | a log-tailing seam |
+| Who is admin? | every plugin invents a gate | `api.isOperator` / `operators: []` |
+
+None of these are asks to build an admin panel into core — the plugin
+proves the *shell* can live out-of-tree; the seams are the data feeds.
 
 ## The core/plugin line (#564, answered empirically)
 

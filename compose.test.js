@@ -46,7 +46,7 @@ describe('composition: every plugin on one server', () => {
 
   after(async () => { if (jss) await jss.close(); });
 
-  it('boots pods + idp + thirty-two plugins from config', async () => {
+  it('boots pods + idp + thirty-three plugins from config', async () => {
     const port = await probePort();
     base = `http://127.0.0.1:${port}`;
     wsBase = `ws://127.0.0.1:${port}`;
@@ -108,6 +108,22 @@ describe('composition: every plugin on one server', () => {
           config: { baseUrl: base, loopbackUrl: base, claimWellKnown: false },
         },
         { id: 'metrics', module: at('metrics/plugin.js'), prefix: '/metrics', config: { loopbackUrl: base } },
+        {
+          id: 'admin',
+          module: at('admin/plugin.js'),
+          prefix: '/admin',
+          // No adminAgents in the composition → open mode (the plugin warns
+          // loudly at activate; the finding: no operator concept in the api).
+          config: {
+            loopbackUrl: base,
+            baseUrl: base,
+            podsRoot: root,
+            plugins: [
+              { id: 'nip05', prefix: '/nip05', probe: '/nip05/nostr.json', expect: [200] },
+              { id: 'metrics', prefix: '/metrics', probe: '/metrics/healthz', expect: [200] },
+            ],
+          },
+        },
         {
           id: 'dashboard',
           module: at('dashboard/plugin.js'),
@@ -347,6 +363,19 @@ describe('composition: every plugin on one server', () => {
   it('remotestorage: own-prefix webfinger answers (well-known stood down to webfinger/)', async () => {
     const res = await fetch(`${base}/remotestorage/webfinger`);
     assert.strictEqual(res.status, 400); // missing ?resource — endpoint alive
+  });
+
+  it('admin: the operator home renders with plugin inventory and pods stats', async () => {
+    let res = await fetch(`${base}/admin/`);
+    assert.strictEqual(res.status, 200);
+    const page = await res.text();
+    assert.ok(page.includes('nip05'));
+    assert.ok(page.includes('metrics'));
+    res = await fetch(`${base}/admin/status.json`);
+    assert.strictEqual(res.status, 200);
+    const status = await res.json();
+    assert.strictEqual(status.server.alive, true);
+    assert.ok(status.plugins.every((p) => p.state === 'up'), JSON.stringify(status.plugins));
   });
 
   it('metrics: healthz is ok and the exposition names the process gauges', async () => {
