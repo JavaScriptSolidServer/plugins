@@ -23,6 +23,12 @@
 //     NIP-98, … An anonymous push gets 401 + WWW-Authenticate.
 //   - clone/fetch is public unless config.requireAuth is true.
 //   - the agent id is passed to the backend as REMOTE_USER.
+//   - by default a scratch repo is SHARED: any verified agent may push to
+//     any repo (that is the "scratch" model). Set config.owned: true to bind
+//     each repo to the agent that first materialized it — thereafter only
+//     that creator may push (and, when requireAuth is set, read); others get
+//     403. This closes the cross-agent-overwrite gap for deployments that
+//     want per-repo ownership without changing the shared default.
 //
 // Raw bodies (relates to JSS #583): the routes live in a Fastify scope
 // whose content-type parser hands the *unconsumed request stream* through
@@ -63,6 +69,7 @@ export async function activate(api) {
   const ttlMs = api.config.ttlMs ?? DEFAULT_TTL_MS;
   const sweepIntervalMs = api.config.sweepIntervalMs ?? Math.min(ttlMs, DEFAULT_SWEEP_MS);
   const requireAuth = api.config.requireAuth ?? false;
+  const owned = api.config.owned ?? false;
   const backend = await findBackend(api.config);
 
   const reposDir = path.join(api.storage.pluginDir(), 'repos');
@@ -85,6 +92,14 @@ export async function activate(api) {
     'fi',
     '',
   ].join('\n');
+
+  // The agent that first materialized a repo, or null if unknown/shared.
+  function repoCreator(name) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(path.join(reposDir, name, META_FILE), 'utf8'));
+      return meta.creator ?? null;
+    } catch { return null; }
+  }
 
   // ------------------------------------------------------- materialize
   async function materialize(name, agent) {
@@ -240,6 +255,16 @@ export async function activate(api) {
       if ((isWrite || requireAuth) && !agent) {
         reply.header('WWW-Authenticate', 'Basic realm="jss-git-scratch", charset="UTF-8"');
         return reply.code(401).send('authentication required\n');
+      }
+
+      // Ownership (config.owned): once a repo has a creator, only that agent
+      // may push to it — and, under requireAuth, read it. Anonymous access is
+      // already handled above; here `agent` is set whenever the gate matters.
+      if (owned) {
+        const creator = repoCreator(name);
+        if (creator && agent !== creator && (isWrite || requireAuth)) {
+          return reply.code(403).send('this scratch repo belongs to another agent\n');
+        }
       }
 
       // First access materializes the repo; the TTL clock starts here.

@@ -195,6 +195,41 @@ describe('gitscratch plugin', () => {
     }
   });
 
+  it('owned: true binds a repo to its creator — other agents cannot push', async () => {
+    const owned = await startJss({
+      idp: true,
+      plugins: [{
+        id: 'gitscratch',
+        module: module_,
+        prefix: '/git',
+        config: { owned: true },
+      }],
+    });
+    try {
+      const { access_token: aliceTok } = await registerAndMint(owned.base, 'aliceowns');
+      const { access_token: bobTok } = await registerAndMint(owned.base, 'bobintrudes');
+      const ownedRemote = `${owned.base}/git/mine.git`;
+
+      // Alice creates the repo by first push.
+      await git([...authFlag(aliceTok), 'push', ownedRemote, 'main'], { cwd: work });
+
+      // Bob, though a verified agent, is refused a push to alice's repo.
+      await assert.rejects(
+        git([...authFlag(bobTok), 'push', ownedRemote, 'main'], { cwd: work }),
+        (err) => {
+          assert.match(String(err.stderr), /403|belongs to another agent|forbidden/i,
+            `bob's push should be forbidden: ${err.stderr}`);
+          return true;
+        },
+      );
+
+      // Alice can still push (a no-op update proves her access survives).
+      await git([...authFlag(aliceTok), 'push', ownedRemote, 'main'], { cwd: work });
+    } finally {
+      await owned.close();
+    }
+  });
+
   it('TTL sweeper reaps expired repos', async () => {
     const shortLived = await startJss({
       plugins: [{
