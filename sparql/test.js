@@ -57,6 +57,16 @@ describe('sparql plugin', () => {
       body: query,
     });
 
+  const sparqlUpdate = (update, { token, resource } = {}) =>
+    fetch(`${base}/sparql${resource ? `?resource=${encodeURIComponent(resource)}` : ''}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/sparql-update',
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
+      body: update,
+    });
+
   after(async () => { if (jss) await jss.close(); });
 
   it('refuses to boot without config.baseUrl', async () => {
@@ -266,5 +276,280 @@ describe('sparql plugin', () => {
       body: 'SELECT ?s WHERE { ?s ?p ?o }',
     });
     assert.strictEqual(wrongType.status, 415);
+  });
+
+  // ------------------------------------------------------- SPARQL UPDATE
+
+  it('INSERT DATA (GRAPH form) adds a triple; SELECT sees it; old triples survive the rewrite', async () => {
+    const target = `${base}/alice/photos/photo-boat.jsonld`;
+    const update = `
+      PREFIX schema: <https://schema.org/>
+      INSERT DATA { GRAPH <${target}> {
+        <${target}> schema:keywords "vintage" .
+      } }
+    `;
+    const res = await sparqlUpdate(update, { token: alice.access_token });
+    assert.strictEqual(res.status, 200);
+    const summary = await res.json();
+    assert.strictEqual(summary.ok, true);
+    assert.strictEqual(summary.op, 'INSERT DATA');
+    assert.strictEqual(summary.inserted, 1);
+    assert.strictEqual(summary.removed, 0);
+
+    // SELECT sees the new triple…
+    const sel = await (await sparql(`
+      PREFIX schema: <https://schema.org/>
+      SELECT ?k FROM <${base}/alice/photos/>
+      WHERE { <${target}> schema:keywords ?k }
+    `, { token: alice.access_token })).json();
+    assert.deepStrictEqual(sel.results.bindings.map((b) => b.k.value), ['vintage']);
+
+    // …the pre-existing triples survived the GET-merge-PUT rewrite…
+    const old = await (await sparql(`
+      PREFIX schema: <https://schema.org/>
+      SELECT ?d FROM <${target}>
+      WHERE { <${target}> a schema:Photo ; schema:dateCreated ?d }
+    `, { token: alice.access_token })).json();
+    assert.deepStrictEqual(old.results.bindings.map((b) => b.d.value), ['2024-06-01']);
+
+    // …and re-inserting the same triple is a no-op (no write issued).
+    const again = await sparqlUpdate(update, { token: alice.access_token });
+    assert.strictEqual(again.status, 200);
+    assert.strictEqual((await again.json()).inserted, 0);
+  });
+
+  it('INSERT DATA via ?resource= creates a missing resource (PUT If-None-Match: *)', async () => {
+    const path_ = '/alice/photos/tags.jsonld';
+    const iri = `${base}${path_}`;
+    const res = await sparqlUpdate(`
+      PREFIX schema: <https://schema.org/>
+      INSERT DATA {
+        <${iri}> a schema:DefinedTerm ; schema:name "boats" .
+      }
+    `, { token: alice.access_token, resource: path_ });
+    assert.strictEqual(res.status, 200);
+    const summary = await res.json();
+    assert.strictEqual(summary.inserted, 2);
+
+    // The resource now exists as an ordinary LDP JSON-LD resource…
+    const got = await fetch(iri, { headers: { authorization: `Bearer ${alice.access_token}` } });
+    assert.strictEqual(got.status, 200);
+    assert.match((got.headers.get('content-type') || ''), /json/);
+
+    // …and SELECT sees it through the container walk.
+    const sel = await (await sparql(`
+      PREFIX schema: <https://schema.org/>
+      SELECT ?n FROM <${base}/alice/photos/>
+      WHERE { ?s a schema:DefinedTerm ; schema:name ?n }
+    `, { token: alice.access_token })).json();
+    assert.deepStrictEqual(sel.results.bindings.map((b) => b.n.value), ['boats']);
+  });
+
+  it('DELETE DATA removes the triple; SELECT no longer sees it; siblings intact', async () => {
+    const target = `${base}/alice/photos/photo-boat.jsonld`;
+    const res = await sparqlUpdate(`
+      PREFIX schema: <https://schema.org/>
+      DELETE DATA { GRAPH <${target}> { <${target}> schema:keywords "vintage" } }
+    `, { token: alice.access_token });
+    assert.strictEqual(res.status, 200);
+    const summary = await res.json();
+    assert.strictEqual(summary.op, 'DELETE DATA');
+    assert.strictEqual(summary.removed, 1);
+
+    const gone = await (await sparql(`
+      PREFIX schema: <https://schema.org/>
+      SELECT ?k FROM <${base}/alice/photos/> WHERE { ?s schema:keywords ?k }
+    `, { token: alice.access_token })).json();
+    assert.strictEqual(gone.results.bindings.length, 0, 'deleted triple still visible');
+
+    const still = await (await sparql(`
+      PREFIX schema: <https://schema.org/>
+      SELECT ?d FROM <${target}> WHERE { <${target}> schema:dateCreated ?d }
+    `, { token: alice.access_token })).json();
+    assert.deepStrictEqual(still.results.bindings.map((b) => b.d.value), ['2024-06-01']);
+  });
+
+  it('DELETE DATA removing every triple leaves an EMPTY resource, not a 404', async () => {
+    const path_ = '/alice/photos/tags.jsonld';
+    const iri = `${base}${path_}`;
+    const res = await sparqlUpdate(`
+      PREFIX schema: <https://schema.org/>
+      DELETE DATA { <${iri}> a schema:DefinedTerm ; schema:name "boats" . }
+    `, { token: alice.access_token, resource: path_ });
+    assert.strictEqual(res.status, 200);
+    const summary = await res.json();
+    assert.strictEqual(summary.removed, 2);
+    assert.strictEqual(summary.triples, 0);
+
+    const got = await fetch(iri, { headers: { authorization: `Bearer ${alice.access_token}` } });
+    assert.strictEqual(got.status, 200, 'the emptied resource still exists');
+    const empty = await (await sparql(
+      `SELECT ?s FROM <${iri}> WHERE { ?s ?p ?o }`,
+      { token: alice.access_token },
+    )).json();
+    assert.strictEqual(empty.results.bindings.length, 0);
+
+    // DELETE DATA against a resource that does not exist at all → 404.
+    const missing = await sparqlUpdate(`
+      PREFIX schema: <https://schema.org/>
+      DELETE DATA { <${base}/alice/photos/nope.jsonld> schema:name "x" }
+    `, { token: alice.access_token, resource: '/alice/photos/nope.jsonld' });
+    assert.strictEqual(missing.status, 404);
+  });
+
+  it('WAC passthrough: anonymous and strangers cannot update, and nothing lands', async () => {
+    const target = `${base}/alice/photos/photo-sunrise.jsonld`;
+    const update = `
+      PREFIX schema: <https://schema.org/>
+      INSERT DATA { GRAPH <${target}> { <${target}> schema:keywords "defaced" } }
+    `;
+    const asMallory = await sparqlUpdate(update, { token: mallory.access_token });
+    assert.ok([401, 403].includes(asMallory.status), `mallory expected 401/403, got ${asMallory.status}`);
+    const anon = await sparqlUpdate(update);
+    assert.ok([401, 403].includes(anon.status), `anonymous expected 401/403, got ${anon.status}`);
+
+    const sel = await (await sparql(`
+      PREFIX schema: <https://schema.org/>
+      SELECT ?k FROM <${target}> WHERE { ?s schema:keywords ?k }
+    `, { token: alice.access_token })).json();
+    assert.strictEqual(sel.results.bindings.length, 0, 'a refused update must not land');
+  });
+
+  it('400 on malformed/unscoped/variable/container updates; 501 on unsupported forms', async () => {
+    const t = { token: alice.access_token };
+
+    const malformed = await sparqlUpdate('INSERT DATA { <x> garbage', t);
+    assert.strictEqual(malformed.status, 400);
+
+    const noTarget = await sparqlUpdate(
+      `INSERT DATA { <${base}/alice/photos/a.jsonld> <${base}/p> "v" }`, t);
+    assert.strictEqual(noTarget.status, 400);
+    assert.match((await noTarget.json()).error, /name the target/);
+
+    const withVar = await sparqlUpdate(
+      `INSERT DATA { GRAPH <${base}/alice/photos/a.jsonld> { ?s <${base}/p> "v" } }`, t);
+    assert.strictEqual(withVar.status, 400);
+    assert.match((await withVar.json()).error, /ground triples/);
+
+    const container = await sparqlUpdate(
+      `INSERT DATA { GRAPH <${base}/alice/photos/> { <${base}/alice/photos/> <${base}/p> "v" } }`, t);
+    assert.strictEqual(container.status, 400);
+
+    const offOrigin = await sparqlUpdate(
+      'INSERT DATA { GRAPH <https://elsewhere.example/g> { <https://elsewhere.example/s> <https://elsewhere.example/p> "v" } }', t);
+    assert.strictEqual(offOrigin.status, 400);
+
+    // Pattern/template forms and graph management: honest 501s.
+    const deleteWhere = await sparqlUpdate('DELETE WHERE { ?s ?p ?o }',
+      { ...t, resource: '/alice/photos/photo-boat.jsonld' });
+    assert.strictEqual(deleteWhere.status, 501);
+    assert.match((await deleteWhere.json()).error, /only INSERT DATA and DELETE DATA/);
+
+    const insertWhere = await sparqlUpdate(
+      `INSERT { ?s <${base}/p> "v" } WHERE { ?s ?p ?o }`,
+      { ...t, resource: '/alice/photos/photo-boat.jsonld' });
+    assert.strictEqual(insertWhere.status, 501);
+
+    const withForm = await sparqlUpdate(
+      `WITH <${base}/alice/photos/photo-boat.jsonld> DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }`, t);
+    assert.strictEqual(withForm.status, 501);
+
+    const clear = await sparqlUpdate(`CLEAR GRAPH <${base}/alice/photos/photo-boat.jsonld>`, t);
+    assert.strictEqual(clear.status, 501);
+  });
+
+  it('the 412 retry path: an interfering write between GET and PUT is re-read, not clobbered', async () => {
+    // The plugin runs in-process and reaches the host through global fetch,
+    // so the test can deterministically slip an external write into the
+    // window between the plugin's GET (which captured the ETag) and its
+    // If-Match PUT. The host must answer that PUT with 412 (stale ETag),
+    // and the plugin must re-read and merge against the NEW state.
+    const path_ = '/alice/photos/photo-sunrise.jsonld';
+    const target = `${base}${path_}`;
+    const externalDoc = {
+      '@context': { schema: 'https://schema.org/' },
+      '@id': '',
+      '@type': 'schema:Photo',
+      'schema:name': 'sunrise over the pier',
+      'schema:dateCreated': '2026-01-15',
+      'schema:caption': 'written between GET and PUT',
+    };
+    const realFetch = globalThis.fetch;
+    let interfered = false;
+    globalThis.fetch = async (input, init) => {
+      if (!interfered && init?.method === 'PUT' && String(input).endsWith(path_)) {
+        interfered = true; // the interfering PUT below must not recurse
+        const ext = await realFetch(target, {
+          method: 'PUT',
+          headers: {
+            'content-type': 'application/ld+json',
+            authorization: `Bearer ${alice.access_token}`,
+          },
+          body: JSON.stringify(externalDoc),
+        });
+        assert.ok(ext.status < 400, `interfering write: ${ext.status}`);
+      }
+      return realFetch(input, init);
+    };
+    try {
+      const res = await sparqlUpdate(`
+        PREFIX schema: <https://schema.org/>
+        INSERT DATA { GRAPH <${target}> { <${target}> schema:keywords "morning" } }
+      `, { token: alice.access_token });
+      assert.strictEqual(res.status, 200);
+      const summary = await res.json();
+      assert.strictEqual(summary.retried, true, 'the stale If-Match PUT must have 412ed and retried');
+      assert.strictEqual(summary.inserted, 1);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    assert.ok(interfered, 'the interfering write never fired');
+
+    // Both the external write's triple and the update's triple survive.
+    const sel = await (await sparql(`
+      PREFIX schema: <https://schema.org/>
+      SELECT ?c ?k FROM <${target}>
+      WHERE { <${target}> schema:caption ?c ; schema:keywords ?k }
+    `, { token: alice.access_token })).json();
+    assert.strictEqual(sel.results.bindings.length, 1);
+    assert.strictEqual(sel.results.bindings[0].c.value, 'written between GET and PUT');
+    assert.strictEqual(sel.results.bindings[0].k.value, 'morning');
+  });
+
+  it('concurrent INSERT DATA: no torn state, but the host may lose one (measured TOCTOU — see README)', async () => {
+    // What IS guaranteed: both callers get 200 (each PUT either passes
+    // If-Match or 412s and the retry lands), the resource stays valid
+    // JSON-LD, and the seeded triples survive (every PUT snapshot includes
+    // them). What is NOT guaranteed: both keywords landing — the host's
+    // If-Match check is check-then-write, and two overlapping PUTs can
+    // both pass the same ETag (measured; README finding), so the loser's
+    // keyword may be silently overwritten. The assertions state exactly
+    // the invariants that hold.
+    const target = `${base}/alice/photos/photo-harbor.jsonld`;
+    const insert = (word) => sparqlUpdate(`
+      PREFIX schema: <https://schema.org/>
+      INSERT DATA { GRAPH <${target}> { <${target}> schema:keywords "${word}" } }
+    `, { token: alice.access_token });
+    const [a, b] = await Promise.all([insert('sunset'), insert('harbor')]);
+    assert.strictEqual(a.status, 200);
+    assert.strictEqual(b.status, 200);
+
+    const sel = await (await sparql(`
+      PREFIX schema: <https://schema.org/>
+      SELECT ?k FROM <${target}> WHERE { <${target}> schema:keywords ?k }
+    `, { token: alice.access_token })).json();
+    const kws = sel.results.bindings.map((x) => x.k.value).sort();
+    assert.ok(kws.length >= 1, 'at least the last write must be visible');
+    assert.ok(kws.every((k) => ['harbor', 'sunset'].includes(k)), `unexpected keywords ${kws}`);
+
+    // No torn state: the photo's seeded triples survived both rewrites.
+    const still = await (await sparql(`
+      PREFIX schema: <https://schema.org/>
+      SELECT ?n ?d FROM <${target}>
+      WHERE { <${target}> a schema:Photo ; schema:name ?n ; schema:dateCreated ?d }
+    `, { token: alice.access_token })).json();
+    assert.strictEqual(still.results.bindings.length, 1);
+    assert.strictEqual(still.results.bindings[0].n.value, 'harbor at sunset');
+    assert.strictEqual(still.results.bindings[0].d.value, '2026-03-02');
   });
 });

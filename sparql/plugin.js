@@ -17,6 +17,19 @@
 // caller could GET anyway (the notifications plugin's loopback pattern,
 // applied to authorization of an entire dataset).
 //
+// It also implements SPARQL UPDATE for the GROUND-DATA forms:
+//
+//   POST /sparql            Content-Type: application/sparql-update
+//   INSERT DATA / DELETE DATA, target named via GRAPH <iri> {} or
+//   ?resource=/path → 200 + a small JSON summary
+//
+// as the exact inverse of the read lens: GET the target over loopback with
+// the caller's own Authorization (host ETag captured), flatten, merge or
+// filter the ground triples, serialize back, PUT with If-Match (retry once
+// on 412, then 409) — the conditional-write pass-through remotestorage/
+// measured, second consumer. Pattern forms (DELETE/INSERT … WHERE) and
+// graph management are 501, not half-implemented.
+//
 // What a plugin CANNOT do is the other half of #509: the write-time index
 // that makes queries O(1). There is no write-hook in the plugin api — no
 // api.events.onResourceChange — so a plugin can't maintain an index that
@@ -125,15 +138,19 @@ function tokenize(src) {
 // Grammar (the SUPPORTED SUBSET — see README.md):
 //   Query      := (PREFIX pname: <iri>)* SELECT [DISTINCT] (?var+ | *)
 //                 [FROM <iri>] WHERE { (Triples | Filter)* } [LIMIT n]
+//   Update     := (PREFIX pname: <iri>)* (INSERT|DELETE) DATA '{' QuadData '}'
+//   QuadData   := GRAPH <iri> '{' Triples* '}' | Triples*
 //   Triples    := Term Verb ObjList (';' Verb ObjList)* ['.']
 //   ObjList    := Term (',' Term)*
 //   Filter     := FILTER '(' Constraint ')'
 //   Constraint := Operand (=|!=|<|>|<=|>=) Operand
 //               | CONTAINS '(' Operand ',' Operand ')'
 //               | REGEX '(' Operand ',' Operand [',' "flags"] ')'
+//
+// The token reader (cursor + PREFIX handling + term resolution) is shared
+// by parseQuery and parseUpdate so both speak the exact same term language.
 
-function parseQuery(src) {
-  if (src.length > MAX_QUERY_LENGTH) throw new QueryError('query too long');
+function reader(src) {
   const toks = tokenize(src);
   let pos = 0;
   const peek = () => toks[pos];
@@ -184,60 +201,83 @@ function parseQuery(src) {
     throw new QueryError(`unexpected token in pattern: '${t.v ?? t.k}'`);
   };
 
-  // PREFIX declarations
-  while (isWord(peek(), 'PREFIX')) {
-    next();
-    const pn = next();
-    if (!pn || pn.k !== 'pname' || pn.l) throw new QueryError('PREFIX expects a namespace like `schema:`');
-    const iri = next();
-    if (!iri || iri.k !== 'iri') throw new QueryError('PREFIX expects an <iri>');
-    prefixes[pn.p] = iri.v;
-  }
+  const parsePrologue = () => { // PREFIX declarations
+    while (isWord(peek(), 'PREFIX')) {
+      next();
+      const pn = next();
+      if (!pn || pn.k !== 'pname' || pn.l) throw new QueryError('PREFIX expects a namespace like `schema:`');
+      const iri = next();
+      if (!iri || iri.k !== 'iri') throw new QueryError('PREFIX expects an <iri>');
+      prefixes[pn.p] = iri.v;
+    }
+  };
 
-  if (!isWord(peek(), 'SELECT')) throw new QueryError('only SELECT queries are supported');
-  next();
+  return { peek, next, isWord, isPunc, expectPunc, resolveTerm, parsePrologue };
+}
+
+/** One `Subject Verb ObjList (';' Verb ObjList)* ['.']` group into `sink`. */
+function parseTriplesGroup(r, sink) {
+  const subj = r.resolveTerm(r.next());
+  if (subj.t === 'lit') throw new QueryError('a literal cannot be a subject');
+  do {
+    const verb = r.resolveTerm(r.next());
+    if (verb.t === 'lit') throw new QueryError('a literal cannot be a predicate');
+    do {
+      sink.push({ s: subj, p: verb, o: r.resolveTerm(r.next()) });
+    } while (r.isPunc(r.peek(), ',') && r.next());
+  } while (r.isPunc(r.peek(), ';') && r.next());
+  if (r.isPunc(r.peek(), '.')) r.next();
+}
+
+function parseQuery(src) {
+  if (src.length > MAX_QUERY_LENGTH) throw new QueryError('query too long');
+  const r = reader(src);
+  r.parsePrologue();
+
+  if (!r.isWord(r.peek(), 'SELECT')) throw new QueryError('only SELECT queries are supported');
+  r.next();
   let distinct = false;
-  if (isWord(peek(), 'DISTINCT')) { next(); distinct = true; }
+  if (r.isWord(r.peek(), 'DISTINCT')) { r.next(); distinct = true; }
   let star = false;
   const projected = [];
-  if (isPunc(peek(), '*')) { next(); star = true; }
+  if (r.isPunc(r.peek(), '*')) { r.next(); star = true; }
   else {
-    while (peek()?.k === 'var') projected.push(next().v);
+    while (r.peek()?.k === 'var') projected.push(r.next().v);
     if (!projected.length) throw new QueryError('SELECT needs ?vars or *');
   }
 
   let from = null;
-  if (isWord(peek(), 'FROM')) {
-    next();
-    const t = next();
+  if (r.isWord(r.peek(), 'FROM')) {
+    r.next();
+    const t = r.next();
     if (t?.k !== 'iri') throw new QueryError('FROM expects an <iri>');
     from = t.v;
   }
 
-  if (!isWord(peek(), 'WHERE')) throw new QueryError('expected WHERE');
-  next();
-  expectPunc('{');
+  if (!r.isWord(r.peek(), 'WHERE')) throw new QueryError('expected WHERE');
+  r.next();
+  r.expectPunc('{');
 
   const patterns = [];
   const filters = [];
 
-  const operand = () => resolveTerm(next());
+  const operand = () => r.resolveTerm(r.next());
 
   function parseConstraint() {
-    if (isWord(peek(), 'CONTAINS') || isWord(peek(), 'REGEX')) {
-      const fn = next().v.toUpperCase();
-      expectPunc('(');
+    if (r.isWord(r.peek(), 'CONTAINS') || r.isWord(r.peek(), 'REGEX')) {
+      const fn = r.next().v.toUpperCase();
+      r.expectPunc('(');
       const a = operand();
-      expectPunc(',');
+      r.expectPunc(',');
       const b = operand();
       let flags = '';
-      if (fn === 'REGEX' && isPunc(peek(), ',')) {
-        next();
-        const f = next();
+      if (fn === 'REGEX' && r.isPunc(r.peek(), ',')) {
+        r.next();
+        const f = r.next();
         if (f?.k !== 'str') throw new QueryError('REGEX flags must be a string');
         flags = f.v;
       }
-      expectPunc(')');
+      r.expectPunc(')');
       const constraint = { kind: fn.toLowerCase(), a, b, flags };
       if (fn === 'REGEX' && b.t === 'lit') {
         try { constraint.re = new RegExp(b.v, flags); }
@@ -246,47 +286,106 @@ function parseQuery(src) {
       return constraint;
     }
     const a = operand();
-    const op = next();
+    const op = r.next();
     if (op?.k !== 'op') throw new QueryError('expected a comparison operator in FILTER');
     const b = operand();
     return { kind: 'cmp', op: op.v, a, b };
   }
 
-  while (peek() && !isPunc(peek(), '}')) {
-    if (isWord(peek(), 'FILTER')) {
-      next();
-      expectPunc('(');
+  while (r.peek() && !r.isPunc(r.peek(), '}')) {
+    if (r.isWord(r.peek(), 'FILTER')) {
+      r.next();
+      r.expectPunc('(');
       filters.push(parseConstraint());
-      expectPunc(')');
+      r.expectPunc(')');
       continue;
     }
-    const subj = resolveTerm(next());
-    if (subj.t === 'lit') throw new QueryError('a literal cannot be a subject');
-    do {
-      const verb = resolveTerm(next());
-      if (verb.t === 'lit') throw new QueryError('a literal cannot be a predicate');
-      do {
-        patterns.push({ s: subj, p: verb, o: resolveTerm(next()) });
-      } while (isPunc(peek(), ',') && next());
-    } while (isPunc(peek(), ';') && next());
-    if (isPunc(peek(), '.')) next();
+    parseTriplesGroup(r, patterns);
   }
-  expectPunc('}');
+  r.expectPunc('}');
 
   let limit = null;
-  while (peek()) {
-    if (isWord(peek(), 'LIMIT')) {
-      next();
-      const n = next();
+  while (r.peek()) {
+    if (r.isWord(r.peek(), 'LIMIT')) {
+      r.next();
+      const n = r.next();
       if (n?.k !== 'num' || !/^\d+$/.test(n.v)) throw new QueryError('LIMIT expects a non-negative integer');
       limit = parseInt(n.v, 10);
       continue;
     }
-    throw new QueryError(`unexpected trailing token '${peek().v ?? peek().k}'`);
+    throw new QueryError(`unexpected trailing token '${r.peek().v ?? r.peek().k}'`);
   }
 
   if (!patterns.length) throw new QueryError('WHERE needs at least one triple pattern');
   return { distinct, star, projected, from, patterns, filters, limit };
+}
+
+// ----------------------------------------------------------- update parser
+//
+// SPARQL 1.1 Update, GROUND-DATA FORMS ONLY: INSERT DATA and DELETE DATA.
+// The pattern forms (DELETE/INSERT … WHERE, WITH, USING), graph management
+// (LOAD/CLEAR/CREATE/DROP/COPY/MOVE/ADD), multi-operation requests (';')
+// and blank nodes in data blocks are all refused — the pattern forms with
+// 501 (UnsupportedError), honestly, rather than half-implemented: applying
+// a WHERE template needs bnode-safe instantiation against the store, which
+// the read engine's per-document bnode relabelling cannot round-trip.
+
+class UnsupportedError extends QueryError {}
+
+const GRAPH_MGMT = new Set(['LOAD', 'CLEAR', 'CREATE', 'DROP', 'COPY', 'MOVE', 'ADD']);
+
+function parseUpdate(src) {
+  if (src.length > MAX_QUERY_LENGTH) throw new QueryError('update too long');
+  const r = reader(src);
+  r.parsePrologue();
+
+  const head = r.next();
+  if (!head) throw new QueryError('empty update');
+  const headWord = head.k === 'word' ? head.v.toUpperCase() : null;
+  if (headWord === 'WITH' || headWord === 'USING') {
+    throw new UnsupportedError(`${headWord} … DELETE/INSERT … WHERE is not supported — only INSERT DATA and DELETE DATA`);
+  }
+  if (GRAPH_MGMT.has(headWord)) {
+    throw new UnsupportedError(`${headWord} is not supported — only INSERT DATA and DELETE DATA`);
+  }
+  if (headWord !== 'INSERT' && headWord !== 'DELETE') {
+    throw new QueryError('expected INSERT DATA or DELETE DATA');
+  }
+  if (!r.isWord(r.peek(), 'DATA')) {
+    throw new UnsupportedError(`${headWord} with a template/WHERE form is not supported — only INSERT DATA and DELETE DATA (ground triples)`);
+  }
+  r.next(); // DATA
+  const op = headWord === 'INSERT' ? 'insert' : 'delete';
+
+  r.expectPunc('{');
+  let graph = null;
+  const triples = [];
+  if (r.isWord(r.peek(), 'GRAPH')) {
+    r.next();
+    const g = r.next();
+    if (g?.k !== 'iri') throw new QueryError('GRAPH expects an <iri>');
+    graph = g.v;
+    r.expectPunc('{');
+    while (r.peek() && !r.isPunc(r.peek(), '}')) parseTriplesGroup(r, triples);
+    r.expectPunc('}');
+  } else {
+    while (r.peek() && !r.isPunc(r.peek(), '}')) parseTriplesGroup(r, triples);
+  }
+  r.expectPunc('}');
+  if (r.isPunc(r.peek(), ';')) {
+    throw new UnsupportedError('multiple update operations in one request are not supported — send one INSERT DATA or DELETE DATA at a time');
+  }
+  if (r.peek()) throw new QueryError(`unexpected trailing token '${r.peek().v ?? r.peek().k}'`);
+
+  if (!triples.length) throw new QueryError('the DATA block needs at least one triple');
+  for (const tr of triples) {
+    for (const part of [tr.s, tr.p, tr.o]) {
+      if (part.t === 'var') {
+        throw new QueryError('INSERT DATA / DELETE DATA take ground triples — variables are not allowed');
+      }
+    }
+  }
+  return { op, graph, triples };
 }
 
 // -------------------------------------------- JSON-LD → triples flattening
@@ -424,6 +523,46 @@ function flattenDoc(doc, resourceIri, triples, normalize, docTag) {
       processNode(node);
     }
   }
+}
+
+// -------------------------------------------- triples → JSON-LD (inverse)
+//
+// The exact inverse of flattenDoc's lens, used by the update path: group
+// triples by subject into an `@graph` of node objects with absolute-IRI
+// keys, `@type` for rdf:type, `{"@id"}` objects for IRI/bnode objects and
+// `{"@value"[, "@type"|"@language"]}` objects for literals. Re-flattening
+// the produced document yields the same triples (bnode labels aside).
+// Consequence, documented in README: an update REWRITES the target through
+// this lens — anything flattenDoc drops (unmapped terms, @list order, the
+// original @context/formatting) does not survive an update.
+
+function tripleEquals(a, b) {
+  return termEquals(a.s, b.s) && termEquals(a.p, b.p) && termEquals(a.o, b.o);
+}
+
+function triplesToJsonLd(triples) {
+  const nodes = new Map();
+  const nodeFor = (id) => {
+    if (!nodes.has(id)) nodes.set(id, { '@id': id });
+    return nodes.get(id);
+  };
+  for (const tr of triples) {
+    const node = nodeFor(tr.s.v);
+    if (tr.p.v === RDF_TYPE && tr.o.t === 'iri') {
+      node['@type'] = [].concat(node['@type'] ?? [], [tr.o.v]);
+      continue;
+    }
+    let obj;
+    if (tr.o.t === 'iri' || tr.o.t === 'bn') {
+      obj = { '@id': tr.o.v };
+    } else {
+      obj = { '@value': tr.o.v };
+      if (tr.o.dt && tr.o.dt !== XSD + 'string') obj['@type'] = tr.o.dt;
+      if (tr.o.lang) obj['@language'] = tr.o.lang;
+    }
+    node[tr.p.v] = [].concat(node[tr.p.v] ?? [], [obj]);
+  }
+  return { '@graph': [...nodes.values()] };
 }
 
 // --------------------------------------------------------------- evaluator
@@ -603,14 +742,184 @@ export async function activate(api) {
     return { triples, truncated: state.truncated, resources: visited.size };
   }
 
+  /**
+   * SPARQL UPDATE (INSERT DATA / DELETE DATA) against ONE pod resource:
+   * GET the target over loopback with the caller's own Authorization
+   * (capturing the host's ETag), flatten it with the read side's lens,
+   * merge/filter the ground triples, serialize with the inverse lens, and
+   * PUT back with If-Match (If-None-Match: * when creating). On 412 the
+   * whole read-transform-write is retried once, then 409 to the caller —
+   * the conditional-write pass-through remotestorage/ measured, second
+   * consumer.
+   */
+  async function handleUpdate(request, reply, body) {
+    let update;
+    try {
+      update = parseUpdate(body);
+    } catch (err) {
+      if (err instanceof UnsupportedError) return reply.code(501).send({ error: err.message });
+      if (err instanceof QueryError) return reply.code(400).send({ error: err.message });
+      throw err;
+    }
+
+    // Target: the update names ONE resource (the read side's "a resource is
+    // a graph" model, inverted) — GRAPH <iri> {} in the data block or
+    // ?resource=/path on the URL.
+    let resourcePath = null;
+    if (update.graph) {
+      let u;
+      try { u = new URL(update.graph); } catch {
+        return reply.code(400).send({ error: 'GRAPH must be an absolute IRI' });
+      }
+      if (u.origin !== origin) {
+        return reply.code(400).send({ error: `GRAPH must be on this server (${origin}); no federation` });
+      }
+      resourcePath = u.pathname;
+    }
+    if (typeof request.query?.resource === 'string' && request.query.resource) {
+      if (!request.query.resource.startsWith('/')) {
+        return reply.code(400).send({ error: '?resource= must be an absolute path like /alice/notes.jsonld' });
+      }
+      if (resourcePath && resourcePath !== request.query.resource) {
+        return reply.code(400).send({ error: 'GRAPH <iri> and ?resource= disagree — name the target once' });
+      }
+      resourcePath = resourcePath ?? request.query.resource;
+    }
+    if (!resourcePath) {
+      return reply.code(400).send({
+        error: 'name the target resource: GRAPH <iri> { … } in the update, or ?resource=/path',
+      });
+    }
+    if (resourcePath.endsWith('/')) {
+      return reply.code(400).send({ error: 'the target must be a single resource, not a container' });
+    }
+    if (/\.(acl|meta)$/i.test(resourcePath)) {
+      return reply.code(400).send({
+        error: '.acl/.meta sidecars are not updatable through this endpoint (the read side skips them too)',
+      });
+    }
+
+    const authorization = request.headers.authorization ?? null;
+    const authHeaders = authorization ? { authorization } : {};
+    const drain = async (res) => { try { await res.body?.cancel(); } catch { /* drained */ } };
+
+    let retried = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let got;
+      try {
+        got = await fetch(loopback + resourcePath, {
+          redirect: 'manual',
+          headers: { accept: 'application/ld+json, application/json;q=0.9', ...authHeaders },
+        });
+      } catch {
+        return reply.code(502).send({ error: `loopback GET ${resourcePath} failed` });
+      }
+      let etag = null;
+      let exists = false;
+      const baseTriples = [];
+      if (got.status === 401 || got.status === 403) {
+        await drain(got);
+        return reply.code(got.status)
+          .send({ error: `the host refused ${resourcePath} (${got.status}) — WAC decides, not this plugin` });
+      }
+      if (got.ok) {
+        const ct = (got.headers.get('content-type') || '').toLowerCase();
+        if (!ct.includes('json')) {
+          await drain(got);
+          return reply.code(409).send({
+            error: 'the target resource is not JSON(-LD) — this endpoint updates exactly the resources the read side can see',
+          });
+        }
+        let doc;
+        try { doc = await got.json(); } catch {
+          return reply.code(409).send({ error: 'the target resource is not parseable JSON' });
+        }
+        etag = got.headers.get('etag');
+        exists = true;
+        flattenDoc(doc, baseUrl + resourcePath, baseTriples, normalize, 'd0');
+      } else if (got.status === 404) {
+        await drain(got);
+        if (update.op === 'delete') {
+          return reply.code(404).send({ error: `${resourcePath} does not exist` });
+        }
+        // insert into a missing resource creates it (PUT If-None-Match: *)
+      } else {
+        await drain(got);
+        return reply.code(502).send({ error: `loopback GET ${resourcePath} → ${got.status}` });
+      }
+
+      let result;
+      let inserted = 0;
+      let removed = 0;
+      if (update.op === 'insert') {
+        result = baseTriples.slice();
+        for (const tr of update.triples) {
+          if (!result.some((x) => tripleEquals(x, tr))) { result.push(tr); inserted++; }
+        }
+      } else {
+        result = baseTriples.filter((x) => !update.triples.some((tr) => tripleEquals(x, tr)));
+        removed = baseTriples.length - result.length;
+      }
+
+      const summary = {
+        ok: true,
+        op: update.op === 'insert' ? 'INSERT DATA' : 'DELETE DATA',
+        resource: baseUrl + resourcePath,
+        inserted,
+        removed,
+        triples: result.length,
+        retried,
+      };
+
+      if (exists && inserted === 0 && removed === 0) {
+        // No-op: don't touch the resource at all.
+        reply.header('content-type', 'application/json');
+        return JSON.stringify(summary);
+      }
+
+      const putHeaders = { 'content-type': 'application/ld+json', ...authHeaders };
+      if (exists) {
+        if (etag) putHeaders['if-match'] = etag; // unconditional only if the host sent no ETag
+      } else {
+        putHeaders['if-none-match'] = '*';
+      }
+      let put;
+      try {
+        put = await fetch(loopback + resourcePath, {
+          method: 'PUT',
+          redirect: 'manual',
+          headers: putHeaders,
+          body: JSON.stringify(triplesToJsonLd(result)),
+        });
+      } catch {
+        return reply.code(502).send({ error: `loopback PUT ${resourcePath} failed` });
+      }
+      await drain(put);
+      if (put.status === 412) { retried = true; continue; } // raced: re-read once
+      if (put.status === 401 || put.status === 403) {
+        return reply.code(put.status)
+          .send({ error: `the host refused to write ${resourcePath} (${put.status}) — WAC decides, not this plugin` });
+      }
+      if (!put.ok) {
+        return reply.code(502).send({ error: `loopback PUT ${resourcePath} → ${put.status}` });
+      }
+      reply.header('content-type', 'application/json');
+      return JSON.stringify(summary);
+    }
+    return reply.code(409).send({
+      error: 'concurrent writes kept changing the resource (If-Match failed twice) — retry the update',
+    });
+  }
+
   // Discovery: GET describes the endpoint and its subset.
   api.fastify.get(routePath, async (request, reply) => {
     reply.header('content-type', 'application/json');
     return JSON.stringify({
       endpoint: routePath,
-      accepts: 'application/sparql-query (POST)',
-      returns: 'application/sparql-results+json',
+      accepts: 'application/sparql-query | application/sparql-update (POST)',
+      returns: 'application/sparql-results+json (query) | application/json summary (update)',
       subset: 'SELECT [DISTINCT] (?vars|*) [FROM <iri>] WHERE { BGP, FILTER(cmp|CONTAINS|REGEX) } [LIMIT n]',
+      updateSubset: 'INSERT DATA / DELETE DATA with ground triples; target via GRAPH <iri> {} or ?resource=/path',
       scope: 'FROM <iri> | ?container=/path/ | config.defaultContainer',
       limits: { maxDepth, maxResources, resultCap },
     });
@@ -618,11 +927,15 @@ export async function activate(api) {
 
   api.fastify.post(routePath, async (request, reply) => {
     const contentType = (request.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
-    if (contentType !== 'application/sparql-query') {
-      return reply.code(415)
-        .send({ error: 'POST the query with Content-Type: application/sparql-query' });
-    }
     const body = Buffer.isBuffer(request.body) ? request.body.toString('utf8') : String(request.body ?? '');
+    if (contentType === 'application/sparql-update') {
+      return handleUpdate(request, reply, body);
+    }
+    if (contentType !== 'application/sparql-query') {
+      return reply.code(415).send({
+        error: 'POST a query with Content-Type: application/sparql-query, or an update with application/sparql-update',
+      });
+    }
 
     let query;
     try {
@@ -694,5 +1007,5 @@ export async function activate(api) {
     return JSON.stringify({ head: { vars }, results: { bindings } });
   });
 
-  api.log.info(`sparql: SELECT endpoint at ${routePath} (read-time crawl; no write-time index — see README findings)`);
+  api.log.info(`sparql: SELECT + INSERT/DELETE DATA endpoint at ${routePath} (read-time crawl; no write-time index — see README findings)`);
 }
