@@ -1,4 +1,4 @@
-# The plugin api, 31 plugins later — a report for the maintainer
+# The plugin api, 32 plugins later — a report for the maintainer
 
 This document is the actionable summary of the whole experiment: what the
 #206 plugin api can already do, what it can't, and — ranked with evidence —
@@ -14,7 +14,7 @@ want it.
 ## Executive summary
 
 - The api as shipped in 0.0.215 (`createServer({ plugins })` + `prefix` +
-  `getAgent` + `pluginDir` + `ws.route`) is **sufficient for 31 real
+  `getAgent` + `pluginDir` + `ws.route`) is **sufficient for 32 real
   plugins across fifteen capability classes** — realtime, DAV,
   fediverse/chat shims, IndieWeb publishing, identity, query/search,
   object storage, proxy, dev tooling, pay, data portability,
@@ -30,10 +30,11 @@ want it.
   `api.events.onResourceChange`, `api.reservePath`, and `api.serverInfo`.
   Adding the first three moves essentially every remaining plugin-shaped
   issue from "honest approximation" to "faithful implementation".
-- Four small loader/core bugs are worth fixing regardless
+- Five small loader/core bugs are worth fixing regardless
   (generic-basename id derivation; dotted-prefix WS validation;
   `logger: false` breaking every plugin `onResponse` hook; the loader's
-  error wrap dropping `err.code`).
+  error wrap dropping `err.code`; the host's conditional write being
+  check-then-write rather than atomic).
 - One measured surprise: **plugins are not isolated from each other** —
   all entries share one Fastify register scope, so any plugin can hook
   every other plugin's routes (never core's). Worth a deliberate
@@ -62,9 +63,11 @@ Validated by use, not opinion:
    *not* on the ask list — only the cases loopback structurally can't
    cover are.
 6. **Conditional writes survive loopback intact** (measured by
-   `remotestorage/`): forwarded `If-Match`/`If-None-Match` are honored by
-   the host end-to-end (412 on stale, 304 on match, atomic). A protocol
-   that needs optimistic concurrency gets it for free.
+   `remotestorage/`; `sparql/`'s UPDATE is the second consumer):
+   forwarded `If-Match`/`If-None-Match` are honored by the host
+   end-to-end (412 on stale, 304 on match). A protocol that needs
+   optimistic concurrency gets the stale-writer case for free — but see
+   bug 5: under true concurrency the check is not atomic.
 
 ## The seams to add, ranked by independent demand
 
@@ -77,7 +80,8 @@ entry is written as a fileable issue: motivation, consumers, sketch, cost.
 *requester's credentials don't drive*.
 
 **Why loopback can't cover it:** loopback answers "may *this caller* read
-X?". Three plugins need "may *someone else* — a pod owner, a token issuer —
+X?". Four plugins need "may *someone else* — a pod owner, a token issuer,
+a message recipient —
 authorize this?":
 
 - `corsproxy/` (#382): per-pod proxy ACLs — the *pod owner's* `.acl`
@@ -87,6 +91,10 @@ authorize this?":
   can only enforce its own token scopes, not re-check the issuer's current
   WAC rights (revocation by ACL edit doesn't propagate).
 - `pay/`: the 402 gate wants to compose with WAC instead of replacing it.
+- `caldav/` (RFC 6638 scheduling): Outbox→Inbox delivery is a write into
+  the *recipient's* pod the sender has no WAC right to make — loopback
+  structurally cannot express it. (A narrower server-mediated
+  deliver-to-inbox primitive would also cover this one.)
 
 **Sketch:** `api.authorize({ agent, path, mode }) → Promise<boolean>` —
 agent id (not request) in, decision out, same engine the LDP path uses.
@@ -197,7 +205,7 @@ probe-port-then-boot dance for the same reason.
   Deliberately *not* asked for as a default-on hook: it's a bigger grant
   than route ownership. If ever, gate it: `capabilities: ['hooks']`.
 
-## Four loader/core bugs worth fixing regardless
+## Five loader/core bugs worth fixing regardless
 
 1. **Generic-basename id derivation.** Every plugin follows
    `<name>/plugin.js`, so every derived id is `plugin` and the (correct)
@@ -219,6 +227,12 @@ probe-port-then-boot dance for the same reason.
    failed: <message>` with `FST_ERR_DUPLICATED_ROUTE` stripped — callers
    can only string-match. Preserve `code` (or use `cause`) when
    re-wrapping (found by `remotestorage/`).
+5. **The conditional write is check-then-write, not atomic** (found live
+   by `sparql/`): two *concurrent* PUTs carrying the same currently-valid
+   `If-Match` both return 2xx and one is silently overwritten; the same
+   PUTs run sequentially 412 correctly. Both callers are told success but
+   one write is gone. Unfixable from a plugin; the LDP write path needs
+   an atomic stat+write.
 
 ## A measured surprise: plugins are not isolated from each other
 

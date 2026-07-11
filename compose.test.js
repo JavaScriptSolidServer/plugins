@@ -46,7 +46,7 @@ describe('composition: every plugin on one server', () => {
 
   after(async () => { if (jss) await jss.close(); });
 
-  it('boots pods + idp + thirty-one plugins from config', async () => {
+  it('boots pods + idp + thirty-two plugins from config', async () => {
     const port = await probePort();
     base = `http://127.0.0.1:${port}`;
     wsBase = `ws://127.0.0.1:${port}`;
@@ -95,6 +95,7 @@ describe('composition: every plugin on one server', () => {
         { id: 's3', module: at('s3/plugin.js'), prefix: '/s3', config: { baseUrl: base, loopbackUrl: base } },
         { id: 'micropub', module: at('micropub/plugin.js'), prefix: '/micropub', config: { baseUrl: base, loopbackUrl: base } },
         { id: 'backup', module: at('backup/plugin.js'), prefix: '/backup', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'shortlink', module: at('shortlink/plugin.js'), prefix: '/short', config: { baseUrl: base } },
         { id: 'oembed', module: at('oembed/plugin.js'), prefix: '/oembed', config: { baseUrl: base, loopbackUrl: base } },
         { id: 'jmap', module: at('jmap/plugin.js'), prefix: '/jmap', config: { baseUrl: base, loopbackUrl: base } },
         {
@@ -319,6 +320,16 @@ describe('composition: every plugin on one server', () => {
   it('backup: bare GET is 400 with usage (no whole-server export)', async () => {
     const res = await fetch(`${base}/backup`);
     assert.strictEqual(res.status, 400);
+  });
+
+  it('shortlink: anonymous mint is 401; unknown slug is 404', async () => {
+    let res = await fetch(`${base}/short`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: `${base}/x` }),
+    });
+    assert.strictEqual(res.status, 401);
+    res = await fetch(`${base}/short/nosuchslug`, { redirect: 'manual' });
+    assert.strictEqual(res.status, 404);
   });
 
   it('oembed: missing url is 400 (endpoint alive, never fetches external)', async () => {

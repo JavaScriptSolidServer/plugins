@@ -11,7 +11,7 @@ Out-of-tree plugins for [JavaScript Solid
 Server](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer),
 built on its **#206 loader** (`createServer({ plugins })`, JSS ≥ 0.0.215).
 It is an *experiment*: prove the plugin api by using it, and treat every
-wall you hit as a finding, not a blocker. **31 plugins, 332 tests today.**
+wall you hit as a finding, not a blocker. **32 plugins, 363 tests today.**
 
 ### The one rule that makes the experiment valid
 
@@ -156,6 +156,7 @@ Full ranking in `NOTES.md`. The ones you'll hit:
 | a per-resource metadata/unfurl endpoint | `oembed/` | loopback resolve + local-URL-only guard |
 | a stateless request/response protocol (mail, sync, …) | `jmap/` | loopback CRUD + in-protocol refusal of push/delta |
 | a storage protocol with conditional writes | `remotestorage/` | If-Match/If-None-Match pass through loopback intact |
+| a redirect / metadata micro-service | `shortlink/` | pluginDir JSON table + wildcard slug routes |
 
 ## Footguns (every multi-boot suite rediscovered these)
 
@@ -177,7 +178,7 @@ Full ranking in `NOTES.md`. The ones you'll hit:
 
 ## Current state
 
-31 plugins (7 ports + 24 features), 332 tests, all green (`npm test`).
+32 plugins (7 ports + 25 features), 363 tests, all green (`npm test`).
 `compose.test.js` runs every one on a single server from pure config. Two
 core PRs (#590 `api.mountApp`, #591 `/idp/refresh`) sit upstream, unmerged,
 for the maintainer's call. Everything else lives here, by design.

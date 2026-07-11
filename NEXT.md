@@ -8,15 +8,16 @@ plugin), `NOTES.md` (the findings/seams — the real deliverable), and
 
 ## Where things stand
 
-- **31 plugins, 332 tests, all green** (`npm test`), all pushed to
+- **32 plugins, 363 tests, all green** (`npm test`), all pushed to
   `github.com/JavaScriptSolidServer/plugins` (branch `gh-pages`).
-- `compose.test.js` boots all 31 on **one** JSS from pure config; `serve.js`
+- `compose.test.js` boots all 32 on **one** JSS from pure config; `serve.js`
   is the runnable demo. Both must be updated when you add a plugin.
 - Built so far: 7 ports (relay, webrtc, terminal, tunnel, notifications,
-  remotestorage, pay) + 24 features (nip05, corsproxy, capability, webdav,
-  sparql, gitscratch, otp, carddav, mastodon, bluesky, caldav, webfinger,
+  remotestorage, pay) + 25 features (nip05, corsproxy, capability, webdav,
+  sparql — now with UPDATE, gitscratch, otp, carddav, mastodon, bluesky,
+  caldav — now with free-busy, webfinger,
   activitypub, rss, matrix, search, didweb, s3, micropub, backup,
-  metrics, dashboard, oembed, jmap).
+  metrics, dashboard, oembed, jmap, shortlink).
 - Capability classes covered: realtime, WebDAV family, fediverse/social/chat
   (5 shims), IndieWeb publishing, identity, data/query/search, object
   storage, proxy, dev, pay, data portability, ops/observability, mail,
@@ -76,10 +77,10 @@ Still genuinely plugin-shaped and distinct:
 - **feed ingest** — subscribe to external RSS/Atom, store items in the pod
   (the inverse of `rss/`; uses a corsproxy-style fetch — outbound fetches:
   same careful-session caveat as webhooks/webmention).
-- **link-shortener**, **WebSub/PubSubHubbub** (needs `api.events` +
-  outbound POSTs — deferred),
-  **SPARQL UPDATE** (extends `sparql/`), **CalDAV scheduling/free-busy**
-  (extends `caldav/`).
+- **WebSub/PubSubHubbub** (needs `api.events` + outbound POSTs — deferred).
+- **CalDAV scheduling (RFC 6638)** — blocked on cross-user delivery
+  (api.authorize's issuer-authority case, or a deliver-to-inbox
+  primitive); free-busy is done.
 - **Bluesky/Mastodon/Matrix Phase-2** (federation, `/sync` live push) —
   these are blocked on `api.events` + `api.reservePath`; good once those
   seams exist, otherwise document the wall.
@@ -94,12 +95,14 @@ it sharpens the case.
 `NOTES.md` ranks candidate seams by how many independent plugins demanded
 each. Current top four (keep this current as you add consumers):
 
-1. **`api.authorize(request, path, mode)`** — 3 consumers; the top
+1. **`api.authorize(request, path, mode)`** — 4 consumers (caldav
+   scheduling joined); the top
    *blocking* seam (authority the requester doesn't drive).
-2. **`api.events.onResourceChange`** — 5 consumers (backup/ made it 5:
-   incremental/scheduled backup is unbuildable); matrix `/sync` needs
-   live push. Every "react to writes" plugin (webhooks, WebSub, indexing)
-   will want it — webhooks/ would make it 6.
+2. **`api.events.onResourceChange`** — 7 consumers (backup, jmap,
+   remotestorage joined); matrix `/sync` needs
+   live push, and sparql/'s UPDATE proved owning a write endpoint does
+   not buy a write-time index. Every "react to writes" plugin (webhooks,
+   WebSub, indexing) will want it.
 3. **`api.reservePath`** — every API-shim owns fixed roots outside its one
    prefix and can't self-exempt; didweb needs a *parameterized* form.
    (micropub/ is the counter-witness: client-discovered endpoints need no

@@ -24,11 +24,13 @@ are candidates, each with a consumer in this repo attached.
   correct. This removes a whole class of would-be seams (`api.wac.check`)
   from the *necessary* list, leaving them merely *nice*.
 - **Conditional writes pass through loopback intact** (remotestorage/,
-  measured): `If-Match`/`If-None-Match` forwarded verbatim are honored by
+  measured; sparql/ is the second consumer): `If-Match`/`If-None-Match`
+  forwarded verbatim are honored by
   the host end-to-end — stale `If-Match` PUT/DELETE → 412,
   `If-None-Match: *` on an existing resource → 412 with the body proven
-  not to land, `If-None-Match` GET → 304. Atomic at the host; no
-  plugin-side conditional logic needed.
+  not to land, `If-None-Match` GET → 304. No plugin-side conditional
+  logic needed for the stale-writer case. **Caveat measured by sparql/:**
+  the host's check is check-then-write, not atomic — see the bugs section.
 
 ## Candidate seams (ranked by how many independent plugins demanded them)
 
@@ -36,13 +38,17 @@ Twelve plugins in, the ranking is now empirical — a seam's rank is how many
 ports reached for it without coordinating.
 
 1. **`api.authorize(request, path, mode)`** — "would the host's WAC allow
-   this?" **Three independent consumers: notifications/, corsproxy/,
-   capability/.** The loopback trick (below) covers the case where the
-   *requester's own* credentials should decide (notifications, webdav,
+   this?" **Four independent consumers: notifications/, corsproxy/,
+   capability/, caldav/.** The loopback trick (below) covers the case where
+   the *requester's own* credentials should decide (notifications, webdav,
    sparql all use it), but it can't cover authorization the requester
    doesn't drive: a proxy governed by a *pod owner's* `.acl` (corsproxy
-   #382), or a capability exercising the *issuer's* authority
-   (capability #506). This is the most-requested seam and the one that
+   #382), a capability exercising the *issuer's* authority
+   (capability #506), or CalDAV scheduling (RFC 6638), where Outbox→Inbox
+   delivery is a write into the *recipient's* pod the sender has no WAC
+   right to make — loopback structurally cannot express it (a
+   server-mediated deliver-to-inbox primitive is the narrower
+   alternative). This is the most-requested seam and the one that
    moves the most backlog issues from "plugin-approximation" to "faithful".
 2. **`api.events.onResourceChange(cb)`** — **seven consumers now:
    notifications/, sparql/, search/, matrix/, backup/, jmap/,
@@ -60,6 +66,13 @@ ports reached for it without coordinating.
    (`eventSourceUrl`) and delta sync (`*/changes`, `Email/queryChanges`)
    are omitted/refused in-protocol), and remotestorage (rS's
    descendant-version propagation at depth ≥ 2 needs a write-time index).
+   sparql/'s UPDATE work sharpened the whole entry: **owning a write
+   endpoint does not buy the write-time index** — a plugin could index
+   its own writes synchronously, but plain-LDP writes bypass it, yielding
+   a silently-wrong index (worse than none); only the host's event stream
+   sees all writes. caldav/'s free-busy added a wrinkle: a shared
+   write-time index must answer "indexed under whose authority?" or it
+   leaks WAC-hidden data.
    Core already has the
    emitter internally (`src/notifications/events.js`); this is the seam
    every "react to pod writes" app (webhooks, indexing, sync, search, live
@@ -132,9 +145,10 @@ ports reached for it without coordinating.
    endpoints are client-discovered rather than protocol-fixed — the seam
    is specifically about protocols that pin absolute paths, not API shims
    per se.
-6. **Can't set fastify server options** — consumer: capability/ hit
+6. **Can't set fastify server options** — consumers: capability/ hit
    `maxParamLength` (100) silently 404ing long tokens in named params;
-   workaround is a wildcard route. A plugin has no way to raise per-route
+   shortlink/ dodged it pre-emptively the same way. Workaround is a
+   wildcard route. A plugin has no way to raise per-route
    limits. Minor, but sharp when it bites.
 7. **Internal utility modules plugins re-vendor** — consumer: relay/
    (`src/nostr/event.js` NIP-01 verify), pay/ (`src/mrc20.js`). Pure crypto.
@@ -233,6 +247,12 @@ this repo is its proof.
   candidate: when the basename is generic (`plugin`, `index`), derive from
   the parent directory (`relay/plugin.js` → `relay`). Small, backward-
   compatible, removes the most common footgun. **Filed-worthy.**
+- **The host's conditional write is check-then-write, not atomic**
+  (sparql/, measured live): two *concurrent* PUTs carrying the same
+  currently-valid `If-Match` both return 2xx and the loser is silently
+  overwritten; the same two PUTs run sequentially 412 correctly. Two
+  simultaneous writers can lose one with both told success — unfixable
+  plugin-side; the host needs an atomic stat+write. **Filed-worthy.**
 - **The loader's activate-failure wrap drops `err.code`**
   (remotestorage/): a route collision inside `activate` surfaces as
   `plugin <id>: activate() failed: <message>` with the original
@@ -280,3 +300,10 @@ this repo is its proof.
   exported (loopback enforces Control for free) but absolute-URL ACLs
   don't restore elsewhere — policy portability is a spec-level gap, not a
   plugin-api gap.
+- **pluginDir vs pod resources — no doctrine** (shortlink/): stateful
+  plugins choose between `pluginDir` (fast, private, invisible to WAC,
+  backup, and portability) and pod resources (WAC-governed, portable,
+  but a loopback round-trip per operation). The api offers one primitive
+  and no guidance; a design note in the plugin docs would spare every
+  author the same deliberation. Eleven plugins now persist in
+  `pluginDir` — the most settled seam in the api.

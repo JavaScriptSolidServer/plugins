@@ -69,13 +69,13 @@ README and NOTES.md, ship the closest honest approximation.
 | `corsproxy/` | #382/#379 | forward proxy with fail-closed SSRF defense; per-pod ACL needs `api.authorize` |
 | `capability/` | #506 | macaroon-lite scoped/time-bound/revocable capability URLs |
 | `webdav/` | #507 | mount a pod in Finder/Nautilus/Windows; WebDAV↔LDP over loopback, Basic→Bearer |
-| `sparql/` | #509 | read-time SPARQL SELECT over pod JSON-LD; write-index needs `api.events` |
+| `sparql/` | #509 | SPARQL SELECT + UPDATE over pod JSON-LD; write-index still needs `api.events` |
 | `gitscratch/` | #322 | ephemeral Solid-authed git remotes via the `git-http-backend` CGI |
 | `otp/` | #505 | one-time-password session flow; account recovery needs core auth |
 | `carddav/` | #157 | contact sync (iOS/macOS/Thunderbird/DAVx5); the DAV bridge, generalized |
 | `mastodon/` | #515/#516 | Mastodon-API shim — a client logs into its own pod; needs `appPaths` widened |
 | `bluesky/` | #211 | AT-Protocol XRPC shim — same shape, `/xrpc` root; token bridge generalizes |
-| `caldav/` | #157-sib | calendar sync — completes the DAV family (webdav+carddav+caldav) |
+| `caldav/` | #157-sib | calendar sync + free-busy — completes the DAV family (webdav+carddav+caldav) |
 | `webfinger/` | #164 | `/.well-known/webfinger` — fediverse `acct:` resolution for the shims |
 | `activitypub/` | #51/#164 | federate a pod as an AS2 actor; outbound HTTP Signatures |
 | `rss/` | — | any pod container as an Atom/RSS feed |
@@ -89,9 +89,10 @@ README and NOTES.md, ship the closest honest approximation.
 | `dashboard/` | — | live plugin-status page; first consumer of the #463/#464 registry seam |
 | `oembed/` | — | oEmbed provider for pod resources (link unfurling; XSS-refusing) |
 | `jmap/` | — | JMAP mail over pod messages — the stateless/push line, sharpened |
+| `shortlink/` | — | link shortener for pod URLs (deliberately not an open redirector) |
 
-**332 tests, all green** (`npm test`), including `compose.test.js` — all
-thirty-one plugins on one server from pure config, pods + WAC intact
+**363 tests, all green** (`npm test`), including `compose.test.js` — all
+thirty-two plugins on one server from pure config, pods + WAC intact
 beside them. Findings consolidated in [NOTES.md](./NOTES.md); the full
 plugin-tagged backlog triaged in [ISSUES.md](./ISSUES.md); the build guide
 is [AGENT.md](./AGENT.md); the maintainer-facing summary — what to add
