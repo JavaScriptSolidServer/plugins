@@ -141,6 +141,10 @@ describe('rss feed plugin', () => {
     assert.ok(xml.includes(`<id>${base}/alice/blog/</id>`), xml);
     assert.ok(xml.includes('<link rel="self"'), xml);
     assert.match(xml, /<updated>\d{4}-\d\d-\d\dT/, 'feed needs an <updated>');
+    // RFC 4287 §4.1.1: an atom:feed must carry ≥1 atom:author. Here it is
+    // derived from the feed title (no config.author) and XML-escaped.
+    assert.ok(xml.includes('<author><name>Alice&apos;s journal</name></author>'),
+      'atom feed needs a feed-level <author><name>');
 
     // The three titles, drawn from schema:headline, schema:name, dcterms:title.
     for (const t of ['A quiet Tuesday', 'First light', 'Storm over the bay']) {

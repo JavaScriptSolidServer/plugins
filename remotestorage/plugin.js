@@ -244,7 +244,11 @@ export async function activate(api) {
     if (relayRefusal(res, reply)) return reply;
     if (res.status === 404) return jsonReply(reply, 404, { error: 'Not found' });
     cors(reply).code(res.status).header('cache-control', 'no-cache');
-    for (const h of ['content-type', 'etag', 'content-range', 'content-length']) {
+    // content-length deliberately NOT forwarded: the body is streamed via
+    // Readable.fromWeb(res.body) below, already content-decoded by fetch, so
+    // the host's length can be wrong if it ever content-encodes. Let fastify
+    // frame the stream itself — matches the webdav/ sibling (webdav GET).
+    for (const h of ['content-type', 'etag', 'content-range']) {
       const v = res.headers.get(h);
       if (v) reply.header(h, v);
     }

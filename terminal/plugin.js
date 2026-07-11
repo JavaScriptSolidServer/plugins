@@ -22,6 +22,7 @@
 // Attribution: adapted from JavaScriptSolidServer/src/terminal/index.js.
 
 import { spawn } from 'node:child_process';
+import { createHash, timingSafeEqual } from 'node:crypto';
 
 // Wire protocol (matches core): raw text/binary chunks are shell stdio;
 // JSON envelopes carry lifecycle signals.
@@ -42,6 +43,9 @@ export async function activate(api) {
   //     (browsers cannot set Authorization on a WebSocket handshake).
   const allowAgents = Array.isArray(cfg.allowAgents) ? cfg.allowAgents.filter(Boolean) : null;
   const token = typeof cfg.token === 'string' && cfg.token ? cfg.token : null;
+  // Pre-hash the expected token so the compare is constant-time over
+  // fixed-width digests — no early-exit that would leak the token length.
+  const tokenDigest = token ? createHash('sha256').update(token).digest() : null;
   if ((!allowAgents || allowAgents.length === 0) && !token) {
     throw new Error(
       'terminal: refusing to boot an open shell — set config.allowAgents ' +
@@ -71,14 +75,14 @@ export async function activate(api) {
   // Verify the handshake before spawning anything. Returns an agent label
   // string when authorized, or null.
   async function authorize(request) {
-    // Browser fallback: a shared token in the query string.
+    // Browser fallback: a shared token in the query string. Constant-time
+    // over sha256 digests so neither the token nor its LENGTH leaks via an
+    // early-exit length check (the metrics/ pattern).
     if (token) {
       const qToken = request.query?.token;
-      if (typeof qToken === 'string' && qToken.length === token.length) {
-        // constant-time-ish compare
-        let diff = 0;
-        for (let i = 0; i < token.length; i++) diff |= qToken.charCodeAt(i) ^ token.charCodeAt(i);
-        if (diff === 0) return 'token';
+      if (typeof qToken === 'string') {
+        const presented = createHash('sha256').update(qToken).digest();
+        if (timingSafeEqual(presented, tokenDigest)) return 'token';
       }
     }
     // Primary: a verified agent from a Bearer/DPoP/NIP-98/… credential.

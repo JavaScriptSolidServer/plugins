@@ -370,18 +370,35 @@ export async function activate(api) {
         continue;
       }
       const id = newEmailId();
-      const email = { id, mailboxIds: { [mb.id]: true }, keywords: {} };
+      // threadId is degenerate: this server has no Thread/get, so every
+      // message is its own single-message thread (threadId = the message id).
+      // Persisting it keeps Email/get consistent with the create response.
+      const email = { id, threadId: id, mailboxIds: { [mb.id]: true }, keywords: {} };
       for (const p of EMAIL_PROPS) if (spec[p] !== undefined) email[p] = spec[p];
       email.receivedAt = typeof spec.receivedAt === 'string' ? spec.receivedAt : new Date().toISOString();
       email.preview = previewOf(spec);
+      // The stored representation is exactly what writeEmail PUTs — its byte
+      // length is `size`, and its content hash is a stable blobId (there is no
+      // separate blob store; the message JSON IS the blob).
+      const stored = JSON.stringify(email, null, 2);
       const put = await writeEmail(ctx.podPath, mb, id, email, ctx.auth);
       if (put.status === 401 || put.status === 403) {
         notCreated[cid] = { type: 'forbidden' };
       } else if (!(put.ok || put.status === 204)) {
         notCreated[cid] = { type: 'serverFail', description: `pod storage rejected the message (${put.status})` };
       } else {
-        // Server-set properties back to the client, per RFC 8620 §5.3.
-        created[cid] = { id, receivedAt: email.receivedAt, preview: email.preview };
+        // Echo EVERY server-set property the client didn't supply, per
+        // RFC 8620 §5.3 / RFC 8621 §4.6 — a client caches these from the
+        // response instead of re-fetching. blobId/threadId are degenerate but
+        // stable and honest (see README Findings): no blob store, no threads.
+        created[cid] = {
+          id,
+          blobId: crypto.createHash('sha256').update(stored).digest('base64url').slice(0, 24),
+          threadId: id,
+          size: Buffer.byteLength(stored),
+          receivedAt: email.receivedAt,
+          preview: email.preview,
+        };
       }
     }
 

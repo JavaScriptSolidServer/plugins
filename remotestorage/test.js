@@ -179,6 +179,11 @@ describe('remotestorage plugin', () => {
     assert.strictEqual(get.headers.get('etag'), firstEtag,
       'GET ETag equals the ETag PUT reported (host ETag passed through both ways)');
     assert.match(get.headers.get('content-type') || '', /text\/plain/);
+    // The streamed GET body is fetch-decoded, so the plugin must NOT forward a
+    // host content-length that could be wrong under content-encoding — it lets
+    // fastify frame the stream (matches the webdav/ sibling).
+    assert.strictEqual(get.headers.get('content-length'), null,
+      'GET must not forward a host content-length over the fetch-decoded stream');
 
     // The resource is created in the pod's own namespace — visible over LDP.
     const ldp = await fetch(`${base}/alice/remotestorage/documents/notes/todo.txt`, {

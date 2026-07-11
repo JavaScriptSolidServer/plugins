@@ -62,6 +62,11 @@ describe('terminal plugin', () => {
     const bad = await open(`${jss.wsBase}/terminal?token=nope`);
     assert.strictEqual(bad.opened, false, 'wrong token must not open a usable session');
 
+    // A wrong token of the SAME length as the real one is also refused — the
+    // compare is constant-time over sha256 digests, no length early-exit.
+    const sameLen = await open(`${jss.wsBase}/terminal?token=${'x'.repeat(TOKEN.length)}`);
+    assert.strictEqual(sameLen.opened, false, 'same-length wrong token must be refused');
+
     const none = await open(`${jss.wsBase}/terminal`);
     assert.strictEqual(none.opened, false, 'missing token must be refused');
   });

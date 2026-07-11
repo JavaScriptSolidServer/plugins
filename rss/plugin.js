@@ -165,13 +165,16 @@ function mapEntry({ url, path }, contentType, bodyText, listingModified) {
 
 // ----------------------------------------------------------- feed rendering
 
-function renderAtom({ feedTitle, feedId, selfUrl, updated, entries }) {
+function renderAtom({ feedTitle, feedAuthor, feedId, selfUrl, updated, entries }) {
   const parts = [
     '<?xml version="1.0" encoding="utf-8"?>',
     '<feed xmlns="http://www.w3.org/2005/Atom">',
     `  <title>${xmlEscape(feedTitle)}</title>`,
     `  <id>${xmlEscape(feedId)}</id>`,
     `  <updated>${xmlEscape(updated)}</updated>`,
+    // RFC 4287 §4.1.1: a feed-level author satisfies the "≥1 author" rule for
+    // every entry at once (RSS 2.0 has no equivalent requirement).
+    `  <author><name>${xmlEscape(feedAuthor)}</name></author>`,
     `  <link rel="self" type="application/atom+xml" href="${xmlEscape(selfUrl)}"/>`,
     `  <link rel="alternate" href="${xmlEscape(feedId)}"/>`,
   ];
@@ -233,6 +236,9 @@ export async function activate(api) {
   const defaultContainer = api.config.defaultContainer || null;
   const maxItems = api.config.maxItems ?? DEFAULT_MAX_ITEMS;
   const feedTitle = api.config.title || 'Solid pod feed';
+  // RFC 4287 §4.1.1 requires an atom:feed to carry ≥1 atom:author. Derive the
+  // name from config.author, else the feed title, else a sensible default.
+  const feedAuthor = api.config.author || feedTitle || 'Solid pod feed';
 
   /** Which container path this request addresses ('/alice/blog/'), or null. */
   function resolveContainer(request) {
@@ -335,6 +341,7 @@ export async function activate(api) {
     const updated = result.entries.length ? result.entries[0].updated : new Date().toISOString();
     const model = {
       feedTitle,
+      feedAuthor,
       feedId: result.containerUrl,
       selfUrl: baseUrl + request.raw.url,
       updated,

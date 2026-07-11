@@ -126,7 +126,14 @@ The stored resource is readable as a plain pod document too — `GET
   — the same wall as micropub's media endpoint. See Findings #5.
 - **No threads** (`Thread/get`), no `Email/import`, no
   `EmailSubmission/*` — this stores and organizes mail; it does not send
-  SMTP.
+  SMTP. `Email/set` create still returns the RFC 8621 §4.6 server-set
+  properties (`id`, `blobId`, `threadId`, `size`) so a client can cache them
+  without a re-fetch, but two are **degenerate and documented**: `threadId`
+  equals the message id (every message is its own single-message thread,
+  since there is no `Thread/get`), and `blobId` is a SHA-256 hash of the
+  stored message JSON (there is no separate blob store — the JSON resource
+  *is* the blob; see also Findings #5). `size` is the honest byte length of
+  that stored representation.
 - **One mailbox per message** (`maxMailboxesPerEmail: 1`, advertised): a
   message is one resource in one container, so JMAP's "email in several
   mailboxes at once" doesn't map to LDP containment.

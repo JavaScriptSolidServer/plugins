@@ -182,6 +182,13 @@ describe('jmap plugin', () => {
     assert.ok(args.created?.m1?.id, `not created: ${JSON.stringify(args)}`);
     assert.ok(args.created.m1.receivedAt, 'no server-set receivedAt');
     assert.match(args.created.m1.preview, /Hello over a pod/);
+    // RFC 8621 §4.6: the create response echoes every server-set property so
+    // the client caches them instead of re-fetching (blobId/threadId/size).
+    assert.ok(args.created.m1.blobId, 'no server-set blobId');
+    assert.strictEqual(args.created.m1.threadId, args.created.m1.id,
+      'threadId is the degenerate per-message id (one-message threads)');
+    assert.ok(Number.isInteger(args.created.m1.size) && args.created.m1.size > 0,
+      `no server-set size: ${JSON.stringify(args.created.m1)}`);
     assert.notStrictEqual(args.oldState, args.newState, 'state string did not change on create');
     emailId = args.created.m1.id;
 
