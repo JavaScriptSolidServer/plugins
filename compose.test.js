@@ -112,16 +112,15 @@ describe('composition: every plugin on one server', () => {
           id: 'admin',
           module: at('admin/plugin.js'),
           prefix: '/admin',
-          // No adminAgents in the composition → open mode (the plugin warns
-          // loudly at activate; the finding: no operator concept in the api).
+          // Auto-discovers via api.plugins (#610), origin via api.serverInfo
+          // (#601) — no hand-fed list, no loopbackUrl. No adminAgents → open
+          // mode (the plugin warns; the finding: no operator concept yet).
           config: {
-            loopbackUrl: base,
-            baseUrl: base,
             podsRoot: root,
-            plugins: [
-              { id: 'nip05', prefix: '/nip05', probe: '/nip05/nostr.json', expect: [200] },
-              { id: 'metrics', prefix: '/metrics', probe: '/metrics/healthz', expect: [200] },
-            ],
+            probes: {
+              relay: { kind: 'ws' }, webrtc: { kind: 'ws' }, terminal: { kind: 'ws' },
+              tunnel: { kind: 'ws' }, notifications: { kind: 'ws' },
+            },
           },
         },
         {
@@ -368,17 +367,23 @@ describe('composition: every plugin on one server', () => {
     assert.strictEqual(res.status, 400); // missing ?resource — endpoint alive
   });
 
-  it('admin: the operator home renders with plugin inventory and pods stats', async () => {
+  it('admin: auto-discovers plugins (api.plugins) and reports pods stats', async () => {
     let res = await fetch(`${base}/admin/`);
     assert.strictEqual(res.status, 200);
     const page = await res.text();
-    assert.ok(page.includes('nip05'));
-    assert.ok(page.includes('metrics'));
+    for (const id of ['nip05', 'metrics', 'rss', 's3']) assert.ok(page.includes(id), id);
     res = await fetch(`${base}/admin/status.json`);
     assert.strictEqual(res.status, 200);
     const status = await res.json();
     assert.strictEqual(status.server.alive, true);
-    assert.ok(status.plugins.every((p) => p.state === 'up'), JSON.stringify(status.plugins));
+    // Discovered ~every sibling, not a hand-fed few.
+    assert.ok(status.plugins.length >= 25, `discovered only ${status.plugins.length}`);
+    const byId = Object.fromEntries(status.plugins.map((p) => [p.id, p]));
+    for (const id of ['nip05', 'rss', 'mastodon', 's3', 'metrics']) {
+      assert.ok(byId[id]?.alive, `${id}: ${JSON.stringify(byId[id])}`);
+    }
+    // podsRoot configured → pod stats present.
+    assert.ok(status.pods && typeof status.pods.count === 'number', JSON.stringify(status.pods));
   });
 
   it('metrics: healthz is ok and the exposition names the process gauges', async () => {

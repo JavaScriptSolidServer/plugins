@@ -57,44 +57,8 @@ fs.mkdirSync(PODS, { recursive: true });
 
 const terminalToken = process.env.TERMINAL_TOKEN || crypto.randomBytes(16).toString('hex');
 
-// Hand-copied inventory for the admin home (phase-2; still on the pre-seam
-// path). The dashboard no longer needs this — it auto-discovers via
-// api.plugins (#610). admin/ will drop it too once it consumes the seam.
-const INVENTORY = [
-  { id: 'relay', prefix: '/relay', description: 'nostr relay (ws)', probe: '/relay', kind: 'ws' },
-  { id: 'webrtc', prefix: '/webrtc', description: 'WebRTC signaling (ws)', probe: '/webrtc', kind: 'ws' },
-  { id: 'terminal', prefix: '/terminal', description: 'token-gated shell (ws)', probe: '/terminal', kind: 'ws' },
-  { id: 'tunnel', prefix: '/tunnel', description: 'HTTP tunnel (ws)', probe: '/tunnel', kind: 'ws' },
-  { id: 'notifications', prefix: '/.notifications', description: 'solid-0.1 notifications (ws)', probe: '/.notifications', kind: 'ws' },
-  { id: 'pay', prefix: '/paid', description: '402 pay gate demo', probe: '/paid/demo', expect: [402] },
-  { id: 'nip05', prefix: '/nip05', description: 'NIP-05 discovery', probe: '/nip05/nostr.json', expect: [200] },
-  { id: 'corsproxy', prefix: '/proxy', description: 'CORS forward proxy', probe: '/proxy', expect: [400] },
-  { id: 'capability', prefix: '/cap', description: 'capability URLs', probe: '/cap/issue', expect: [404, 401, 405] },
-  { id: 'webdav', prefix: '/webdav', description: 'WebDAV bridge', probe: '/webdav/', expect: [401, 207, 200] },
-  { id: 'gitscratch', prefix: '/git', description: 'Solid-authed git remotes', probe: '/git/probe.git/info/refs?service=git-receive-pack', expect: [401] },
-  { id: 'sparql', prefix: '/sparql', description: 'SPARQL SELECT + UPDATE', probe: '/sparql', expect: [400, 404, 405] },
-  { id: 'otp', prefix: '/otp', description: 'one-time-password sessions', probe: '/otp/whoami', expect: [401] },
-  { id: 'carddav', prefix: '/carddav', description: 'CardDAV contacts', probe: '/carddav/', expect: [401, 207, 200] },
-  { id: 'mastodon', prefix: '/mastodon', description: 'Mastodon API shim', probe: '/api/v1/instance', expect: [200] },
-  { id: 'bluesky', prefix: '/bluesky', description: 'AT-Proto XRPC shim', probe: '/xrpc/com.atproto.server.describeServer', expect: [200] },
-  { id: 'caldav', prefix: '/caldav', description: 'CalDAV calendars + free-busy', probe: '/caldav/', expect: [401, 207, 200] },
-  { id: 'webfinger', prefix: '/webfinger', description: 'WebFinger discovery', probe: '/.well-known/webfinger', expect: [400] },
-  { id: 'activitypub', prefix: '/activitypub', description: 'AS2 federation actor', probe: '/ap/alice/actor', expect: [200, 404] },
-  { id: 'rss', prefix: '/feed', description: 'container → Atom/RSS', probe: '/feed/atom', expect: [400] },
-  { id: 'matrix', prefix: '/matrix', description: 'Matrix client-server shim', probe: '/_matrix/client/versions', expect: [200] },
-  { id: 'search', prefix: '/search', description: 'full-text pod search', probe: '/search', expect: [400] },
-  { id: 'didweb', prefix: '/didweb', description: 'did:web resolver', probe: '/didweb/nobody/did.json', expect: [404] },
-  { id: 's3', prefix: '/s3', description: 'S3 gateway (SigV4)', probe: '/s3/bucket/key', expect: [403] },
-  { id: 'micropub', prefix: '/micropub', description: 'IndieWeb Micropub', probe: '/micropub?q=config', expect: [200] },
-  { id: 'backup', prefix: '/backup', description: 'pod → tar.gz export', probe: '/backup', expect: [400] },
-  { id: 'shortlink', prefix: '/short', description: 'pod link shortener', probe: '/short', expect: [401] },
-  { id: 'oembed', prefix: '/oembed', description: 'oEmbed provider', probe: '/oembed', expect: [400] },
-  { id: 'jmap', prefix: '/jmap', description: 'JMAP mail over the pod', probe: '/jmap/session', expect: [401] },
-  { id: 'remotestorage', prefix: '/remotestorage', description: 'remoteStorage server', probe: '/remotestorage/webfinger', expect: [400] },
-  { id: 'metrics', prefix: '/metrics', description: 'healthz + Prometheus', probe: '/metrics/healthz', expect: [200] },
-  { id: 'dashboard', prefix: '/dashboard', description: 'plugin liveness page', probe: '/dashboard/status.json', expect: [200] },
-  { id: 'admin', prefix: '/admin', description: 'operator home (this page)' },
-];
+// Both ops consoles (dashboard/, admin/) now auto-discover their siblings via
+// api.plugins (#610) — no hand-copied inventory to keep in sync.
 
 const fastify = createServer({
   root: PODS,
@@ -167,14 +131,19 @@ const fastify = createServer({
       id: 'admin',
       module: at('admin/plugin.js'),
       prefix: '/admin',
+      // Auto-discovers via api.plugins (#610); origin via api.serverInfo
+      // (#601) — no hand-fed list, no loopbackUrl. podsRoot enables pod stats;
+      // probes refine the ws endpoints and pay.
       config: {
-        loopbackUrl: `http://127.0.0.1:${PORT}`,
-        baseUrl: PUBLIC_URL,
         podsRoot: PODS,
-        plugins: INVENTORY,
+        probes: {
+          relay: { kind: 'ws' }, webrtc: { kind: 'ws' }, terminal: { kind: 'ws' },
+          tunnel: { kind: 'ws' }, notifications: { kind: 'ws' },
+          pay: { probe: '/paid/demo', expect: [402] },
+        },
         // Gate the operator home: ADMIN_AGENTS is a comma-separated list of
         // WebIDs/agent ids. Without it the plugin serves OPEN and warns
-        // loudly (finding: the api has no operator concept).
+        // loudly (finding: the api has no operator concept — api.isOperator).
         ...(process.env.ADMIN_AGENTS
           ? { adminAgents: process.env.ADMIN_AGENTS.split(',').map((s) => s.trim()).filter(Boolean) }
           : {}),

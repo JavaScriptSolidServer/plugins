@@ -1,13 +1,12 @@
-// admin plugin over a real JSS from npm: ONE server carrying the admin page
-// plus two real sibling plugins (rss, metrics) as probe targets, podsRoot
-// pointed at the server's own data root, and an adminAgents allowlist proven
-// with two real pods (alice is the operator, mallory is not).
+// admin plugin over a real JSS from npm (>= 0.0.218): ONE server carrying the
+// admin page plus two real siblings (rss, metrics), auto-discovered via
+// api.plugins (#610) with NO hand-fed list and NO loopbackUrl (api.serverInfo,
+// #601). podsRoot points at the server's own data root; an adminAgents
+// allowlist is proven with two real pods (alice is the operator, mallory not).
 //
-// Ordering follows AGENT.md's DATA_ROOT footgun: every validation-failure
-// boot runs FIRST (a second createServer in one process repoints JSS's
-// module-global data root, even when the boot fails), and the open-mode
-// (no adminAgents) boot runs LAST, after the long-lived server is closed —
-// sequential closed boots are fine (metrics/test.js does the same).
+// Ordering follows AGENT.md's DATA_ROOT footgun: validation-failure boots run
+// FIRST, and the open-mode (no adminAgents) boot runs LAST after the
+// long-lived server is closed (sequential closed boots are fine).
 
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
@@ -38,42 +37,27 @@ describe('admin plugin', () => {
   });
 
   // ------------------------------------------------ validation (pre-boot)
+  // config.probes refinements are validated at activate. (There is no
+  // loopbackUrl to validate — api.serverInfo supplies the origin.)
 
-  it('refuses to boot without config.loopbackUrl', async () => {
-    await assert.rejects(
-      startJss({ plugins: [{ id: 'admin', module: module_, prefix: '/admin' }] }),
-      /requires config\.loopbackUrl/,
-    );
-  });
-
-  it('rejects a probe path containing :// (probes never leave loopback)', async () => {
+  it('rejects a probe refinement containing :// (probes never leave loopback)', async () => {
     await assert.rejects(
       startJss({
         plugins: [{
-          id: 'admin',
-          module: module_,
-          prefix: '/admin',
-          config: {
-            loopbackUrl: 'http://127.0.0.1:9',
-            plugins: [{ id: 'evil', probe: 'https://example.com/exfil' }],
-          },
+          id: 'admin', module: module_, prefix: '/admin',
+          config: { probes: { evil: { probe: 'https://example.com/exfil' } } },
         }],
       }),
       /probe must be a local path/,
     );
   });
 
-  it('rejects a probe that targets the admin page itself (would recurse)', async () => {
+  it('rejects a probe refinement that targets the admin page itself (would recurse)', async () => {
     await assert.rejects(
       startJss({
         plugins: [{
-          id: 'admin',
-          module: module_,
-          prefix: '/admin',
-          config: {
-            loopbackUrl: 'http://127.0.0.1:9',
-            plugins: [{ id: 'ouroboros', probe: '/admin/status.json' }],
-          },
+          id: 'admin', module: module_, prefix: '/admin',
+          config: { probes: { ouroboros: { probe: '/admin/status.json' } } },
         }],
       }),
       /would recurse/,
@@ -82,10 +66,10 @@ describe('admin plugin', () => {
 
   // -------------------------------------------------- the long-lived boot
 
-  it('boots ONE JSS: admin + rss + metrics, podsRoot at the server root, adminAgents set', async () => {
+  it('boots ONE JSS and auto-discovers siblings (no hand-fed list, no loopbackUrl)', async () => {
     const port = await probePort();
     base = `http://127.0.0.1:${port}`;
-    // Our own data root so its absolute path can go into config BEFORE boot
+    // Our own data root so its absolute path can go into config before boot
     // (podsRoot is operator-repeated state — the api doesn't mediate it).
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jss-admin-test-'));
     // The admin agent must be known at boot, before the pod exists — the
@@ -113,23 +97,16 @@ describe('admin plugin', () => {
           id: 'admin',
           module: module_,
           prefix: '/admin',
+          // No loopbackUrl, no baseUrl, no hand-fed plugins list. Only
+          // podsRoot (pod stats), adminAgents (the gate), and per-plugin
+          // probe refinements (the roster carries no health hints).
           config: {
-            loopbackUrl: base,
-            baseUrl: base,
             podsRoot: root,
             adminAgents: [adminWebId],
-            // Hand-copied inventory — a duplicate of the list above, because
-            // the api has no registry a plugin could read (#463/#464).
-            plugins: [
-              // rss: anonymous GET /feed/atom is a 400 usage/guard answer.
-              { id: 'rss', prefix: '/feed', description: 'Atom/RSS feeds over pod containers', probe: '/feed/atom', expect: [400] },
-              // metrics healthz is open → 200; its exposition doubles as the
-              // adminPage link (the settings-panel workaround convention).
-              { id: 'metrics', prefix: '/metrics', description: 'healthz + Prometheus exporter', probe: '/metrics/healthz', expect: [200], adminPage: '/metrics/metrics' },
-              // admin itself: declared but NOT probed (a probe under our own
-              // prefix throws at activate) → the 'unprobed' state.
-              { id: 'admin', prefix: '/admin', description: 'this page' },
-            ],
+            probes: {
+              rss: { probe: '/feed/atom', expect: [400], description: 'Atom/RSS feeds over pod containers' },
+              metrics: { probe: '/metrics/healthz', expect: [200], description: 'healthz + Prometheus exporter', adminPage: '/metrics/metrics' },
+            },
           },
         },
       ],
@@ -182,9 +159,6 @@ describe('admin plugin', () => {
   });
 
   it('healthz is 200 and ungated — liveness needs no auth, even when the page is gated', async () => {
-    // The page and status.json are gated (above), but healthz must answer
-    // anonymously so another prober (dashboard/) can check liveness cheaply
-    // without triggering a full snapshot render.
     const res = await get(`${base}/admin/healthz`);
     assert.strictEqual(res.status, 200, `healthz: ${res.status}`);
     const body = await res.json();
@@ -194,16 +168,17 @@ describe('admin plugin', () => {
 
   // ------------------------------------------------------------- the page
 
-  it('admin GET page → 200 self-contained HTML with plugin ids, pods count, sections', async () => {
+  it('admin GET page → 200 self-contained HTML with discovered plugins, pods, sections', async () => {
     const res = await get(`${base}/admin/`, alice);
     assert.strictEqual(res.status, 200);
     assert.match(res.headers.get('content-type'), /text\/html/);
     const html = await res.text();
 
-    // Plugins table: every declared id, prefix links, the adminPage link.
-    for (const id of ['rss', 'metrics', 'admin']) {
+    // Plugins table: the discovered siblings (admin filters ITSELF out).
+    for (const id of ['rss', 'metrics']) {
       assert.ok(html.includes(`<td class="id">${id}</td>`), `page must list ${id}`);
     }
+    assert.ok(!html.includes('<td class="id">admin</td>'), 'admin does not list itself');
     assert.ok(html.includes('href="/feed"'), 'prefix link to rss');
     assert.ok(html.includes('href="/metrics/metrics"'), 'adminPage link rendered');
 
@@ -215,9 +190,10 @@ describe('admin plugin', () => {
     assert.ok(html.includes('id="pods-count">2<'), 'pods count rendered server-side');
     assert.match(html, /id="pods-raw">\d+</, 'storage bytes rendered');
 
-    // The not-possible strip, with the seams named.
+    // The not-possible strip, with the seams named (api.plugins no longer
+    // among them — it shipped).
     assert.ok(html.includes("What wp-admin has that this page can't do"), 'strip present');
-    for (const marker of ['#200', '#463', 'deactivate()', 'adminPage', 'write-only']) {
+    for (const marker of ['#200', 'deactivate()', 'adminPage', 'write-only', 'api.isOperator']) {
       assert.ok(html.includes(marker), `strip names the seam: ${marker}`);
     }
 
@@ -233,7 +209,7 @@ describe('admin plugin', () => {
 
   // ------------------------------------------------------------- the JSON
 
-  it('status.json: server, plugins[].state, pods stats, meta counts', async () => {
+  it('status.json: server (origin from serverInfo), plugins[].state, pods, meta', async () => {
     const res = await get(`${base}/admin/status.json`, alice);
     assert.strictEqual(res.status, 200);
     assert.match(res.headers.get('content-type'), /application\/json/);
@@ -241,28 +217,28 @@ describe('admin plugin', () => {
 
     assert.match(body.generated, /^\d{4}-\d\d-\d\dT/, 'generated is an ISO timestamp');
 
-    // Server: liveness over loopback + process facts (same process as the test).
+    // Server: liveness over loopback + process facts. baseUrl now comes from
+    // api.serverInfo (no config.baseUrl) — assert it's a real origin.
     assert.strictEqual(body.server.alive, true, JSON.stringify(body.server));
     assert.strictEqual(typeof body.server.status, 'number');
-    assert.strictEqual(body.server.baseUrl, base);
+    assert.ok(/^https?:\/\/.+:\d+$/.test(body.server.baseUrl) || body.server.baseUrl.startsWith('http'),
+      `server.baseUrl is an origin: ${body.server.baseUrl}`);
     assert.strictEqual(body.server.node, process.version);
     assert.strictEqual(body.server.platform, `${process.platform} ${process.arch}`);
     assert.ok(body.server.uptime_seconds >= 0);
 
-    // Plugins: rss up via expect [400], metrics up via expect [200],
-    // admin declared-but-unprobed.
-    assert.strictEqual(body.plugins.length, 3);
+    // Plugins: the two discovered siblings, refined via config.probes; admin
+    // filtered itself out.
+    assert.strictEqual(body.plugins.length, 2);
     const byId = Object.fromEntries(body.plugins.map((p) => [p.id, p]));
+    assert.ok(!byId.admin, 'admin is not in its own list');
     assert.strictEqual(byId.rss.state, 'up', JSON.stringify(byId.rss));
     assert.strictEqual(byId.rss.status, 400, 'anonymous /feed/atom is a 400 guard answer');
     assert.strictEqual(byId.metrics.state, 'up', JSON.stringify(byId.metrics));
     assert.strictEqual(byId.metrics.status, 200);
     assert.strictEqual(byId.metrics.adminPage, '/metrics/metrics');
-    assert.strictEqual(byId.admin.state, 'unprobed');
-    assert.strictEqual(byId.admin.status, null);
 
     // Pods: two pods, real byte totals from the capped walk.
-    assert.ok(body.pods.count >= 1, `pods.count: ${body.pods.count}`);
     assert.strictEqual(body.pods.count, 2, 'alice + mallory');
     assert.strictEqual(typeof body.pods.storageBytes, 'number');
     assert.ok(body.pods.storageBytes > 0, 'pods have profile documents on disk');
@@ -272,7 +248,7 @@ describe('admin plugin', () => {
     // Meta.
     assert.deepStrictEqual(
       { declared: body.meta.declared, up: body.meta.up, down: body.meta.down, unprobed: body.meta.unprobed },
-      { declared: 3, up: 2, down: 0, unprobed: 1 },
+      { declared: 2, up: 2, down: 0, unprobed: 0 },
     );
     assert.strictEqual(body.meta.guarded, true);
   });
@@ -285,7 +261,7 @@ describe('admin plugin', () => {
 
   // --------------------------------------- open mode (fresh boot, LAST)
 
-  it('a boot WITHOUT adminAgents serves anonymously, and says so on the page', async () => {
+  it('a boot WITHOUT adminAgents serves anonymously; admin alone renders empty', async () => {
     await jss.close(); // sequential closed boots are safe (DATA_ROOT footgun)
     jss = null;
 
@@ -294,10 +270,8 @@ describe('admin plugin', () => {
     jssOpen = await startJss({
       port,
       plugins: [{
-        id: 'admin',
-        module: module_,
-        prefix: '/admin',
-        config: { loopbackUrl: openBase }, // no adminAgents → OPEN (warned at activate)
+        id: 'admin', module: module_, prefix: '/admin',
+        config: {}, // no adminAgents → OPEN (warned at activate); no loopbackUrl
       }],
     });
 
@@ -306,13 +280,14 @@ describe('admin plugin', () => {
     const html = await page.text();
     assert.ok(html.includes('OPEN: no adminAgents configured'),
       'the page itself declares the open-mode hazard');
-    assert.ok(html.includes('No plugins declared'), 'empty inventory explains itself');
+    assert.ok(html.includes('No other plugins are loaded'), 'empty inventory explains itself');
 
     const res = await fetch(`${openBase}/admin/status.json`);
     assert.strictEqual(res.status, 200, 'anonymous JSON in open mode');
     const body = await res.json();
     assert.strictEqual(body.server.alive, true);
     assert.strictEqual(body.meta.guarded, false);
+    assert.deepStrictEqual(body.plugins, [], 'admin alone discovers no siblings');
     assert.strictEqual(body.pods, null, 'no podsRoot → no pod stats');
   });
 });

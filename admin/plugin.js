@@ -6,12 +6,14 @@
 // blocks it.
 //
 //   plugins: [{ id: 'admin', module: 'admin/plugin.js', prefix: '/admin',
-//               config: { loopbackUrl: 'http://127.0.0.1:3000',
-//                         baseUrl: 'https://pod.example',        // optional
-//                         podsRoot: '/srv/jss/data/pods',        // optional
-//                         adminAgents: ['https://…/card.jsonld#me'], // optional
-//                         plugins: [{ id, prefix?, description?, probe?,
-//                                     expect?, kind?, adminPage? }, …] } }]
+//               config: {                                    // all optional
+//                 podsRoot: '/srv/jss/data/pods',            // enables pod stats
+//                 adminAgents: ['https://…/card.jsonld#me'], // gate the surface
+//                 probes: { relay: { kind: 'ws' } },         // refine a plugin row
+//               } }]
+//
+// The plugin list is auto-discovered (api.plugins, #610) and the origin comes
+// from api.serverInfo (#601) — no hand-copied inventory, no loopbackUrl.
 //
 //   GET <prefix>/            → self-contained HTML admin page (server-side
 //                              rendered from a live snapshot, then polled
@@ -21,11 +23,12 @@
 //                              caching)
 //
 // THE POINT (the README headline): measure how much of wp-admin the plugin
-// api can express today. The read side mostly works — liveness, per-plugin
-// probes, user/storage stats — but every pillar rests on config the host
-// already knows (the plugin list is hand-copied, #463/#464 api.plugins; the
-// origin is repeated, api.serverInfo; podsRoot is repeated, same cousin) and
-// the WRITE side is architecturally absent: no install (#200), no runtime
+// api can express today. The read side works — liveness, per-plugin probes,
+// user/storage stats — and now runs on real seams: the plugin list is
+// api.plugins (#610, auto-discovered, no drift), the origin is api.serverInfo
+// (#601). What's still re-declared: podsRoot (the api mediates no data-root
+// access) and the operator gate (adminAgents — no api.isOperator yet). The
+// WRITE side is architecturally absent: no install (#200), no runtime
 // enable/disable (boot-time loader; `deactivate()` exists but nothing calls
 // it at runtime), no settings panels (no contribute-a-panel affordance — the
 // `adminPage` link convention here is the workaround), no log viewer
@@ -90,22 +93,28 @@ export const NOT_POSSIBLE = [
   ['Enable / disable', 'the loader activates plugins at boot only; deactivate() exists in the contract but nothing calls it at runtime — no toggle without a restart.'],
   ['Plugin settings panels', 'no contribute-a-panel affordance in the api; the adminPage link convention used on this page is the workaround (each plugin hand-rolls its own page and this one merely links to it).'],
   ['Log viewer', 'api.log is write-only — there is no tailing/reading seam, so "recent server logs" cannot be shown here at all.'],
-  ['Plugin inventory itself', 'this page cannot enumerate its co-loaded siblings; config.plugins is a hand-copied duplicate of the createServer list and the two drift silently (#463/#464 api.plugins).'],
+  ['Gated by default', 'without config.adminAgents this page serves OPEN — the api has no operator concept, so an on-by-default admin can\'t be safely gated without one (the api.isOperator seam).'],
 ];
 
 export async function activate(api) {
   const prefix = api.prefix || '/admin';
   const cfg = api.config || {};
 
-  const loopback = (cfg.loopbackUrl || '').replace(/\/$/, '');
-  if (!loopback) {
-    throw new Error(
-      'admin plugin requires config.loopbackUrl — the plugin api exposes no '
-      + 'server origin (the api.serverInfo finding, again); point it at the '
-      + 'host itself, e.g. http://127.0.0.1:3000',
-    );
+  // The origin the admin page reaches the host on (loopback) and displays
+  // (public) both come from api.serverInfo (#601) unless overridden — no more
+  // loopbackUrl/baseUrl required in config. Resolved per request: with port 0
+  // the real port exists only once the server is listening.
+  function loopbackOrigin() {
+    if (cfg.loopbackUrl) return String(cfg.loopbackUrl).replace(/\/$/, '');
+    const { protocol, host, port } = api.serverInfo();
+    const h = host.includes(':') ? `[${host}]` : host;
+    return `${protocol}://${h}:${port}`;
   }
-  const baseUrl = (cfg.baseUrl || loopback).replace(/\/$/, '');
+  function publicOrigin() {
+    if (cfg.baseUrl) return String(cfg.baseUrl).replace(/\/$/, '');
+    return api.serverInfo().baseUrl;
+  }
+
   const timeoutMs = cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const refreshMs = cfg.refreshMs ?? DEFAULT_REFRESH_MS;
   const maxWalk = cfg.maxWalkEntries ?? DEFAULT_MAX_WALK;
@@ -129,13 +138,17 @@ export async function activate(api) {
     }
   }
 
-  // ------------------------------------------- validate the declared list
-  // config.plugins is the operator's hand-copied inventory — same drift
-  // caveat as dashboard/ (#463/#464): nothing detects when it and the real
-  // createServer list diverge.
-  const declared = cfg.plugins ?? [];
-  if (!Array.isArray(declared)) {
-    throw new Error('admin: config.plugins must be an array of { id, prefix?, description?, probe?, expect?, kind?, adminPage? }');
+  // ------------------------------------------ discovered plugins + probes
+  // The plugin list is api.plugins (#610) — auto-discovered, not hand-copied,
+  // so it can't drift from the real createServer list. config.probes
+  // optionally refines a single plugin's row by id:
+  //   { <id>: { probe?, expect?, kind?, description?, adminPage? } }
+  // Paths are validated so a refinement can't leave loopback or recurse into
+  // this page. (The roster carries no health hints, so ws endpoints and odd
+  // prefixes still want a refinement — same residual as dashboard/.)
+  const overrides = cfg.probes ?? {};
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) {
+    throw new Error('admin: config.probes must be an object keyed by plugin id');
   }
   const localPath = (where, key, value) => {
     if (typeof value !== 'string' || !value.startsWith('/') || value.includes('://')) {
@@ -146,42 +159,46 @@ export async function activate(api) {
     }
     return value;
   };
-  const targets = declared.map((entry, i) => {
-    const where = `admin: config.plugins[${i}]`;
-    if (!entry || typeof entry !== 'object') throw new Error(`${where} must be an object`);
-    const { id, prefix: pPrefix, description, probe, expect, kind, adminPage } = entry;
-    if (typeof id !== 'string' || !id) throw new Error(`${where} needs a non-empty string id`);
-    if (pPrefix !== undefined) localPath(where, 'prefix', pPrefix);
-    if (description !== undefined && typeof description !== 'string') {
-      throw new Error(`${where}: description must be a string`);
-    }
-    if (probe !== undefined) {
-      localPath(where, 'probe', probe);
-      if (probe === prefix || probe.startsWith(`${prefix}/`)) {
+  for (const [id, ov] of Object.entries(overrides)) {
+    const where = `admin: config.probes[${JSON.stringify(id)}]`;
+    if (!ov || typeof ov !== 'object') throw new Error(`${where} must be an object`);
+    if (ov.probe !== undefined) {
+      localPath(where, 'probe', ov.probe);
+      if (ov.probe === prefix || ov.probe.startsWith(`${prefix}/`)) {
         throw new Error(
-          `${where}: probe ${JSON.stringify(probe)} targets the admin page itself — `
+          `${where}: probe ${JSON.stringify(ov.probe)} targets the admin page itself — `
           + 'probing status.json from status.json would recurse; point probes at other plugins',
         );
       }
     }
-    if (expect !== undefined
-        && (!Array.isArray(expect) || expect.length === 0 || !expect.every(Number.isInteger))) {
+    if (ov.adminPage !== undefined) localPath(where, 'adminPage', ov.adminPage);
+    if (ov.description !== undefined && typeof ov.description !== 'string') {
+      throw new Error(`${where}: description must be a string`);
+    }
+    if (ov.expect !== undefined
+        && (!Array.isArray(ov.expect) || ov.expect.length === 0 || !ov.expect.every(Number.isInteger))) {
       throw new Error(`${where}: expect must be a non-empty array of integer HTTP statuses`);
     }
-    if (kind !== undefined && kind !== 'http' && kind !== 'ws') {
+    if (ov.kind !== undefined && ov.kind !== 'http' && ov.kind !== 'ws') {
       throw new Error(`${where}: kind must be 'http' or 'ws'`);
     }
-    if (adminPage !== undefined) localPath(where, 'adminPage', adminPage);
-    return {
-      id,
-      prefix: pPrefix ?? null,
-      description: description ?? '',
-      probe: probe ?? null,
-      expect: expect ?? null,
-      kind: kind ?? 'http',
-      adminPage: adminPage ?? null,
-    };
-  });
+  }
+  // Every co-loaded plugin except this admin (identified by its own prefix);
+  // default probe is the plugin's own prefix.
+  const targets = api.plugins
+    .filter((p) => p.id && p.prefix !== prefix)
+    .map((p) => {
+      const ov = overrides[p.id] ?? {};
+      return {
+        id: p.id,
+        prefix: p.prefix || null,
+        description: ov.description ?? '',
+        probe: ov.probe ?? (p.prefix || null),
+        expect: ov.expect ?? null,
+        kind: ov.kind ?? 'http',
+        adminPage: ov.adminPage ?? null,
+      };
+    });
 
   // ---------------------------------------------------------------- auth
   // Agent-allowlist guard (after shortlink/'s getAgent pattern). Applied to
@@ -211,7 +228,7 @@ export async function activate(api) {
     const started = performance.now();
     let status = null;
     try {
-      const res = await fetch(loopback + p, {
+      const res = await fetch(loopbackOrigin() + p, {
         redirect: 'manual',
         signal: AbortSignal.timeout(timeoutMs),
         headers: { accept: '*/*' }, // deliberately NO authorization
@@ -316,7 +333,7 @@ export async function activate(api) {
     return {
       generated: new Date().toISOString(),
       server: {
-        baseUrl,
+        baseUrl: publicOrigin(),
         alive: host.status !== null && host.status < 500,
         status: host.status,
         latency_ms: host.latency_ms,
@@ -422,14 +439,14 @@ export async function activate(api) {
 </head>
 <body>
   <h1>server admin</h1>
-  <p class="note">${esc(baseUrl)} — ${adminAgents
+  <p class="note">${esc(snap.server.baseUrl)} — ${adminAgents
     ? `guarded: ${adminAgents.length} admin agent${adminAgents.length === 1 ? '' : 's'}`
     : 'OPEN: no adminAgents configured — anyone can read this page'}</p>
 
   <h2>Server</h2>
   <table>
     <tbody>
-      <tr><th>base URL</th><td><a href="${esc(baseUrl)}/">${esc(baseUrl)}</a></td></tr>
+      <tr><th>base URL</th><td><a href="${esc(snap.server.baseUrl)}/">${esc(snap.server.baseUrl)}</a></td></tr>
       <tr><th>host liveness</th><td><span id="srv-state">${badge(srvState)}</span>
         <span class="muted">http <span id="srv-status" class="code">${snap.server.status ?? '—'}</span>,
         <span id="srv-latency" class="latency">${snap.server.latency_ms} ms</span> over loopback</span></td></tr>
@@ -440,17 +457,16 @@ export async function activate(api) {
   </table>
 
   <h2>Plugins</h2>
-${targets.length === 0 ? `  <p class="note">No plugins declared. Pass <code>config.plugins</code>
-  (an array of <code>{ id, prefix?, description?, probe?, expect?, kind?, adminPage? }</code>) —
-  the plugin api has no registry, so this page cannot discover its co-loaded
-  siblings (#463/#464).</p>` : `  <table>
+${targets.length === 0 ? `  <p class="note">No other plugins are loaded. This page
+  auto-discovers its co-loaded siblings via <code>api.plugins</code> (#610);
+  load another plugin and it appears here — no hand-maintained list.</p>` : `  <table>
     <thead><tr><th>plugin</th><th>description</th><th>prefix</th><th>status</th><th>http</th><th>latency</th><th>admin</th></tr></thead>
     <tbody>${rows}
     </tbody>
   </table>
-  <p class="note">Hand-copied inventory (<code>config.plugins</code>) — the api has no
-  <code>api.plugins</code> registry, so this list and the real <code>createServer</code>
-  list drift silently (#463/#464). Probes are anonymous loopback GETs.</p>`}
+  <p class="note">Auto-discovered via <code>api.plugins</code> (#610) — no
+  hand-copied list to drift. Probes are anonymous loopback GETs at each
+  plugin's prefix; <code>config.probes</code> refines individual rows.</p>`}
 
   <h2>Pods / Users</h2>${podsSection}
 
@@ -583,8 +599,8 @@ ${NOT_POSSIBLE.map(([what, why]) => `      <li><strong>${esc(what)}</strong> —
     );
   }
   api.log.info(
-    `admin: operator home at ${prefix}/ — ${targets.length} plugin(s) declared `
-    + `(hand-copied; #463/#464), ${podsRoot ? `pods stats from ${podsRoot}` : 'no podsRoot (no pod stats)'}, `
+    `admin: operator home at ${prefix}/ — ${targets.length} plugin(s) auto-discovered `
+    + `(api.plugins), ${podsRoot ? `pods stats from ${podsRoot}` : 'no podsRoot (no pod stats)'}, `
     + `${adminAgents ? `${adminAgents.length} admin agent(s)` : 'OPEN'}`,
   );
 
