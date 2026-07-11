@@ -38,31 +38,38 @@ ports reached for it without coordinating.
    #382), or a capability exercising the *issuer's* authority
    (capability #506). This is the most-requested seam and the one that
    moves the most backlog issues from "plugin-approximation" to "faithful".
-2. **`api.events.onResourceChange(cb)`** — **four consumers now:
-   notifications/, sparql/, search/, matrix/**, in rising sharpness:
-   notifications (a miss is a *late* notification), sparql (a miss is a
-   *wrong* query result), search (a miss is *stale results*, the property
-   users most expect to be fresh — the most user-visible instance), and
-   matrix (its `/sync?since=` long-poll needs server-side sync cursors +
-   **live push on writes** — an event hook feeding `api.ws.route` — so a
-   stateless bridge can only do full-state `/sync` at all). Core already has
-   the emitter internally (`src/notifications/events.js`); this is the seam
+2. **`api.events.onResourceChange(cb)`** — **five consumers now:
+   notifications/, sparql/, search/, matrix/, backup/**, in rising
+   sharpness: notifications (a miss is a *late* notification), sparql (a
+   miss is a *wrong* query result), search (a miss is *stale results*, the
+   property users most expect to be fresh — the most user-visible
+   instance), matrix (its `/sync?since=` long-poll needs server-side sync
+   cursors + **live push on writes** — an event hook feeding `api.ws.route`
+   — so a stateless bridge can only do full-state `/sync` at all), and
+   backup (with no change hook *and* no plugin-owned read authority,
+   incremental and scheduled/server-initiated backup are both unbuildable —
+   every backup is a caller-driven full crawl). Core already has the
+   emitter internally (`src/notifications/events.js`); this is the seam
    every "react to pod writes" app (webhooks, indexing, sync, search, live
    chat) will want, and it's now clearly the #2 most-demanded after
    `api.authorize`.
-3. **`api.serverInfo` (`{ baseUrl, port }` at listen)** — **eight+
+3. **`api.serverInfo` (`{ baseUrl, port }` at listen)** — **a dozen+
    consumers: notifications/, webdav/, carddav/, caldav/, sparql/, rss/,
-   nip05/, webfinger/, mastodon/, bluesky/, activitypub/** — essentially
+   nip05/, webfinger/, mastodon/, bluesky/, activitypub/, micropub/,
+   backup/** — essentially
    every plugin that mints absolute URLs or reaches the host over loopback.
    All repeat the origin in config today; a wrong value fails quietly (nip05
    serves an empty identity map). The single most *broadly* needed seam
    (vs. api.authorize being the most *blocking*); trivially cheap to provide.
-4. **The unconsumed-body-**stream** primitive (#583)** — consumer:
-   gitscratch/ sharpened it. tunnel/ needed the raw *buffer*; git needs the
-   raw *stream* piped to a subprocess gzip-and-all. Whatever `api.mountApp`
-   / raw-body mode ships must hand back the un-drained stream, not just a
-   buffered body. (This is exactly what the merged loader's scoped
-   pass-through parser does — the finding is to keep it that way.)
+4. **The unconsumed-body-**stream** primitive (#583)** — consumers:
+   gitscratch/ sharpened it; micropub/ adds a blocked one. tunnel/ needed
+   the raw *buffer*; git needs the raw *stream* piped to a subprocess
+   gzip-and-all; micropub's **media endpoint** (multipart file upload) is
+   simply not implemented until a plugin can pipe an un-drained body.
+   Whatever `api.mountApp` / raw-body mode ships must hand back the
+   un-drained stream, not just a buffered body. (This is exactly what the
+   merged loader's scoped pass-through parser does — the finding is to
+   keep it that way.)
 5. **Routes/WAC-exemption outside the single prefix** — **the most-hit
    finding: seven+ consumers.** A plugin can *register* absolute/exact
    routes outside its prefix (the loader doesn't confine `api.fastify`), but
@@ -98,7 +105,11 @@ ports reached for it without coordinating.
    (or `paths: [...]` in the entry) — the loader exempts *and* claims each
    deliberately and reports collisions. The seam **every API-shim plugin**
    structurally requires; third most-demanded after `api.authorize` and
-   `api.events`.
+   `api.events`. **Counter-witness that sharpens it:** micropub/ is a
+   protocol shim that needed *no* reservation at all, because Micropub
+   endpoints are client-discovered rather than protocol-fixed — the seam
+   is specifically about protocols that pin absolute paths, not API shims
+   per se.
 6. **Can't set fastify server options** — consumer: capability/ hit
    `maxParamLength` (100) silently 404ing long tokens in named params;
    workaround is a wildcard route. A plugin has no way to raise per-route
@@ -107,10 +118,13 @@ ports reached for it without coordinating.
    (`src/nostr/event.js` NIP-01 verify), pay/ (`src/mrc20.js`). Pure crypto.
    Export like auth.js (`javascript-solid-server/nostr.js`) or bless
    vendoring.
-8. **Response-header injection on core routes** — consumer: notifications/
-   (`Updates-Via` discovery). A plugin can't add headers to routes it
-   doesn't own. NOT a default-on hook (bigger grant than route ownership);
-   gate behind `capabilities: ['hooks']` if ever.
+8. **Response-header injection on core routes** — **two consumers:
+   notifications/** (`Updates-Via` discovery) and **micropub/** (clients
+   find the endpoint via `<link rel="micropub">` on the user's homepage —
+   a core-owned resource the plugin can't decorate; the operator must
+   advertise it by hand). A plugin can't add headers to routes it doesn't
+   own. NOT a default-on hook (bigger grant than route ownership); gate
+   behind `capabilities: ['hooks']` if ever.
 
 ## Test-harness footguns (host quirks, not plugin api)
 
@@ -192,3 +206,14 @@ this repo is its proof.
 - Test harness dance: a plugin whose config references the server's own
   origin forces the port-probe-then-boot pattern (helpers.js `port` option)
   — same finding as api.serverInfo, visible in test setup.
+- **No snapshot semantics** (backup/): a multi-resource read is never
+  atomic — the api offers no lock, snapshot, or conditional multi-read, so
+  an archive of a busy pod is an honest but mixed-state export. Related:
+  a streaming response can't report post-walk results (skip counts) in
+  headers — they're committed before the walk starts and there are no
+  usable trailers — so backup/ writes an in-band `MANIFEST.json` as the
+  last archive entry.
+- **Permissions don't round-trip** (backup/): `.acl`/`.meta` could be
+  exported (loopback enforces Control for free) but absolute-URL ACLs
+  don't restore elsewhere — policy portability is a spec-level gap, not a
+  plugin-api gap.

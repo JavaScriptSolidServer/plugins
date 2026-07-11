@@ -46,7 +46,7 @@ describe('composition: every plugin on one server', () => {
 
   after(async () => { if (jss) await jss.close(); });
 
-  it('boots pods + idp + twenty-four plugins from config', async () => {
+  it('boots pods + idp + twenty-six plugins from config', async () => {
     const port = await probePort();
     base = `http://127.0.0.1:${port}`;
     wsBase = `ws://127.0.0.1:${port}`;
@@ -93,6 +93,8 @@ describe('composition: every plugin on one server', () => {
         { id: 'search', module: at('search/plugin.js'), prefix: '/search', config: { baseUrl: base, loopbackUrl: base } },
         { id: 'didweb', module: at('didweb/plugin.js'), prefix: '/didweb', config: { podsRoot: root, baseUrl: base } },
         { id: 's3', module: at('s3/plugin.js'), prefix: '/s3', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'micropub', module: at('micropub/plugin.js'), prefix: '/micropub', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'backup', module: at('backup/plugin.js'), prefix: '/backup', config: { baseUrl: base, loopbackUrl: base } },
       ],
     });
     assert.ok(jss.base);
@@ -273,6 +275,23 @@ describe('composition: every plugin on one server', () => {
   it('s3: an unauthenticated object GET is denied (gateway alive)', async () => {
     const res = await fetch(`${base}/s3/bucket/key`);
     assert.strictEqual(res.status, 403);
+  });
+
+  it('micropub: q=config answers; unauthenticated POST is 401', async () => {
+    let res = await fetch(`${base}/micropub?q=config`);
+    assert.strictEqual(res.status, 200);
+    assert.ok('syndicate-to' in (await res.json()));
+    res = await fetch(`${base}/micropub`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'h=entry&content=compose',
+    });
+    assert.strictEqual(res.status, 401);
+  });
+
+  it('backup: bare GET is 400 with usage (no whole-server export)', async () => {
+    const res = await fetch(`${base}/backup`);
+    assert.strictEqual(res.status, 400);
   });
 
   it('pods still work beside all of it (idp register + WAC)', async () => {

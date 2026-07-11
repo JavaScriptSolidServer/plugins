@@ -8,16 +8,20 @@ plugin), `NOTES.md` (the findings/seams — the real deliverable), and
 
 ## Where things stand
 
-- **24 plugins, ~270 tests, all green** (`npm test`), all pushed to
+- **26 plugins, 264 tests, all green** (`npm test`), all pushed to
   `github.com/JavaScriptSolidServer/plugins` (branch `gh-pages`).
-- `compose.test.js` boots all 24 on **one** JSS from pure config; `serve.js`
+- `compose.test.js` boots all 26 on **one** JSS from pure config; `serve.js`
   is the runnable demo. Both must be updated when you add a plugin.
 - Built so far: 6 ports (relay, webrtc, terminal, tunnel, notifications,
-  pay) + 18 features (nip05, corsproxy, capability, webdav, sparql,
+  pay) + 20 features (nip05, corsproxy, capability, webdav, sparql,
   gitscratch, otp, carddav, mastodon, bluesky, caldav, webfinger,
-  activitypub, rss, matrix, search, didweb, s3).
+  activitypub, rss, matrix, search, didweb, s3, micropub, backup).
 - Capability classes covered: realtime, WebDAV family, fediverse/social/chat
-  (5 shims), identity, data/query/search, object storage, proxy, dev, pay.
+  (5 shims), IndieWeb publishing, identity, data/query/search, object
+  storage, proxy, dev, pay, data portability.
+- **REPORT.md exists** — the maintainer-facing summary (ranked seams, each
+  fileable nearly verbatim). Keep its consumer counts current as plugins
+  land.
 
 ## The hard rule (don't break it)
 
@@ -33,17 +37,18 @@ plugin), `NOTES.md` (the findings/seams — the real deliverable), and
    pinned to 0.0.215 on `gh-pages`. You may **read** it for reference; keep
    it clean.
 
-## Immediate next step: finish Wave 7
+## Wave 7 status
 
-Four plugins were *planned but not yet built* — this is where to resume:
+`micropub/` and `backup/` are **built and integrated**. Two remain
+*deliberately deferred*, not forgotten:
 
-| Plugin | What | Copy from |
+| Plugin | What | Why deferred |
 |---|---|---|
-| `webhooks/` | change-notification webhooks; **must poll** (no `api.events`) → the canonical 5th consumer of that seam, and a real integration primitive | notifications/ (fs.watch), rss/sparql (container walk) |
-| `micropub/` | IndieWeb Micropub server — POST creates a post in the pod | mastodon/ (auth + pod write via loopback) |
-| `webmention/` | IndieWeb Webmention receiver — store incoming mentions in the pod | activitypub/ inbox, capability/ |
-| `backup/` | pod container → `.tar.gz` download (data portability); hand-roll tar headers + `node:zlib` gzip (no deps) | webdav/rss (container walk) |
+| `webhooks/` | change-notification webhooks; **must poll** (no `api.events`) → a 6th consumer of that seam | POSTs to arbitrary operator-supplied URLs — build with corsproxy/-grade SSRF gates and a careful review, in a session focused on it |
+| `webmention/` | IndieWeb Webmention receiver — store incoming mentions in the pod | spec requires fetching the (arbitrary) source URL to verify the link — same outbound-fetch caution as webhooks |
 
+If you build them, copy notifications/ (fs.watch) + rss/sparql (walk) for
+webhooks, activitypub/ inbox + corsproxy/'s SSRF gates for webmention.
 Dispatch each as its own worker into its own directory (they don't conflict
 — separate subdirs, shared files touched only by you at integration time).
 Verify each with `node --test --test-concurrency=1 <name>/test.js`, then:
@@ -91,12 +96,15 @@ each. Current top four (keep this current as you add consumers):
 
 1. **`api.authorize(request, path, mode)`** — 3 consumers; the top
    *blocking* seam (authority the requester doesn't drive).
-2. **`api.events.onResourceChange`** — 4 consumers; matrix `/sync` needs
+2. **`api.events.onResourceChange`** — 5 consumers (backup/ made it 5:
+   incremental/scheduled backup is unbuildable); matrix `/sync` needs
    live push. Every "react to writes" plugin (webhooks, WebSub, indexing)
-   will want it — webhooks/ (wave 7) makes it 5.
+   will want it — webhooks/ would make it 6.
 3. **`api.reservePath`** — every API-shim owns fixed roots outside its one
    prefix and can't self-exempt; didweb needs a *parameterized* form.
-4. **`api.serverInfo`** — broadest (~10 plugins hand-roll their origin).
+   (micropub/ is the counter-witness: client-discovered endpoints need no
+   reservation — the seam is about protocol-fixed paths.)
+4. **`api.serverInfo`** — broadest (~12 plugins hand-roll their origin).
 
 Plus: the unconsumed-body-**stream** primitive (#583), `api.mcp.registerTool`
 (blocks the MCP-tool issues #495/#496/#500/#501), can't-set-server-options,
@@ -105,12 +113,12 @@ empirically in NOTES: **route-owning → plugin, pipeline-modifying → core**.
 
 ## Meta-work worth doing (beyond more plugins)
 
-- **A summary write-up** the maintainer can act on: "the plugin api reaches
-  N of ~40 tagged issues; here are the M seams to add next, ranked, each
-  with consumers." Half of this exists in `ISSUES.md`/`NOTES.md` already.
+- **The summary write-up is DONE — `REPORT.md`.** Keep it current (counts,
+  consumers) whenever a wave lands; it's written so each seam could be
+  filed nearly verbatim.
 - **Filing the seams as upstream issues** — but only if the maintainer asks
-  (core-repo interaction is currently off; see the hard rule). Draft them
-  here first if so.
+  (core-repo interaction is currently off; see the hard rule). REPORT.md
+  is the draft.
 
 ## Footguns (every multi-boot test suite rediscovered these)
 

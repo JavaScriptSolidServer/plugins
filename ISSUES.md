@@ -35,6 +35,8 @@ evidence. Legend:
 | — | `search/` | full-text search over pod resources |
 | — | `didweb/` | `did:web` DID-document resolver |
 | — | `s3/` | S3-compatible object-storage gateway |
+| — | `micropub/` | IndieWeb Micropub endpoint (media upload → 🔩 raw-body stream #583) |
+| — | `backup/` | pod → `.tar.gz` export (incremental backup → 🔩 `api.events`) |
 
 Plus six **ports of bundled features** proving the migration path for #564 /
 #164: `relay/` `webrtc/` `terminal/` `tunnel/` `notifications/`, and `pay/`
@@ -96,13 +98,13 @@ exists.
 ## Tally
 
 Of ~40 plugin-tagged issues: **13 built as plugins here** (plus `rss/`,
-`matrix/`, `search/`, `didweb/`, `s3/` — capability demonstrations with no
-single issue), **6 ported**, **5 shipped upstream**, **2 more plugin-able
-with no blocker**, **6 clusters blocked on a named seam** (each with a
-proof-of-need consumer), the rest core-by-nature or product-scale. **24
-plugins total, ~270 tests.** The plugin api reaches most of the backlog
-today; ranked by demand, the seams that would unlock the most next are
-`api.authorize` (3 blocking consumers), `api.events` (4 consumers — matrix
-`/sync` needs live push), `api.reservePath` (API-shims + didweb's
-parameterized case), and `api.serverInfo` (broadest: ~10 plugins hand-roll
-their own origin).
+`matrix/`, `search/`, `didweb/`, `s3/`, `micropub/`, `backup/` — capability
+demonstrations with no single issue), **6 ported**, **5 shipped upstream**,
+**2 more plugin-able with no blocker**, **6 clusters blocked on a named
+seam** (each with a proof-of-need consumer), the rest core-by-nature or
+product-scale. **26 plugins total, 264 tests.** The plugin api reaches most
+of the backlog today; ranked by demand, the seams that would unlock the
+most next are `api.authorize` (3 blocking consumers), `api.events` (5
+consumers — matrix `/sync` needs live push, backup can only pull-on-demand),
+`api.reservePath` (API-shims + didweb's parameterized case), and
+`api.serverInfo` (broadest: ~12 plugins hand-roll their own origin).

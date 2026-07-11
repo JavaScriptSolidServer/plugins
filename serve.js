@@ -64,6 +64,8 @@ const fastify = createServer({
     { id: 'search', module: at('search/plugin.js'), prefix: '/search', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
     { id: 'didweb', module: at('didweb/plugin.js'), prefix: '/didweb', config: { podsRoot: PODS, baseUrl: PUBLIC_URL } },
     { id: 's3', module: at('s3/plugin.js'), prefix: '/s3', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    { id: 'micropub', module: at('micropub/plugin.js'), prefix: '/micropub', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    { id: 'backup', module: at('backup/plugin.js'), prefix: '/backup', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
   ],
 });
 
@@ -101,3 +103,5 @@ console.log(`  matrix:         GET ${PUBLIC_URL}/_matrix/client/versions  (point
 console.log(`  search:         GET ${PUBLIC_URL}/search?q=<terms>&container=<pod-container>`);
 console.log(`  did:web:        GET ${PUBLIC_URL}/.well-known/did.json`);
 console.log(`  s3:             ${PUBLIC_URL}/s3/<bucket>/<key>  (aws-cli/rclone, SigV4)`);
+console.log(`  micropub:       POST ${PUBLIC_URL}/micropub  (IndieWeb clients; pod bearer as token)`);
+console.log(`  backup:         GET ${PUBLIC_URL}/backup/<pod>/  → .tar.gz of what you can read`);
