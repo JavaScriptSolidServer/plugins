@@ -7,9 +7,13 @@ repo; nothing is speculative. Detail lives in [NOTES.md](./NOTES.md)
 (findings), [ISSUES.md](./ISSUES.md) (per-issue disposition), and each
 plugin's `README.md ## Findings`.
 
-**The five bugs below are now filed upstream** (#596–#600, 2026-07-11, at
-the maintainer's request). The four *seams* remain unfiled; each is
-drafted so it could be filed nearly verbatim if wanted.
+**Both the bugs and the seams are now filed upstream** (2026-07-11): the
+five bugs as #596–#600, and the four ranked seams as **#601 (serverInfo),
+#602 (reservePath), #603 (events), #604 (authorize)**. The secondary asks
+below (`api.plugins`, `api.isOperator`, mcp.registerTool, per-route
+options, response-header injection, pure-utility exports) are *not* filed
+yet — they're lower-priority and better raised when a design discussion on
+the four opens.
 
 ## Executive summary
 
@@ -73,8 +77,10 @@ Validated by use, not opinion:
 
 Rank = how many plugins reached for the seam *without coordinating*. Each
 entry is written as a fileable issue: motivation, consumers, sketch, cost.
+**All four are now filed:** authorize → #604, events → #603,
+reservePath → #602, serverInfo → #601.
 
-### 1. `api.authorize(request, path, mode)` — the most *blocking*
+### 1. `api.authorize(request, path, mode)` — the most *blocking* (#604)
 
 **Ask:** let a plugin ask the host's WAC engine for a decision the
 *requester's credentials don't drive*.
@@ -102,7 +108,7 @@ agent id (not request) in, decision out, same engine the LDP path uses.
 **Cost:** medium — the WAC engine exists; this is plumbing an entry point
 into the loader's `api` object.
 
-### 2. `api.events.onResourceChange(cb)` — every "react to writes" app
+### 2. `api.events.onResourceChange(cb)` — every "react to writes" app (#603)
 
 **Consumers (seven, rising sharpness):** `notifications/` (a miss = late
 notification), `sparql/` (a miss = wrong query result), `search/` (stale
@@ -129,7 +135,7 @@ construction.
 
 **Cost:** small — the event stream exists; scope it and pass it through.
 
-### 3. `api.reservePath(pattern)` — what every API shim structurally needs
+### 3. `api.reservePath(pattern)` — what every API shim structurally needs (#602)
 
 **The most-hit finding: seven+ consumers.** A plugin can *register* routes
 outside its prefix, but only its one `prefix` is WAC-exempt:
@@ -167,7 +173,7 @@ reporting collisions at boot.
 **Cost:** small-medium — generalizes the `appPaths` mechanism that already
 exists, moving it from operator config to plugin declaration.
 
-### 4. `api.serverInfo` — the broadest, and the cheapest
+### 4. `api.serverInfo` — the broadest, and the cheapest (#601)
 
 **~16 consumers** — every plugin that mints absolute URLs or loopbacks
 (the DAV family, the shims, rss, sparql, nip05, webfinger, notifications,

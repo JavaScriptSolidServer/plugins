@@ -154,7 +154,10 @@ narrative, issues are the actionable subset.
 
 - The repo exists and is public; keep pushing to it.
 - Core PRs #590 / #591 are unmerged — the maintainer's call.
-- **The five bugs are FILED** (core issues #596–#600, 2026-07-11, at the
-  maintainer's request). The four *seam* proposals (authorize, events,
-  reservePath, serverInfo) are still unfiled — ask before filing;
-  REPORT.md is the draft.
+- **Bugs AND seams are FILED upstream** (2026-07-11): five bugs as core
+  #596–#600, four seams as core **#601 (serverInfo), #602 (reservePath),
+  #603 (events), #604 (authorize)**. Next upstream step (Stage 3, needs
+  the core-freeze lifted): ship `serverInfo` (#601) end-to-end as the
+  reference PR — cheapest seam, ~16 consumers — then retrofit the plugins
+  that hand-roll their origin. Secondary asks (api.plugins, api.isOperator)
+  not filed yet; raise when a design discussion on the four opens.
