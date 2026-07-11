@@ -122,6 +122,26 @@ function generateCode(len) {
   return s;
 }
 
+// ------------------------------------------------------- durable write
+// Atomic persist: write to a uniquely-named temp file in the SAME directory
+// (rename is only atomic within one filesystem), then rename it over the
+// target. A crash mid-write truncates the throwaway temp, never the live
+// table — so a truncated table can no longer silently reset to {} at boot
+// and re-open a consumed OTP row. The random suffix avoids concurrent-writer
+// temp collisions; a failed rename unlinks the temp so no partial file and
+// no stale `.tmp` are left behind. (This does NOT address the read-modify-
+// write TOCTOU between concurrent persisters — a separate, larger concern.)
+function atomicWrite(file, data) {
+  const tmp = `${file}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch { /* best-effort cleanup */ }
+    throw err;
+  }
+}
+
 export async function activate(api) {
   const prefix = api.prefix || '/otp';
   const cfg = api.config || {};
@@ -154,7 +174,7 @@ export async function activate(api) {
   // pruned at boot.
   const now0 = Math.floor(Date.now() / 1000);
   const table = new Map(Object.entries(loadJson(tableFile)).filter(([, e]) => e && e.exp > now0));
-  const persist = () => fs.writeFileSync(tableFile, JSON.stringify(Object.fromEntries(table)));
+  const persist = () => atomicWrite(tableFile, JSON.stringify(Object.fromEntries(table)));
   const keyFor = (identifier, purpose) => `${identifier}${NUL}${purpose}`;
 
   // ---------------------------------------------------- channel adapter

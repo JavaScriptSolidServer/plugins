@@ -63,6 +63,39 @@ export function randomSlug(len = 7) {
   return s;
 }
 
+// ------------------------------------------------------- durable write
+// Atomic persist: write to a uniquely-named temp file in the SAME directory
+// (rename is only atomic within one filesystem), then rename it over the
+// target. A crash mid-write truncates the throwaway temp, never the live
+// links table — so a truncated table can no longer silently reset to {} at
+// boot and lose every link. The random suffix avoids concurrent-writer temp
+// collisions; a failed rename unlinks the temp so no partial file and no
+// stale `.tmp` are left behind. Both the sync (create/delete) and async
+// (hit-count flush) writers go through this — a crashed hit-count flush must
+// not truncate the table either. (This does NOT address the read-modify-
+// write TOCTOU between concurrent persisters — a separate, larger concern.)
+function atomicWriteSync(file, data) {
+  const tmp = `${file}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch { /* best-effort cleanup */ }
+    throw err;
+  }
+}
+
+async function atomicWriteAsync(file, data) {
+  const tmp = `${file}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    await fsp.writeFile(tmp, data);
+    await fsp.rename(tmp, file);
+  } catch (err) {
+    try { await fsp.unlink(tmp); } catch { /* best-effort cleanup */ }
+    throw err;
+  }
+}
+
 export async function activate(api) {
   const prefix = api.prefix || '/shortlink';
   const cfg = api.config || {};
@@ -102,7 +135,7 @@ export async function activate(api) {
   };
   const links = new Map(Object.entries(loadJson(tableFile)));
 
-  const persist = () => fs.writeFileSync(tableFile, JSON.stringify(Object.fromEntries(links)));
+  const persist = () => atomicWriteSync(tableFile, JSON.stringify(Object.fromEntries(links)));
 
   // Fire-and-forget flush for hit counts: serialized on a promise chain so
   // concurrent redirects never interleave writes to the same file. A crash
@@ -111,7 +144,7 @@ export async function activate(api) {
   let pending = Promise.resolve();
   const persistLazy = () => {
     pending = pending
-      .then(() => fsp.writeFile(tableFile, JSON.stringify(Object.fromEntries(links))))
+      .then(() => atomicWriteAsync(tableFile, JSON.stringify(Object.fromEntries(links))))
       .catch((err) => api.log.warn(`shortlink: hit-count flush failed: ${err.message}`));
   };
 

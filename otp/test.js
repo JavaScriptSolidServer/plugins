@@ -6,6 +6,7 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startJss } from '../helpers.js';
@@ -150,6 +151,28 @@ describe('otp plugin', () => {
     for (let i = 0; i < 4; i++) statuses.push((await requestCode(id, 'session')).status);
     assert.deepStrictEqual(statuses.slice(0, 3), [201, 201, 201], 'first three allowed');
     assert.strictEqual(statuses[3], 429, 'fourth request throttled');
+  });
+
+  it('persistence is atomic: otp.json stays valid JSON with the row, no leftover .tmp', async () => {
+    const id = 'durable@example.com';
+    assert.strictEqual((await requestCode(id, 'session')).status, 201);
+
+    // pluginDir lives at <root>/.plugins/<id> (same as capability/'s secret).
+    const pluginDir = path.join(jss.root, '.plugins', 'otp');
+    const tableFile = path.join(pluginDir, 'otp.json');
+
+    // The whole table survived the write and parses — a truncated write would
+    // have left invalid JSON that the boot loader swallows into {} (the bug).
+    const table = JSON.parse(fs.readFileSync(tableFile, 'utf8'));
+    const rows = Object.values(table);
+    assert.ok(
+      rows.some((e) => e && e.identifier === id && e.purpose === 'session'),
+      'the just-minted OTP row is present on disk',
+    );
+
+    // The atomic write must not leave any temp file behind in the plugin dir.
+    const leftovers = fs.readdirSync(pluginDir).filter((f) => f.endsWith('.tmp'));
+    assert.deepStrictEqual(leftovers, [], `no leftover temp files, saw: ${leftovers}`);
   });
 
   it('a tampered or missing session token is refused at whoami', async () => {

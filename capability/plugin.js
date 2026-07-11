@@ -51,6 +51,27 @@ const MIME = {
 };
 const mimeFor = (name) => MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream';
 
+// ------------------------------------------------------- durable write
+// Atomic persist: write to a uniquely-named temp file in the SAME directory
+// (rename is only atomic within one filesystem), then rename it over the
+// target. A crash mid-write truncates the throwaway temp, never the live
+// file — so a truncated REVOCATION LEDGER can no longer silently reset to {}
+// at boot and let a revoked capability come back to life. The random suffix
+// avoids concurrent-writer temp collisions; a failed rename unlinks the temp
+// so no partial file and no stale `.tmp` are left behind. (This does NOT
+// address the read-modify-write TOCTOU between concurrent persisters — a
+// separate, larger concern.)
+function atomicWrite(file, data) {
+  const tmp = `${file}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch { /* best-effort cleanup */ }
+    throw err;
+  }
+}
+
 // ---------------------------------------------------------------- token
 // Exported as pure functions so tests (and operators) can craft and check
 // tokens against a known secret without booting a server.
@@ -117,8 +138,8 @@ export async function activate(api) {
   const revoked = new Map(Object.entries(loadJson(revokedFile)).filter(([, exp]) => exp == null || exp > now));
   const issued = new Map(Object.entries(loadJson(issuedFile)).filter(([, v]) => v?.exp > now));
   const persist = () => {
-    fs.writeFileSync(revokedFile, JSON.stringify(Object.fromEntries(revoked)));
-    fs.writeFileSync(issuedFile, JSON.stringify(Object.fromEntries(issued)));
+    atomicWrite(revokedFile, JSON.stringify(Object.fromEntries(revoked)));
+    atomicWrite(issuedFile, JSON.stringify(Object.fromEntries(issued)));
   };
 
   // -------------------------------------------------------- resources

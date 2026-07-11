@@ -193,4 +193,26 @@ describe('capability plugin', () => {
     assert.strictEqual(res.status, 200);
     assert.strictEqual((await fetch(`${jss.base}${cap.url}`)).status, 401);
   });
+
+  it('the revocation ledger persists atomically: valid JSON with the jti, no leftover .tmp', async () => {
+    const cap = await (await issue({ resource: 'report.pdf', ttl: 3600 }, alice.access_token)).json();
+    const revoke = await fetch(`${jss.base}/cap/revoke`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${alice.access_token}` },
+      body: JSON.stringify({ token: cap.token }),
+    });
+    assert.strictEqual(revoke.status, 200);
+
+    const pluginDir = path.join(jss.root, '.plugins', 'capability');
+
+    // The revocation ledger survived the write and parses. A truncated write
+    // would leave invalid JSON the boot loader swallows into {} — and a
+    // revoked capability would silently come back to life. That's the bug.
+    const revoked = JSON.parse(fs.readFileSync(path.join(pluginDir, 'revoked.json'), 'utf8'));
+    assert.ok(cap.jti in revoked, 'the revoked jti is on disk in the ledger');
+
+    // Neither ledger write may leave a temp file behind in the plugin dir.
+    const leftovers = fs.readdirSync(pluginDir).filter((f) => f.endsWith('.tmp'));
+    assert.deepStrictEqual(leftovers, [], `no leftover temp files, saw: ${leftovers}`);
+  });
 });

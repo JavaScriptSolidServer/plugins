@@ -8,6 +8,7 @@
 
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { probePort, startJss } from '../helpers.js';
@@ -190,6 +191,24 @@ describe('shortlink plugin', () => {
 
     const mine = await list(alice);
     assert.strictEqual(mine.find((l) => l.slug === slug).hits, 2);
+  });
+
+  it('persistence is atomic: links.json stays valid JSON with the record, no leftover .tmp', async () => {
+    const res = await post(alice, { url: `${base}/alice/durable/thing.ttl`, slug: 'durable-link' });
+    assert.strictEqual(res.status, 201);
+
+    const pluginDir = path.join(jss.root, '.plugins', 'shortlink');
+    const tableFile = path.join(pluginDir, 'links.json');
+
+    // The table survived the write and parses. A truncated write would leave
+    // invalid JSON the boot loader swallows into {} — losing every link.
+    const table = JSON.parse(fs.readFileSync(tableFile, 'utf8'));
+    assert.ok(table['durable-link'], 'the just-created link is present on disk');
+    assert.strictEqual(table['durable-link'].url, `${base}/alice/durable/thing.ttl`);
+
+    // The atomic write must not leave any temp file behind in the plugin dir.
+    const leftovers = fs.readdirSync(pluginDir).filter((f) => f.endsWith('.tmp'));
+    assert.deepStrictEqual(leftovers, [], `no leftover temp files, saw: ${leftovers}`);
   });
 
   it('unknown slug → 404, even one far past maxParamLength (wildcard route)', async () => {
