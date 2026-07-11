@@ -38,13 +38,18 @@ ports reached for it without coordinating.
    #382), or a capability exercising the *issuer's* authority
    (capability #506). This is the most-requested seam and the one that
    moves the most backlog issues from "plugin-approximation" to "faithful".
-2. **`api.events.onResourceChange(cb)`** — **two consumers: notifications/,
-   sparql/**, and sparql is the *stronger* one: without a write hook a
-   plugin index returns **wrong** query results, not merely late
-   notifications, and `pluginDir` caching is uninvalidatable. Core already
-   has the emitter internally (`src/notifications/events.js`). The seam
-   every "react to pod writes" app (webhooks, indexing, sync, full-text)
-   will want.
+2. **`api.events.onResourceChange(cb)`** — **four consumers now:
+   notifications/, sparql/, search/, matrix/**, in rising sharpness:
+   notifications (a miss is a *late* notification), sparql (a miss is a
+   *wrong* query result), search (a miss is *stale results*, the property
+   users most expect to be fresh — the most user-visible instance), and
+   matrix (its `/sync?since=` long-poll needs server-side sync cursors +
+   **live push on writes** — an event hook feeding `api.ws.route` — so a
+   stateless bridge can only do full-state `/sync` at all). Core already has
+   the emitter internally (`src/notifications/events.js`); this is the seam
+   every "react to pod writes" app (webhooks, indexing, sync, search, live
+   chat) will want, and it's now clearly the #2 most-demanded after
+   `api.authorize`.
 3. **`api.serverInfo` (`{ baseUrl, port }` at listen)** — **eight+
    consumers: notifications/, webdav/, carddav/, caldav/, sparql/, rss/,
    nip05/, webfinger/, mastodon/, bluesky/, activitypub/** — essentially
@@ -78,14 +83,22 @@ ports reached for it without coordinating.
      prefixes"); activitypub sharpened it further — its natural layout wants
      paths **interleaved with** the pod's own `/<user>/` namespace, which no
      single mount prefix can carve out at all.
+   - **parameterized paths can't be exempted at all** — didweb/ serves
+     `/<user>/did.json`, which lives *inside* the pod's own WAC-governed
+     `/<user>/` namespace. `appPaths` matches literal prefixes, so it can't
+     carve out a parameterized route interleaved with pod paths; and unlike
+     an API shim, did:web can't escape to a fake root (the DID id is fixed
+     by the method). It works only where the pod grants public Read. This is
+     the sharpest form and needs a **parameterized** `api.reservePath`.
    - none of it has conflict detection: a future core route at a
      plugin-claimed path throws `FST_ERR_DUPLICATED_ROUTE` at boot (and a
      link registry — `api.webfinger.addLink` — is missing, so two plugins
      contributing `.well-known/webfinger` links would collide silently).
-   The seam: `api.reservePath('/xrpc')` (or `paths: [...]` in the entry) —
-   the loader exempts *and* claims each deliberately and reports collisions.
-   The seam **every API-shim plugin** structurally requires; third
-   most-demanded after `api.authorize` and `api.events`.
+   The seam: `api.reservePath('/xrpc')` / `api.reservePath('/:user/did.json')`
+   (or `paths: [...]` in the entry) — the loader exempts *and* claims each
+   deliberately and reports collisions. The seam **every API-shim plugin**
+   structurally requires; third most-demanded after `api.authorize` and
+   `api.events`.
 6. **Can't set fastify server options** — consumer: capability/ hit
    `maxParamLength` (100) silently 404ing long tokens in named params;
    workaround is a wildcard route. A plugin has no way to raise per-route

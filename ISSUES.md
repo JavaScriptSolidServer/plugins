@@ -31,6 +31,10 @@ evidence. Legend:
 | #164 | `webfinger/` | `/.well-known/webfinger` — the WebFinger half of #164 |
 | #51/#164 | `activitypub/` | federate a pod as an AS2 actor (needs `appPaths` widened → 🔩) |
 | — | `rss/` | any pod container as an Atom/RSS feed |
+| — | `matrix/` | Matrix Client-Server API shim (chat) |
+| — | `search/` | full-text search over pod resources |
+| — | `didweb/` | `did:web` DID-document resolver |
+| — | `s3/` | S3-compatible object-storage gateway |
 
 Plus six **ports of bundled features** proving the migration path for #564 /
 #164: `relay/` `webrtc/` `terminal/` `tunnel/` `notifications/`, and `pay/`
@@ -91,12 +95,14 @@ exists.
 
 ## Tally
 
-Of ~40 plugin-tagged issues: **13 built as plugins here** (plus `rss/`, no
-issue), **6 ported**, **5 shipped upstream**, **2 more plugin-able with no
-blocker**, **6 clusters blocked on a named seam** (each with a proof-of-need
-consumer), the rest core-by-nature or product-scale. 20 plugins total, ~200
-tests. The plugin api reaches most of the backlog today; ranked by demand,
-the seams that would unlock the most next are `api.authorize` (3 blocking
-consumers), `api.reservePath` (3 API-shims can't self-exempt), `api.events`
-(2, one where a miss means *wrong* answers), and `api.serverInfo` (broadest:
-~10 plugins hand-roll their own origin).
+Of ~40 plugin-tagged issues: **13 built as plugins here** (plus `rss/`,
+`matrix/`, `search/`, `didweb/`, `s3/` — capability demonstrations with no
+single issue), **6 ported**, **5 shipped upstream**, **2 more plugin-able
+with no blocker**, **6 clusters blocked on a named seam** (each with a
+proof-of-need consumer), the rest core-by-nature or product-scale. **24
+plugins total, ~270 tests.** The plugin api reaches most of the backlog
+today; ranked by demand, the seams that would unlock the most next are
+`api.authorize` (3 blocking consumers), `api.events` (4 consumers — matrix
+`/sync` needs live push), `api.reservePath` (API-shims + didweb's
+parameterized case), and `api.serverInfo` (broadest: ~10 plugins hand-roll
+their own origin).

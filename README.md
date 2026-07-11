@@ -76,11 +76,16 @@ README and NOTES.md, ship the closest honest approximation.
 | `webfinger/` | #164 | `/.well-known/webfinger` — fediverse `acct:` resolution for the shims |
 | `activitypub/` | #51/#164 | federate a pod as an AS2 actor; outbound HTTP Signatures |
 | `rss/` | — | any pod container as an Atom/RSS feed |
+| `matrix/` | — | Matrix Client-Server API shim (chat protocol) |
+| `search/` | — | full-text search over pod resources (TF-IDF) |
+| `didweb/` | — | `did:web` DID-document resolver for pods |
+| `s3/` | — | S3-compatible object-storage gateway (SigV4) |
 
-**~200 tests, all green** (`npm test`), including `compose.test.js` — all
-twenty plugins on one server from pure config, pods + WAC intact beside
-them. Findings consolidated in [NOTES.md](./NOTES.md); the full
-plugin-tagged backlog triaged in [ISSUES.md](./ISSUES.md).
+**~270 tests, all green** (`npm test`), including `compose.test.js` — all
+twenty-four plugins on one server from pure config, pods + WAC intact
+beside them. Findings consolidated in [NOTES.md](./NOTES.md); the full
+plugin-tagged backlog triaged in [ISSUES.md](./ISSUES.md); the build guide
+is [AGENT.md](./AGENT.md).
 
 ```
 <name>/plugin.js   the port          <name>/test.js   real-JSS tests   <name>/README.md   findings

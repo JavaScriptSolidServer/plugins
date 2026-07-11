@@ -29,9 +29,10 @@ const fastify = createServer({
   idp: true,
   idpIssuer: PUBLIC_URL,
   // The protocol shims own fixed roots outside their prefix — mastodon
-  // (/api,/oauth), bluesky (/xrpc), activitypub (/ap) — which a plugin
-  // can't self-exempt from WAC, so the operator widens appPaths.
-  appPaths: ['/api', '/oauth', '/xrpc', '/ap'],
+  // (/api,/oauth), bluesky (/xrpc), activitypub (/ap), matrix (/_matrix) —
+  // which a plugin can't self-exempt from WAC, so the operator widens
+  // appPaths.
+  appPaths: ['/api', '/oauth', '/xrpc', '/ap', '/_matrix'],
   // Explicit ids — the <name>/plugin.js convention collides on basename.
   plugins: [
     { id: 'relay', module: at('relay/plugin.js'), prefix: '/relay' },
@@ -59,6 +60,10 @@ const fastify = createServer({
     { id: 'webfinger', module: at('webfinger/plugin.js'), prefix: '/webfinger', config: { podsRoot: PODS, baseUrl: PUBLIC_URL } },
     { id: 'activitypub', module: at('activitypub/plugin.js'), prefix: '/activitypub', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
     { id: 'rss', module: at('rss/plugin.js'), prefix: '/feed', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    { id: 'matrix', module: at('matrix/plugin.js'), prefix: '/matrix', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    { id: 'search', module: at('search/plugin.js'), prefix: '/search', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    { id: 'didweb', module: at('didweb/plugin.js'), prefix: '/didweb', config: { podsRoot: PODS, baseUrl: PUBLIC_URL } },
+    { id: 's3', module: at('s3/plugin.js'), prefix: '/s3', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
   ],
 });
 
@@ -92,3 +97,7 @@ console.log(`  caldav:         ${PUBLIC_URL}/caldav/  (calendar sync)`);
 console.log(`  webfinger:      GET ${PUBLIC_URL}/.well-known/webfinger?resource=acct:me@host`);
 console.log(`  activitypub:    GET ${PUBLIC_URL}/ap/<user>/actor`);
 console.log(`  rss/atom:       GET ${PUBLIC_URL}/feed/atom?container=<pod-container>`);
+console.log(`  matrix:         GET ${PUBLIC_URL}/_matrix/client/versions  (point Element here)`);
+console.log(`  search:         GET ${PUBLIC_URL}/search?q=<terms>&container=<pod-container>`);
+console.log(`  did:web:        GET ${PUBLIC_URL}/.well-known/did.json`);
+console.log(`  s3:             ${PUBLIC_URL}/s3/<bucket>/<key>  (aws-cli/rclone, SigV4)`);

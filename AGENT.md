@@ -143,9 +143,11 @@ Full ranking in `NOTES.md`. The ones you'll hit:
 | an API shim (a new social/chat/proto) | `mastodon/` or `bluesky/` | token bridge + fixed-root `appPaths` |
 | a `.well-known` discovery doc | `nip05/` or `webfinger/` | podsRoot scan + guarded absolute route |
 | a scoped-token / auth service | `capability/` or `otp/` | HMAC macaroon-lite + `pluginDir` |
-| a query/read-over-pod-data feature | `sparql/` or `rss/` | loopback container walk + forwarded auth |
+| a query/read/search over pod data | `sparql/`, `rss/`, `search/` | loopback container walk + forwarded auth |
 | a federation actor | `activitypub/` | keypair in `pluginDir` + loopback objects |
 | a proxy/gateway | `corsproxy/` | fetch upstream, SSRF gates, CORS |
+| an object-storage / S3-style gateway | `s3/` | loopback LDP + hand-rolled XML + SigV4 |
+| a DID / identity document | `didweb/` | podsRoot scan + key derivation |
 | a dev/tooling subsystem | `gitscratch/` | shell a system binary via CGI |
 
 ## Footguns (every multi-boot suite rediscovered these)
@@ -164,7 +166,7 @@ Full ranking in `NOTES.md`. The ones you'll hit:
 
 ## Current state
 
-20 plugins (6 ports + 14 features), ~200 tests, all green (`npm test`).
+24 plugins (6 ports + 18 features), ~270 tests, all green (`npm test`).
 `compose.test.js` runs every one on a single server from pure config. Two
 core PRs (#590 `api.mountApp`, #591 `/idp/refresh`) sit upstream, unmerged,
 for the maintainer's call. Everything else lives here, by design.

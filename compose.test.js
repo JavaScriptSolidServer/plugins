@@ -46,7 +46,7 @@ describe('composition: every plugin on one server', () => {
 
   after(async () => { if (jss) await jss.close(); });
 
-  it('boots pods + idp + twenty plugins from config', async () => {
+  it('boots pods + idp + twenty-four plugins from config', async () => {
     const port = await probePort();
     base = `http://127.0.0.1:${port}`;
     wsBase = `ws://127.0.0.1:${port}`;
@@ -56,9 +56,10 @@ describe('composition: every plugin on one server', () => {
       root,
       idp: true,
       // The protocol shims own fixed roots outside their prefix — mastodon
-      // (/api,/oauth), bluesky (/xrpc), activitypub (/ap) — which a plugin
-      // can't self-exempt (finding), so the operator widens appPaths.
-      appPaths: ['/api', '/oauth', '/xrpc', '/ap'],
+      // (/api,/oauth), bluesky (/xrpc), activitypub (/ap), matrix (/_matrix)
+      // — which a plugin can't self-exempt (finding), so the operator
+      // widens appPaths.
+      appPaths: ['/api', '/oauth', '/xrpc', '/ap', '/_matrix'],
       // Explicit ids: the <name>/plugin.js convention makes every basename
       // reduce to 'plugin' — the loader's duplicate-id guard requires ids
       // here (finding: derive from the parent dir for generic basenames).
@@ -88,6 +89,10 @@ describe('composition: every plugin on one server', () => {
         { id: 'webfinger', module: at('webfinger/plugin.js'), prefix: '/webfinger', config: { podsRoot: root, baseUrl: base } },
         { id: 'activitypub', module: at('activitypub/plugin.js'), prefix: '/activitypub', config: { baseUrl: base, loopbackUrl: base } },
         { id: 'rss', module: at('rss/plugin.js'), prefix: '/feed', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'matrix', module: at('matrix/plugin.js'), prefix: '/matrix', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'search', module: at('search/plugin.js'), prefix: '/search', config: { baseUrl: base, loopbackUrl: base } },
+        { id: 'didweb', module: at('didweb/plugin.js'), prefix: '/didweb', config: { podsRoot: root, baseUrl: base } },
+        { id: 's3', module: at('s3/plugin.js'), prefix: '/s3', config: { baseUrl: base, loopbackUrl: base } },
       ],
     });
     assert.ok(jss.base);
@@ -248,6 +253,26 @@ describe('composition: every plugin on one server', () => {
   it('rss: missing container is 400 (endpoint alive)', async () => {
     const res = await fetch(`${base}/feed/atom`);
     assert.strictEqual(res.status, 400);
+  });
+
+  it('matrix: the versions endpoint answers (fixed /_matrix root)', async () => {
+    const res = await fetch(`${base}/_matrix/client/versions`);
+    assert.strictEqual(res.status, 200);
+  });
+
+  it('search: missing query is 400 (endpoint alive)', async () => {
+    const res = await fetch(`${base}/search`);
+    assert.strictEqual(res.status, 400);
+  });
+
+  it('didweb: unknown pod DID is 404 (resolver alive)', async () => {
+    const res = await fetch(`${base}/didweb/nobody/did.json`);
+    assert.strictEqual(res.status, 404);
+  });
+
+  it('s3: an unauthenticated object GET is denied (gateway alive)', async () => {
+    const res = await fetch(`${base}/s3/bucket/key`);
+    assert.strictEqual(res.status, 403);
   });
 
   it('pods still work beside all of it (idp register + WAC)', async () => {
