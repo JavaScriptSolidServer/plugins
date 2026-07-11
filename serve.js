@@ -57,9 +57,9 @@ fs.mkdirSync(PODS, { recursive: true });
 
 const terminalToken = process.env.TERMINAL_TOKEN || crypto.randomBytes(16).toString('hex');
 
-// One hand-copied inventory feeding both the admin home and the dashboard —
-// a plugin can't enumerate its co-loaded siblings (the #463/#464 app-registry
-// finding), so this duplicate of the plugins array below can silently drift.
+// Hand-copied inventory for the admin home (phase-2; still on the pre-seam
+// path). The dashboard no longer needs this — it auto-discovers via
+// api.plugins (#610). admin/ will drop it too once it consumes the seam.
 const INVENTORY = [
   { id: 'relay', prefix: '/relay', description: 'nostr relay (ws)', probe: '/relay', kind: 'ws' },
   { id: 'webrtc', prefix: '/webrtc', description: 'WebRTC signaling (ws)', probe: '/webrtc', kind: 'ws' },
@@ -149,10 +149,15 @@ const fastify = createServer({
       id: 'dashboard',
       module: at('dashboard/plugin.js'),
       prefix: '/dashboard',
+      // Auto-discovers every plugin via api.plugins (#610); reaches the host
+      // via api.serverInfo (#601) — no hand-fed list, no loopbackUrl. Only the
+      // ws endpoints and the pay gate need a probe refinement.
       config: {
-        loopbackUrl: `http://127.0.0.1:${PORT}`,
-        // The shared INVENTORY minus itself (self-probes would recurse).
-        plugins: INVENTORY.filter((p) => p.id !== 'dashboard' && p.probe),
+        probes: {
+          relay: { kind: 'ws' }, webrtc: { kind: 'ws' }, terminal: { kind: 'ws' },
+          tunnel: { kind: 'ws' }, notifications: { kind: 'ws' },
+          pay: { probe: '/paid/demo', expect: [402] },
+        },
       },
     },
     {

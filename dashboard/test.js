@@ -1,14 +1,13 @@
-// Dashboard plugin over a real JSS from npm: boot ONE server carrying the
-// dashboard plus three real sibling plugins from this repo (rss, capability,
-// relay) and probe them through /dashboard/status.json — the operator's
-// hand-copied plugins list (there is no api.plugins registry to read;
-// #463/#464), anonymous <500-is-alive semantics, an expect-mismatch 'down'
-// row, and the ws-over-plain-HTTP simplification.
+// Dashboard plugin over a real JSS from npm (>= 0.0.218): boot ONE server
+// carrying the dashboard plus three real sibling plugins (rss, capability,
+// relay) and probe them through /dashboard/status.json. The dashboard
+// AUTO-DISCOVERS its siblings from api.plugins (#610) — no hand-copied list —
+// and reaches the host over loopback via api.serverInfo (#601) — no
+// loopbackUrl in config. config.probes only refines individual probes.
 //
-// Same probe-port-then-boot dance as rss/backup (the plugin needs the host
-// origin in config before listen — api.serverInfo finding), and ALL the
-// misconfiguration tests run FIRST because a failed second createServer
-// re-points JSS's process-global data root (AGENT.md footgun).
+// Misconfiguration tests (which fail a createServer) run FIRST: a failed
+// second createServer re-points JSS's process-global data root (AGENT.md
+// footgun), so the empty-server case runs LAST and closes itself.
 
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
@@ -27,59 +26,47 @@ describe('dashboard plugin', () => {
   after(async () => { if (jss) await jss.close(); });
 
   // ------------------------------------------------ validation (pre-boot)
+  //
+  // config.probes refinements are validated at activate; a bad one fails the
+  // boot. (There is no loopbackUrl to validate anymore — serverInfo supplies
+  // the origin.)
 
-  it('refuses to boot without config.loopbackUrl', async () => {
-    await assert.rejects(
-      startJss({ plugins: [{ id: 'dashboard', module: module_, prefix: '/dashboard' }] }),
-      /requires config\.loopbackUrl/,
-    );
-  });
-
-  it('rejects a probe path containing :// (probes never leave loopback)', async () => {
+  it('rejects a probe refinement containing :// (probes never leave loopback)', async () => {
     await assert.rejects(
       startJss({
         plugins: [{
           id: 'dashboard',
           module: module_,
           prefix: '/dashboard',
-          config: {
-            loopbackUrl: 'http://127.0.0.1:9',
-            plugins: [{ id: 'evil', probe: 'https://example.com/exfil' }],
-          },
+          config: { probes: { evil: { probe: 'https://example.com/exfil' } } },
         }],
       }),
       /probe must be a local path/,
     );
   });
 
-  it('rejects a probe path not starting with /', async () => {
+  it('rejects a probe refinement not starting with /', async () => {
     await assert.rejects(
       startJss({
         plugins: [{
           id: 'dashboard',
           module: module_,
           prefix: '/dashboard',
-          config: {
-            loopbackUrl: 'http://127.0.0.1:9',
-            plugins: [{ id: 'relative', probe: 'api/v1/instance' }],
-          },
+          config: { probes: { relative: { probe: 'api/v1/instance' } } },
         }],
       }),
       /probe must be a local path/,
     );
   });
 
-  it('rejects a probe that targets the dashboard itself (would recurse)', async () => {
+  it('rejects a probe refinement that targets the dashboard itself (would recurse)', async () => {
     await assert.rejects(
       startJss({
         plugins: [{
           id: 'dashboard',
           module: module_,
           prefix: '/dashboard',
-          config: {
-            loopbackUrl: 'http://127.0.0.1:9',
-            plugins: [{ id: 'ouroboros', probe: '/dashboard/status.json' }],
-          },
+          config: { probes: { ouroboros: { probe: '/dashboard/status.json' } } },
         }],
       }),
       /would recurse/,
@@ -88,7 +75,7 @@ describe('dashboard plugin', () => {
 
   // -------------------------------------------------- the long-lived boot
 
-  it('boots ONE JSS: dashboard + rss + capability + relay as probe targets', async () => {
+  it('boots ONE JSS and auto-discovers its siblings (no hand-fed list, no loopbackUrl)', async () => {
     const port = await probePort();
     base = `http://127.0.0.1:${port}`;
     jss = await startJss({
@@ -106,48 +93,42 @@ describe('dashboard plugin', () => {
           id: 'dashboard',
           module: module_,
           prefix: '/dashboard',
+          // NO config.plugins (auto-discovered) and NO loopbackUrl
+          // (serverInfo). Only per-plugin probe refinements:
           config: {
-            loopbackUrl: base,
-            // The operator's hand-copied registry — a duplicate of the very
-            // list above, because a plugin can't see its siblings (#463/#464).
-            plugins: [
-              // rss: anonymous GET /feed/atom is a 400 usage/guard answer —
-              // a 4xx from a living plugin counts as alive by default.
-              { id: 'rss', probe: '/feed/atom' },
-              // capability: /cap/issue only answers POST; anonymous GET is a
-              // 4xx — alive.
-              { id: 'capability', probe: '/cap/issue' },
-              // relay is a WebSocket endpoint: plain-HTTP GET, upgrade-refusal
-              // (or 4xx) counts as alive — the documented ws simplification.
-              { id: 'relay', probe: '/relay', kind: 'ws' },
-              // Nothing serves /ghost/health; the 4xx it draws is <500 (so
-              // "alive" by default), but expect: [200] declares that
-              // insufficient → demonstrates 'down'.
-              { id: 'ghost', probe: '/ghost/health', expect: [200] },
-            ],
+            probes: {
+              // rss: bare /feed isn't a clean liveness signal; /feed/atom
+              // gives a 400 usage/guard answer — a 4xx from a living plugin.
+              rss: { probe: '/feed/atom' },
+              // relay is a WebSocket endpoint (probe defaults to its /relay
+              // prefix); an upgrade-refusal to a plain GET counts as alive.
+              relay: { kind: 'ws' },
+              // capability: probe the POST-only /cap/issue and DECLARE
+              // expect [200]; its anonymous 4xx fails that → demonstrates
+              // 'down' with a real, loaded plugin.
+              capability: { probe: '/cap/issue', expect: [200] },
+            },
           },
         },
-        // A second mount with NO plugins list: must still boot and render.
-        { id: 'dashboard-empty', module: module_, prefix: '/emptyboard', config: { loopbackUrl: base } },
       ],
     });
+    assert.ok(jss.base);
   });
 
-  it('GET /dashboard/ is a self-contained HTML page naming every plugin', async () => {
+  it('GET /dashboard/ is a self-contained HTML page naming every discovered plugin', async () => {
     const res = await fetch(`${base}/dashboard/`);
     assert.strictEqual(res.status, 200);
     assert.match(res.headers.get('content-type'), /text\/html/);
     const html = await res.text();
-    for (const id of ['rss', 'capability', 'relay', 'ghost', 'server']) {
+    for (const id of ['rss', 'capability', 'relay', 'server']) {
       assert.ok(html.includes(`<td class="id">${id}</td>`), `page must list ${id}`);
     }
-    for (const probe of ['/feed/atom', '/cap/issue', '/relay', '/ghost/health']) {
+    for (const probe of ['/feed/atom', '/relay', '/cap/issue']) {
       assert.ok(html.includes(`<code>${probe}</code>`), `page must show probe ${probe}`);
     }
     assert.ok(html.includes('status.json'), 'page script polls status.json');
     assert.ok(!/src\s*=\s*"http/.test(html) && !/href\s*=\s*"http/.test(html),
       'page must be self-contained (no external assets)');
-    // The bare prefix serves the same page.
     const bare = await fetch(`${base}/dashboard`);
     assert.strictEqual(bare.status, 200);
     assert.match(bare.headers.get('content-type'), /text\/html/);
@@ -159,36 +140,30 @@ describe('dashboard plugin', () => {
     assert.match(res.headers.get('content-type'), /application\/json/);
     const body = await res.json();
 
-    // Envelope.
     assert.match(body.generated, /^\d{4}-\d\d-\d\dT/, 'generated is an ISO timestamp');
     assert.strictEqual(body.server.alive, true, `host probe: ${JSON.stringify(body.server)}`);
     assert.strictEqual(typeof body.server.status, 'number');
 
-    // One entry per declared plugin, in order.
-    assert.strictEqual(body.plugins.length, 4);
+    // Three discovered siblings — the dashboard filtered itself out.
+    assert.strictEqual(body.plugins.length, 3);
     const byId = Object.fromEntries(body.plugins.map((p) => [p.id, p]));
-
     for (const p of body.plugins) {
       assert.strictEqual(typeof p.latency_ms, 'number', `${p.id} latency_ms`);
       assert.strictEqual(typeof p.probe, 'string');
     }
 
-    // The three live siblings answered <500 anonymously → alive.
-    for (const id of ['rss', 'capability', 'relay']) {
-      assert.strictEqual(byId[id].alive, true, `${id} should be alive: ${JSON.stringify(byId[id])}`);
-      assert.ok(byId[id].status < 500, `${id} status <500, got ${byId[id].status}`);
-    }
-    // rss's anonymous /feed/atom is a 400 guard answer — alive, not 'down'.
-    assert.strictEqual(byId.rss.status, 400);
-    assert.notStrictEqual(byId.rss.state, 'down');
+    // relay (ws) and rss answered <500 anonymously → alive.
+    assert.strictEqual(byId.relay.alive, true, `relay: ${JSON.stringify(byId.relay)}`);
+    assert.strictEqual(byId.rss.alive, true, `rss: ${JSON.stringify(byId.rss)}`);
+    assert.strictEqual(byId.rss.status, 400, 'rss /feed/atom anon is a 400 guard answer');
 
-    // The expect-mismatch probe: something answered (a 4xx, <500 — which the
-    // DEFAULT rule would call alive) but expect [200] declares it down.
-    assert.strictEqual(typeof byId.ghost.status, 'number');
-    assert.ok(byId.ghost.status < 500 && byId.ghost.status !== 200,
-      `ghost draws a non-200 <500, got ${byId.ghost.status}`);
-    assert.strictEqual(byId.ghost.alive, false, `ghost: ${JSON.stringify(byId.ghost)}`);
-    assert.strictEqual(byId.ghost.state, 'down');
+    // capability answered a non-200 <500, which the DEFAULT rule would call
+    // alive — but its expect:[200] refinement declares that down.
+    assert.strictEqual(typeof byId.capability.status, 'number');
+    assert.ok(byId.capability.status < 500 && byId.capability.status !== 200,
+      `capability draws a non-200 <500, got ${byId.capability.status}`);
+    assert.strictEqual(byId.capability.alive, false, `capability: ${JSON.stringify(byId.capability)}`);
+    assert.strictEqual(byId.capability.state, 'down');
   });
 
   it('probes are live each request (no caching): two calls, fresh timestamps', async () => {
@@ -197,16 +172,25 @@ describe('dashboard plugin', () => {
     assert.notStrictEqual(a.generated, b.generated, 'each request re-probes');
   });
 
-  it('missing config.plugins → empty dashboard that still renders, with a note', async () => {
-    const page = await fetch(`${base}/emptyboard/`);
-    assert.strictEqual(page.status, 200);
-    const html = await page.text();
-    assert.ok(html.includes('No plugins declared'), 'empty dashboard explains itself');
+  // ---------------------------------------------- empty case (own server, last)
 
-    const res = await fetch(`${base}/emptyboard/status.json`);
-    assert.strictEqual(res.status, 200);
-    const body = await res.json();
-    assert.deepStrictEqual(body.plugins, []);
-    assert.strictEqual(body.server.alive, true);
+  it('with no other plugins loaded, renders an empty dashboard that explains itself', async () => {
+    const solo = await startJss({
+      plugins: [{ id: 'dashboard', module: module_, prefix: '/dashboard' }],
+    });
+    try {
+      const page = await fetch(`${solo.base}/dashboard/`);
+      assert.strictEqual(page.status, 200);
+      assert.ok((await page.text()).includes('No other plugins are loaded'),
+        'empty dashboard explains itself');
+
+      const res = await fetch(`${solo.base}/dashboard/status.json`);
+      assert.strictEqual(res.status, 200);
+      const bodyJson = await res.json();
+      assert.deepStrictEqual(bodyJson.plugins, []);
+      assert.strictEqual(bodyJson.server.alive, true);
+    } finally {
+      await solo.close();
+    }
   });
 });

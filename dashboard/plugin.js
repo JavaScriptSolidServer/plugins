@@ -1,34 +1,30 @@
 // Plugin status dashboard, as a #206 loader plugin.
 //
 //   plugins: [{ module: 'dashboard/plugin.js', prefix: '/dashboard',
-//               config: { loopbackUrl: 'http://127.0.0.1:3000',
-//                         plugins: [{ id: 'rss', probe: '/feed/atom' }, …] } }]
+//               config: { probes: { relay: { kind: 'ws' } } } }]   // all optional
 //
 //   GET /dashboard/            → self-contained HTML status page
 //   GET /dashboard/status.json → live probe results as JSON
 //
-// THE POINT: a plugin cannot enumerate its co-loaded siblings — the api has
-// no registry (no api.plugins, no api.serverInfo, nothing). So the operator
-// must hand this dashboard a DUPLICATE of the very plugins list they already
-// passed to createServer, and the two lists can silently drift. This plugin
-// is the first live consumer of the #463/#464 app-registry seam — see
-// README `## Findings`.
+// The dashboard AUTO-DISCOVERS every co-loaded plugin from `api.plugins`
+// (#610) — a read-only, frozen roster of { id, prefix, module } the loader
+// exposes — so there is no hand-maintained list to drift when a plugin is
+// added or removed. It reaches the host over loopback via `api.serverInfo()`
+// (#601), resolved per request, so no `loopbackUrl` need be configured
+// either. (Earlier this plugin required both a hand-copied `config.plugins`
+// array and `config.loopbackUrl`; both were the workarounds those two seams
+// removed — see README "Findings".)
 //
 // Probes are anonymous liveness checks of public surfaces: they carry NO
-// Authorization and go ONLY to loopbackUrl + a declared local path (never an
-// external URL — enforced at activate). By default any status < 500 counts
-// as alive: a 400/401/404 from a guard or a usage hint IS a living plugin
-// answering. An `expect: [200, …]` list narrows that per probe. Probes run
-// server-side, concurrently, with a per-probe timeout, and are NEVER cached:
-// every request to /status.json probes live (O(N) loopback fetches — see
-// README).
-//
-// kind: 'ws' is a documented simplification: a WebSocket endpoint is probed
-// with a plain HTTP GET, and the upgrade-refusal statuses (400/426) count as
-// "up". This proves the path is routed and answering, not that the socket
-// handshake works — an honest ws probe would need a real upgrade (the 'ws'
-// package is an allowed dep, but the HTTP probe keeps the plugin dep-free
-// and the caveat is documented in the README findings).
+// Authorization and go ONLY to the host's own loopback origin. By default
+// each plugin is probed at its OWN prefix and any status < 500 counts as
+// alive — a 400/401/404 from a guard is a living plugin answering. The
+// roster carries no health hints, so `config.probes` optionally refines a
+// per-plugin probe: `{ <id>: { probe?, expect?, kind? } }` — a different
+// path, an `expect: [200,…]` allowlist, or `kind: 'ws'` (a WebSocket
+// endpoint, where a 400/426 upgrade-refusal to a plain GET counts as up).
+// Probes run server-side, concurrently, with a per-probe timeout, and are
+// NEVER cached: every request re-probes (O(N) loopback fetches).
 
 const DEFAULT_TIMEOUT_MS = 3000;
 const DEFAULT_REFRESH_MS = 5000;
@@ -38,52 +34,64 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ESC[c]);
 
 export async function activate(api) {
   const prefix = api.prefix || '/dashboard';
-  const loopback = (api.config.loopbackUrl || '').replace(/\/$/, '');
-  if (!loopback) {
-    throw new Error(
-      'dashboard plugin requires config.loopbackUrl — the plugin api exposes '
-      + 'no server origin (the api.serverInfo finding, again); point it at the '
-      + 'host itself, e.g. http://127.0.0.1:3000',
-    );
-  }
   const timeoutMs = api.config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const refreshMs = api.config.refreshMs ?? DEFAULT_REFRESH_MS;
 
-  // ------------------------------------------------- validate declared list
-  //
-  // config.plugins is the operator's hand-copied registry (the finding).
-  // Missing → [] and the dashboard still renders, with a note.
-
-  const declared = api.config.plugins ?? [];
-  if (!Array.isArray(declared)) {
-    throw new Error('dashboard: config.plugins must be an array of { id, probe, expect?, kind? }');
+  // The callable loopback origin. Prefer an explicit override; otherwise ask
+  // the host (api.serverInfo, #601) at REQUEST time — before listen the port
+  // may be 0, and probes only ever run per request. Build host:port (the
+  // live bind), not baseUrl, since baseUrl may be a public idpIssuer URL the
+  // server can't call itself.
+  function loopbackOrigin() {
+    if (api.config.loopbackUrl) return String(api.config.loopbackUrl).replace(/\/$/, '');
+    const { protocol, host, port } = api.serverInfo();
+    const h = host.includes(':') ? `[${host}]` : host;
+    return `${protocol}://${h}:${port}`;
   }
-  const targets = declared.map((entry, i) => {
-    const where = `dashboard: config.plugins[${i}]`;
-    if (!entry || typeof entry !== 'object') throw new Error(`${where} must be an object`);
-    const { id, probe, expect, kind } = entry;
-    if (typeof id !== 'string' || !id) throw new Error(`${where} needs a non-empty string id`);
-    if (typeof probe !== 'string' || !probe.startsWith('/') || probe.includes('://')) {
-      throw new Error(
-        `${where}: probe must be a local path starting with '/' and containing no '://' `
-        + `(probes only ever go to loopbackUrl) — got ${JSON.stringify(probe)}`,
-      );
+
+  // Optional per-plugin probe refinements: { <id>: { probe?, expect?, kind? } }.
+  // Validated here so a refinement can never leave loopback or recurse into
+  // the dashboard's own routes.
+  const overrides = api.config.probes ?? {};
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) {
+    throw new Error('dashboard: config.probes must be an object keyed by plugin id');
+  }
+  for (const [id, ov] of Object.entries(overrides)) {
+    const where = `dashboard: probes[${JSON.stringify(id)}]`;
+    if (!ov || typeof ov !== 'object') throw new Error(`${where} must be an object`);
+    if (ov.probe !== undefined) {
+      if (typeof ov.probe !== 'string' || !ov.probe.startsWith('/') || ov.probe.includes('://')) {
+        throw new Error(`${where}.probe must be a local path starting with '/' and containing no '://' — got ${JSON.stringify(ov.probe)}`);
+      }
+      if (ov.probe === prefix || ov.probe.startsWith(`${prefix}/`)) {
+        throw new Error(`${where}.probe ${JSON.stringify(ov.probe)} targets the dashboard itself — would recurse`);
+      }
     }
-    if (probe === prefix || probe.startsWith(`${prefix}/`)) {
-      throw new Error(
-        `${where}: probe ${JSON.stringify(probe)} targets the dashboard itself — `
-        + 'probing /status.json from /status.json would recurse; point probes at other plugins',
-      );
+    if (ov.expect !== undefined
+        && (!Array.isArray(ov.expect) || ov.expect.length === 0 || !ov.expect.every(Number.isInteger))) {
+      throw new Error(`${where}.expect must be a non-empty array of integer HTTP statuses`);
     }
-    if (expect !== undefined
-        && (!Array.isArray(expect) || expect.length === 0 || !expect.every(Number.isInteger))) {
-      throw new Error(`${where}: expect must be a non-empty array of integer HTTP statuses`);
+    if (ov.kind !== undefined && ov.kind !== 'http' && ov.kind !== 'ws') {
+      throw new Error(`${where}.kind must be 'http' or 'ws'`);
     }
-    if (kind !== undefined && kind !== 'http' && kind !== 'ws') {
-      throw new Error(`${where}: kind must be 'http' or 'ws'`);
-    }
-    return { id, probe, expect: expect ?? null, kind: kind ?? 'http' };
-  });
+  }
+
+  // The targets: every loaded plugin EXCEPT this dashboard (identified by its
+  // own prefix), auto-discovered from api.plugins. Default probe = the
+  // plugin's own prefix; an override wins. A plugin with neither a prefix nor
+  // an override probe can't be health-checked, so it's skipped.
+  const targets = api.plugins
+    .filter((p) => p.id && p.prefix !== prefix)
+    .map((p) => {
+      const ov = overrides[p.id] ?? {};
+      return {
+        id: p.id,
+        probe: ov.probe ?? (p.prefix || null),
+        expect: ov.expect ?? null,
+        kind: ov.kind ?? 'http',
+      };
+    })
+    .filter((t) => t.probe);
 
   // ------------------------------------------------------------- the probes
 
@@ -92,7 +100,7 @@ export async function activate(api) {
     const started = performance.now();
     let status = null;
     try {
-      const res = await fetch(loopback + path, {
+      const res = await fetch(loopbackOrigin() + path, {
         redirect: 'manual',
         signal: AbortSignal.timeout(timeoutMs),
         headers: { accept: '*/*' }, // deliberately NO authorization
@@ -108,13 +116,13 @@ export async function activate(api) {
     if (status === null || status >= 500) return 'down'; // no answer, or the server erred
     if (target.expect) return target.expect.includes(status) ? 'up' : 'down';
     if (status < 400) return 'up';
-    // ws simplification: 400/426 are exactly what an upgrade-requiring
-    // endpoint says to a plain GET — that IS the healthy answer.
+    // ws refinement: 400/426 are exactly what an upgrade-requiring endpoint
+    // says to a plain GET — that IS the healthy answer.
     if (target.kind === 'ws' && (status === 400 || status === 426)) return 'up';
     return 'degraded'; // alive — a guard answered 4xx — but not plainly 2xx/3xx
   }
 
-  /** Probe the host and every declared plugin, concurrently, uncached. */
+  /** Probe the host and every discovered plugin, concurrently, uncached. */
   async function snapshot() {
     const [host, ...results] = await Promise.all([
       hit('/'), // the host itself: any non-5xx answer is a living server
@@ -148,7 +156,7 @@ export async function activate(api) {
   //
   // Self-contained: inline CSS, no external assets, no frameworks; one small
   // inline script polls status.json and rewrites the table cells. Rows are
-  // rendered server-side from the declared list so the page is readable
+  // rendered server-side from the discovered list so the page is readable
   // without JS (and testable with curl). Dark-mode via prefers-color-scheme.
 
   const row = (rid, id, probe, kind) => `
@@ -203,10 +211,9 @@ export async function activate(api) {
 ${row('row-server', 'server', '/', 'http')}${targets.map((t, i) => row(`row-${i}`, t.id, t.probe, t.kind)).join('')}
     </tbody>
   </table>
-${targets.length === 0 ? `  <p class="note">No plugins declared. Pass <code>config.plugins</code>
-  (an array of <code>{ id, probe, expect?, kind? }</code>) to this dashboard's
-  entry — the plugin api has no registry, so the dashboard cannot discover its
-  co-loaded siblings on its own (see the README findings, issues #463/#464).</p>
+${targets.length === 0 ? `  <p class="note">No other plugins are loaded. This dashboard
+  auto-discovers its co-loaded siblings via <code>api.plugins</code> (#610); load
+  another plugin and it appears here — no hand-maintained list to drift.</p>
 ` : ''}  <script>
     (function () {
       var url = ${JSON.stringify(`${prefix}/status.json`)};
@@ -257,8 +264,8 @@ ${targets.length === 0 ? `  <p class="note">No plugins declared. Pass <code>conf
   });
 
   api.log.info(
-    `dashboard: ${targets.length} declared plugin(s) at ${prefix}/ `
-    + `(hand-copied list — no api.plugins registry to read; #463/#464)`,
+    `dashboard: ${targets.length} plugin(s) at ${prefix}/ `
+    + `(auto-discovered via api.plugins; loopback via api.serverInfo)`,
   );
   // Stateless — nothing to tear down (probes are per-request, the refresh
   // timer lives in the client page).

@@ -13,7 +13,7 @@
     "@noble/curves": "^1.4.0"
   },
   "devDependencies": {
-    "javascript-solid-server": "^0.0.215",
+    "javascript-solid-server": "^0.0.218",
     "ws": "^8.18.0"
   }
 }

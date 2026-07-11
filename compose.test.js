@@ -128,15 +128,15 @@ describe('composition: every plugin on one server', () => {
           id: 'dashboard',
           module: at('dashboard/plugin.js'),
           prefix: '/dashboard',
+          // No hand-fed list and no loopbackUrl: the dashboard auto-discovers
+          // every plugin via api.plugins (#610) and reaches the host via
+          // api.serverInfo (#601). Only the WebSocket endpoints need a
+          // refinement so a plain-GET upgrade refusal reads as alive.
           config: {
-            loopbackUrl: base,
-            // A hand-copied slice of this very list — a plugin can't see its
-            // siblings (the #463/#464 app-registry finding).
-            plugins: [
-              { id: 'nip05', probe: '/nip05/nostr.json', expect: [200] },
-              { id: 'rss', probe: '/feed/atom', expect: [400] },
-              { id: 'relay', probe: '/relay', kind: 'ws' },
-            ],
+            probes: {
+              relay: { kind: 'ws' }, webrtc: { kind: 'ws' }, terminal: { kind: 'ws' },
+              tunnel: { kind: 'ws' }, notifications: { kind: 'ws' },
+            },
           },
         },
       ],
@@ -387,16 +387,25 @@ describe('composition: every plugin on one server', () => {
     assert.match(await res.text(), /process_uptime_seconds/);
   });
 
-  it('dashboard: the page names the declared plugins; status.json probes live', async () => {
+  it('dashboard: auto-discovers every plugin via api.plugins; status.json probes live', async () => {
     let res = await fetch(`${base}/dashboard/`);
     assert.strictEqual(res.status, 200);
     const page = await res.text();
-    for (const id of ['nip05', 'rss', 'relay']) assert.ok(page.includes(id), id);
+    // Auto-discovered, not a hand-fed three — a broad sample must appear.
+    for (const id of ['nip05', 'rss', 'relay', 's3', 'micropub', 'metrics']) {
+      assert.ok(page.includes(id), id);
+    }
     res = await fetch(`${base}/dashboard/status.json`);
     assert.strictEqual(res.status, 200);
     const status = await res.json();
     assert.strictEqual(status.server.alive, true);
-    assert.ok(status.plugins.every((p) => p.alive), JSON.stringify(status.plugins));
+    // Discovered ~every sibling (minus itself), far more than a curated list.
+    assert.ok(status.plugins.length >= 25, `discovered only ${status.plugins.length}`);
+    // The well-understood HTTP plugins answer <500 at their prefix → alive.
+    const byId = Object.fromEntries(status.plugins.map((p) => [p.id, p]));
+    for (const id of ['nip05', 'rss', 'mastodon', 's3', 'micropub', 'backup', 'metrics']) {
+      assert.strictEqual(byId[id]?.alive, true, `${id}: ${JSON.stringify(byId[id])}`);
+    }
   });
 
   it('pods still work beside all of it (idp register + WAC)', async () => {
