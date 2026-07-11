@@ -26,6 +26,13 @@ This is the plugin-zero method
 [#589](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer/pull/589))
 applied to JSS's own feature set.
 
+## Building more
+
+**[AGENT.md](./AGENT.md)** is the comprehensive guide for adding plugins —
+the api, the five reusable patterns, the gaps and their workarounds, a
+copy-this-plugin map, and the footguns. Read it, then `NOTES.md` (findings)
+and `ISSUES.md` (backlog).
+
 ## The rule
 
 A plugin directory may import:
