@@ -22,7 +22,7 @@ want it.
   with zero core changes. Seven of those are ports of bundled features;
   remoteStorage in particular still ships always-on in core and could
   move out-of-tree behind the loader.
-- Of the ~40 `plugin`-tagged backlog issues, **13 are built here**, 6
+- Of the ~40 `plugin`-tagged backlog issues, **14 are built here**, 7
   bundled features are ported, 5 shipped upstream during this line of work,
   2 more are unblocked, and **6 clusters are blocked on exactly four
   missing seams**. The rest are core-by-nature (a finding, not a gap).
@@ -199,9 +199,11 @@ probe-port-then-boot dance for the same reason.
 - **Per-route Fastify options** — `capability/` found `maxParamLength`
   (100) silently 404s long tokens in named params; wildcard routes are
   the workaround. Sharp when it bites.
-- **Response-header injection on core routes** — wanted twice
+- **Response-header injection on core routes** — wanted three times
   (notifications' `Updates-Via` discovery; micropub's
-  `<link rel="micropub">` endpoint discovery on the user's homepage).
+  `<link rel="micropub">` endpoint discovery on the user's homepage;
+  oembed's per-resource discovery `<link>`, whose in-HTML form is content
+  rewriting even a header hook couldn't do).
   Deliberately *not* asked for as a default-on hook: it's a bigger grant
   than route ownership. If ever, gate it: `capabilities: ['hooks']`.
 
@@ -262,8 +264,9 @@ isolation the default.
 ## The core/plugin line (#564, answered empirically)
 
 **A feature is plugin-able iff it OWNS its routes; it stays core iff it
-MODIFIES the pipeline of routes it doesn't own.** Six bundled features
-ported cleanly (relay, webrtc, terminal, tunnel, notifications — plus
+MODIFIES the pipeline of routes it doesn't own.** Seven bundled features
+ported (relay, webrtc, terminal, tunnel, notifications,
+remoteStorage — plus
 `pay/` as the deliberate counter-example: 402-gating LDP routes is
 pipeline modification, which is the definition of core). The migration
 list in #564 is right for every route-owning feature; the
@@ -285,15 +288,17 @@ hooks capability.
 
 If effort is scarce, this order maximizes unblocked value per unit cost:
 
-1. `api.serverInfo` (trivial; tidies ~10 plugins' config and every test
+1. `api.serverInfo` (trivial; tidies ~16 plugins' config and every test
    harness),
 2. `api.reservePath` (small-medium; makes four existing shims
-   self-contained and didweb *possible*),
+   self-contained and didweb *possible* — pair it with a webfinger link
+   registry for the shared-document case),
 3. `api.events.onResourceChange` (small; unlocks webhooks/WebSub/indexing
-   and makes search/sparql/matrix faithful),
-4. `api.authorize` (medium; the blocking seam for proxy ACLs and
-   capability semantics),
-5. the two loader bug fixes (anytime; small).
+   and makes search/sparql/matrix/jmap faithful),
+4. `api.authorize` (medium; the blocking seam for proxy ACLs, capability
+   semantics, and scheduling delivery),
+5. the five bug fixes (anytime; small — the non-atomic conditional write
+   is the one with real data-loss consequences).
 
 Everything else can wait until a real consumer shows up — this repo is the
 mechanism for finding those.
