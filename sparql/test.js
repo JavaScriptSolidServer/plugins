@@ -186,6 +186,46 @@ describe('sparql plugin', () => {
     assert.deepStrictEqual(rxBody.results.bindings.map((b) => b.name.value), ['harbor at sunset']);
   });
 
+  // --------------------------------------------------- ReDoS guards on REGEX
+
+  it('ReDoS guard: a normal case-insensitive REGEX filter still matches (no regression)', async () => {
+    const res = await sparql(`
+      PREFIX schema: <https://schema.org/>
+      SELECT ?name
+      WHERE { ?s schema:name ?name . FILTER(REGEX(?name, "BOAT", "i")) }
+    `, { token: alice.access_token, container: '/alice/photos/' });
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    assert.deepStrictEqual(body.results.bindings.map((b) => b.name.value), ['old fishing boat']);
+  });
+
+  it('ReDoS guard: a catastrophic REGEX pattern is rejected with 400, promptly (no hang)', async () => {
+    // `(a+)+$` is the classic catastrophic-backtracking shape. Without the
+    // guard, running it over a long crafted string pins the event loop; with
+    // it, the request returns a 400 at parse time. The test completing quickly
+    // (well under the node:test timeout) is itself the "no hang" proof.
+    const started = Date.now();
+    const res = await sparql(`
+      PREFIX schema: <https://schema.org/>
+      SELECT ?name
+      WHERE { ?s schema:name ?name . FILTER(REGEX(?name, "(a+)+$")) }
+    `, { token: alice.access_token, container: '/alice/photos/' });
+    assert.strictEqual(res.status, 400);
+    assert.match((await res.json()).error, /catastrophic REGEX/);
+    assert.ok(Date.now() - started < 5000, 'the guarded request must return promptly, not hang');
+  });
+
+  it('ReDoS guard: an over-length REGEX pattern is rejected with 400', async () => {
+    const huge = 'a'.repeat(600); // > default maxRegexLength (512)
+    const res = await sparql(`
+      PREFIX schema: <https://schema.org/>
+      SELECT ?name
+      WHERE { ?s schema:name ?name . FILTER(REGEX(?name, "${huge}")) }
+    `, { token: alice.access_token, container: '/alice/photos/' });
+    assert.strictEqual(res.status, 400);
+    assert.match((await res.json()).error, /too long/);
+  });
+
   it('predicate lists (;) and FILTER(=) find exactly one photo', async () => {
     const res = await sparql(`
       PREFIX schema: <https://schema.org/>

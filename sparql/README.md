@@ -27,6 +27,8 @@ plugins: [{
     // maxDepth: 3,                     // container recursion below the scope
     // maxResources: 200,               // loopback fetches per query
     // resultCap: 1000,                 // bindings cap even without LIMIT
+    // maxRegexLength: 512,             // reject FILTER(REGEX) patterns longer than this
+    // maxRegexInput: 10000,            // test a REGEX against at most this many chars
   },
 }]
 ```
@@ -296,3 +298,25 @@ that asserts exactly the invariants the host guarantees (see Findings 7).
    loudly above instead. (Also mildly convenient: the loader's wildcard
    `parseAs: 'buffer'` content-type parser passed `application/
    sparql-update` bodies through untouched — no parser gap this time.)
+9. **User-supplied `FILTER(REGEX(...))` is a ReDoS surface, mitigated by
+   bounding not by a real timeout.** The pattern is caller-controlled and
+   run with `RegExp.test` against strings the caller can plant in their own
+   pod, so a catastrophic-backtracking pattern like `(a+)+$` over a long
+   crafted string would pin Node's single event loop and hang the whole
+   server. Node has no built-in regex timeout and the import rule forbids a
+   new dep (no RE2), so the worst case is bounded honestly instead, in three
+   layers: (a) cap the **pattern length** (`config.maxRegexLength`, default
+   512) → 400; (b) cap the **input length** the pattern is tested against
+   (`config.maxRegexInput`, default 10 000 chars — oversized inputs are
+   truncated before `test`, so normal-length strings are unaffected), which
+   bounds the backtracking exponent × input; (c) a best-effort **static
+   heuristic** (`\(.*[+*].*\)[+*{]`) that rejects the obvious nested-unbounded-
+   quantifier shapes (`(a+)+`, `(a*)*`, `(a|b*)+`…) with a 400 before ever
+   compiling them. The guard runs at BOTH parse time (literal patterns) and
+   eval time (patterns bound from a variable, which are never seen at parse
+   time). This is deliberately conservative — it can over-reject and is not a
+   complete safe-regex analyzer — and the real bound is the two length caps;
+   the finding is that **without a host- or runtime-level regex timeout, a
+   plugin exposing user regex can only bound the worst case, not eliminate
+   it.** A genuine per-request CPU/time budget (or RE2) is the seam a core
+   implementation would want.

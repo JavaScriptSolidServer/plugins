@@ -53,7 +53,40 @@ const DEFAULT_RESULT_CAP = 1000; // bindings, even when LIMIT is higher/absent
 const MAX_QUERY_LENGTH = 20_000;
 const MAX_JOIN_ROWS = 100_000; // abort pathological joins
 
+// ReDoS guards for user-supplied FILTER(REGEX(...)) patterns. Node has no
+// built-in regex timeout and no new deps are allowed (no RE2), so the worst
+// case is bounded honestly instead: cap the PATTERN length, cap the length
+// of the INPUT the pattern is tested against (backtracking blows up as a
+// function of input length), and statically reject the obvious catastrophic
+// shapes before ever compiling/running them. Both caps are config-overridable
+// (config.maxRegexLength / config.maxRegexInput). See README ## Findings.
+const DEFAULT_MAX_REGEX_LENGTH = 512; // reject patterns longer than this
+const DEFAULT_MAX_REGEX_INPUT = 10_000; // regex tested against at most this many chars
+
+// Best-effort static heuristic for catastrophic backtracking: an unbounded
+// quantifier (+ or *) applied to a parenthesised group that itself contains
+// an unbounded quantifier — the classic (a+)+, (a*)*, (a+)*, (a|b*)+ shape.
+// This is intentionally conservative (it can over-reject, never a complete
+// safe-regex analyzer) and errs toward rejecting; the length caps above are
+// the real bound. Cheap on a length-capped pattern (O(n^2) at worst).
+const CATASTROPHIC_REGEX_RE = /\(.*[+*].*\)[+*{]/;
+
 class QueryError extends Error {}
+
+/**
+ * Reject a user-supplied REGEX pattern that is over-long or matches the
+ * catastrophic-backtracking heuristic, BEFORE it is compiled or run. Throws
+ * QueryError (→ 400) so a normal filter still compiles and a pathological one
+ * is refused promptly instead of pinning the event loop.
+ */
+function assertSafeRegexPattern(pattern, maxRegexLength) {
+  if (pattern.length > maxRegexLength) {
+    throw new QueryError(`REGEX pattern too long (max ${maxRegexLength} chars)`);
+  }
+  if (CATASTROPHIC_REGEX_RE.test(pattern)) {
+    throw new QueryError('potentially catastrophic REGEX rejected (nested unbounded quantifier)');
+  }
+}
 
 // --------------------------------------------------------------- tokenizer
 
@@ -229,8 +262,9 @@ function parseTriplesGroup(r, sink) {
   if (r.isPunc(r.peek(), '.')) r.next();
 }
 
-function parseQuery(src) {
+function parseQuery(src, opts = {}) {
   if (src.length > MAX_QUERY_LENGTH) throw new QueryError('query too long');
+  const maxRegexLength = opts.maxRegexLength ?? DEFAULT_MAX_REGEX_LENGTH;
   const r = reader(src);
   r.parsePrologue();
 
@@ -280,6 +314,7 @@ function parseQuery(src) {
       r.expectPunc(')');
       const constraint = { kind: fn.toLowerCase(), a, b, flags };
       if (fn === 'REGEX' && b.t === 'lit') {
+        assertSafeRegexPattern(b.v, maxRegexLength); // ReDoS guard (literal pattern)
         try { constraint.re = new RegExp(b.v, flags); }
         catch (e) { throw new QueryError(`bad REGEX pattern: ${e.message}`); }
       }
@@ -613,7 +648,9 @@ function compare(x, y, op) {
   }
 }
 
-function applyFilter(f, row) {
+function applyFilter(f, row, opts = {}) {
+  const maxRegexLength = opts.maxRegexLength ?? DEFAULT_MAX_REGEX_LENGTH;
+  const maxRegexInput = opts.maxRegexInput ?? DEFAULT_MAX_REGEX_INPUT;
   const A = f.a.t === 'var' ? row[f.a.v] : f.a;
   const B = f.b.t === 'var' ? row[f.b.v] : f.b;
   if (!A || !B) return false; // unbound → filter fails (SPARQL error semantics)
@@ -626,10 +663,19 @@ function applyFilter(f, row) {
     case 'contains':
       return a.includes(b);
     case 'regex': {
-      try {
-        const re = f.re ?? new RegExp(b, f.flags);
-        return re.test(a);
-      } catch { return false; }
+      let re = f.re;
+      if (!re) {
+        // Pattern came from a variable binding (not a compile-time literal),
+        // so it was never vetted at parse time — guard it here before it can
+        // backtrack. A rejected/invalid dynamic pattern fails the filter.
+        try { assertSafeRegexPattern(b, maxRegexLength); } catch { return false; }
+        try { re = new RegExp(b, f.flags); } catch { return false; }
+      }
+      // Cap the INPUT length: catastrophic backtracking grows with input
+      // size, so bound it. Normal-length strings (< maxRegexInput) are
+      // unaffected; only oversized inputs are truncated before testing.
+      const input = a.length > maxRegexInput ? a.slice(0, maxRegexInput) : a;
+      try { return re.test(input); } catch { return false; }
     }
     default:
       return false;
@@ -671,6 +717,8 @@ export async function activate(api) {
   const maxDepth = api.config.maxDepth ?? DEFAULT_MAX_DEPTH;
   const maxResources = api.config.maxResources ?? DEFAULT_MAX_RESOURCES;
   const resultCap = api.config.resultCap ?? DEFAULT_RESULT_CAP;
+  const maxRegexLength = api.config.maxRegexLength ?? DEFAULT_MAX_REGEX_LENGTH;
+  const maxRegexInput = api.config.maxRegexInput ?? DEFAULT_MAX_REGEX_INPUT;
   const origin = new URL(baseUrl).origin;
 
   /** Map any loopback-origin IRI back to the public origin. */
@@ -921,7 +969,7 @@ export async function activate(api) {
       subset: 'SELECT [DISTINCT] (?vars|*) [FROM <iri>] WHERE { BGP, FILTER(cmp|CONTAINS|REGEX) } [LIMIT n]',
       updateSubset: 'INSERT DATA / DELETE DATA with ground triples; target via GRAPH <iri> {} or ?resource=/path',
       scope: 'FROM <iri> | ?container=/path/ | config.defaultContainer',
-      limits: { maxDepth, maxResources, resultCap },
+      limits: { maxDepth, maxResources, resultCap, maxRegexLength, maxRegexInput },
     });
   });
 
@@ -939,7 +987,7 @@ export async function activate(api) {
 
     let query;
     try {
-      query = parseQuery(body);
+      query = parseQuery(body, { maxRegexLength });
     } catch (err) {
       if (err instanceof QueryError) return reply.code(400).send({ error: err.message });
       throw err;
@@ -978,7 +1026,7 @@ export async function activate(api) {
     let rows;
     try {
       rows = evalBGP(triples, query.patterns)
-        .filter((row) => query.filters.every((f) => applyFilter(f, row)));
+        .filter((row) => query.filters.every((f) => applyFilter(f, row, { maxRegexLength, maxRegexInput })));
     } catch (err) {
       if (err instanceof QueryError) return reply.code(400).send({ error: err.message });
       throw err;
