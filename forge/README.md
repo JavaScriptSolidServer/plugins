@@ -40,6 +40,8 @@ plugins: [{ id: 'forge', module: 'forge/plugin.js', prefix: '/forge',
               cspConnect: [],           // extra connect-src origins (e.g. external Solid IdPs)
               chain: 'tbtc4',           // anchoring chain (testnet4); 'btc' is REFUSED …
               allowMainnet: false,      // … unless this is explicitly true (see Finding 18)
+              announceRelays: [],       // NIP-34 relays (opt-in); empty => emission OFF
+              announceKey: undefined,   // optional 32-byte hex nostr privkey; else generated once
             } }]
 ```
 
@@ -484,6 +486,148 @@ identifiers (`btc`/`mainnet`/`bitcoin`) are **refused at activate** —
 loudly, naming the stakes — unless `config.allowMainnet: true`; unknown
 chains are refused too (no address is better than a wrong-network
 address someone might fund).
+
+## Nostr discovery (NIP-34)
+
+A repo lives on **many** forges (mirrors); the Blocktrails mark (a
+Bitcoin tx) is the **source of truth**; [NIP-34](https://github.com/nostr-protocol/nips/blob/master/34.md)
+Nostr events are the **discovery + notification layer**. The Anchors
+work above records the source of truth; this layer makes it *findable*
+and **syncable to a precise commit**. The forge publishes two correlated
+NIP-34 events, signed by the SAME stable per-instance key, to the
+operator-configured relays:
+
+- a **kind-30617 "repo announcement"** — the repo's name, description,
+  clone/web **mirror URLs**, relay set, maintainers, and (when anchored)
+  its Bitcoin anchor. [ngit](https://gitworkshop.dev/) (a kind-30617
+  viewer) then shows the repo.
+- a **kind-30618 "repo state"** — the repo's refs (`refs/heads/<branch> →
+  <commit-sha>` + the symbolic `HEAD`), so a subscriber can sync to an
+  exact commit. This is what enables **commit-precise sync**:
+  [nostr-git-sync](https://github.com/) reads the `kind:30618` state and
+  `git checkout <commit>` to the announced tip. Both events share the
+  same `d` = `<owner>/<name>`, so a consumer correlates them.
+
+### The announce identity
+
+A stable per-instance Nostr key. `config.announceKey` (32-byte hex
+privkey) wins if set; otherwise one is generated **once** and persisted
+at `pluginDir/announce-key` (mode `0600`), so the forge keeps one
+identity across restarts. Its `npub`-short is logged at boot. The
+announce **pubkey** is the x-only 32-byte schnorr key (`event.pubkey`).
+
+### Opt-in, never always-on
+
+`config.announceRelays` is an array of `wss://` relay URLs. **Empty or
+unset ⇒ emission is DISABLED** (a logged no-op) — relays are never
+hardcoded always-on; the operator opts in. A reasonable ngit-compatible
+set to opt into:
+
+```js
+announceRelays: [
+  'wss://relay.damus.io',
+  'wss://nos.lol',
+  'wss://relay.nostr.band',
+]
+```
+
+### The kind-30617 event shape
+
+`buildRepoEvent(owner, name)` returns a signed event (NIP-01: `id =
+sha256` of the canonical `[0,pubkey,created_at,kind,tags,content]`
+serialization, `sig =` schnorr over the `id`). Tags:
+
+| tag | value | when |
+|-----|-------|------|
+| `d` | `<owner>/<name>` | always (the NIP-34 repo id) |
+| `name` | `<name>` | always |
+| `description` | first line of the repo `description`/README | always (also the `content`) |
+| `web` | `<origin><prefix>/<owner>/<name>` | always (browse mirror URL) |
+| `clone` | `<origin><prefix>/<owner>/<name>.git` | always (clone mirror URL) |
+| `relays` | the configured relay URLs | when `announceRelays` set |
+| `maintainers` | `<owner>` | nostr-owned repos (owner **is** the hex pubkey) |
+| `r` | `<origin><prefix>/<owner>/<name>/blocktrails.json` | when anchored |
+| `anchor` | `[<chain>, <genesis-txid>]` | when anchored |
+
+The last two tie the discovery event back to the Bitcoin source of
+truth: `r` hands a consumer the CORS-readable, verifier-compatible trail
+doc, and the custom `anchor` tag carries the **chain + genesis txid** (a
+marked mark 0 — marks are a linear spend chain, so a marked genesis is
+the on-chain root). `created_at` is `Math.floor(Date.now()/1000)`
+(normal plugin runtime).
+
+### The kind-30618 event shape (repo state)
+
+`buildStateEvent(owner, name)` returns a signed **kind-30618** event
+(same NIP-01 id/sig helper, same announce key). It is a *replaceable*
+event (NIP-33) keyed by the **same `d`** as the 30617, so a consumer
+correlates the announcement with its state. It carries the repo's refs,
+read straight from the bare repo (`symbolic-ref HEAD` for the default
+branch, `for-each-ref refs/heads` for each head's full commit sha):
+
+| tag | value | when |
+|-----|-------|------|
+| `d` | `<owner>/<name>` | always (same repo id as the 30617) |
+| `refs/heads/<branch>` | `<full-commit-sha>` | one per local head (default branch first) |
+| `HEAD` | `ref: refs/heads/<defaultBranch>` | always (the symbolic default) |
+| `r` | `<origin><prefix>/<owner>/<name>/blocktrails.json` | when anchored |
+| `anchor` | `[<chain>, <genesis-txid>]` | when anchored |
+
+`content` is **empty** (per the state-event convention). Each
+`refs/heads/<branch>` tag hands a subscriber a **precise commit** to
+check out (nostr-git-sync's `kind:30618` → `git checkout <commit>`).
+When the repo is anchored, the state event carries the SAME `anchor`
+(chain + genesis txid) and `r` tags as the 30617 — so a subscriber can
+**require Bitcoin-anchored state** (verify the txid on-chain) before
+pulling the announced commit.
+
+A tip change is announced by either **(a) anchoring** (a mark flipping to
+`marked`) or **(b) calling the announce endpoint** — there is no
+filesystem watcher (git over the forge is shadowed by core `--git` on the
+live box, so pushes may not flow through the forge; the reliable triggers
+are anchor + the manual endpoint).
+
+### Publishing + triggers
+
+`publishEvent(event)` opens a `ws` WebSocket to each relay, sends
+`["EVENT", event]`, and waits (bounded ~5 s per relay) for the relay's
+`["OK", <id>, true|false, …]`, returning `{relay, ok, error?}[]`. A
+single relay failing never throws; the `ws` client is loaded lazily
+(only when a publish actually happens), so activation never depends on
+it and the no-relays path never touches it.
+
+Every announce emits **both** events (30617 then 30618) to the relays.
+
+- **Auto on anchor**: when a mark flips to `marked` (the `.../txo`
+  handler), the forge fire-and-forgets an announcement **with** the
+  anchor tags — the 30617 AND the 30618 (so the anchored state carries the
+  Bitcoin txid) — the txo response never blocks on relays.
+- **Manual**: `POST <prefix>/api/repos/<o>/<n>/announce` (owner-only,
+  same auth as marks/labels) builds + publishes both and returns
+  `{ published, event: {id, kind, tags} (30617), state: {id, kind, tags}
+  (30618), relays: [{relay, ok}], stateRelays: [{relay, ok}] }`. With no
+  relays configured it is a clear `200` no-op (`published: false`, both
+  events still returned for inspection) so callers need no live relay.
+- **Read-back**: `GET <prefix>/api/repos/<o>/<n>/nostr` returns the
+  announce `pubkey`/`npub`, the relay set, and the freshly built signed
+  `event` (30617) **and** `state` (30618) (also as `events: [30617,
+  30618]`) — inspect the exact shapes, including the commit-precise refs,
+  without a relay.
+
+### Who signs — forge instance key, not the maintainer (a Finding)
+
+The forge signs with its **own instance key**, not the maintainer's
+nostr key. For a *mirror announcement* that is the honest claim — "this
+instance hosts these clone URLs, anchored to this tx" — and it needs no
+custody of the maintainer's key. The `maintainers` tag still names the
+maintainer's pubkey (for nostr-owned repos the owner **is** that hex
+pubkey), so a canonical **maintainer-signed** 30617 can supersede the
+forge's mirror announcement in any viewer that prefers the maintainer.
+This mirrors the anchoring custody posture (Finding 18): the
+forge-instance key is a POC-grade signer for a discovery claim, and the
+principled upgrade is the same one — the maintainer signs client-side
+(NIP-07/xlogin) and the forge only relays. Until then, forge-signed
+mirror announcements are a sound, clearly-scoped discovery layer.
 
 ## Nostr agents (tier 2.5)
 
@@ -1061,3 +1205,37 @@ the `authFetch` PUT is same-origin (`connect-src 'self'` already admits
 it). The one seam this still wants is the same `api.podOf` ask from
 Finding 10 — a did:nostr key with provisioned storage could take this
 exact client-write path and the hosted asymmetry would finally vanish.
+
+### 22. The forge is a NODE, not a home — storage + anchor + nostr discovery, three separable layers
+
+Three tiers stack into a coherent role: the forge **hosts** the bytes
+(tier 1 git), **anchors** their history to Bitcoin (tier 3.5 marks — the
+source of truth), and now **announces** them over Nostr (NIP-34 30617
+discovery + 30618 repo-state — the latter carries the refs so a
+subscriber syncs to a precise commit, anchored to the same Bitcoin txid).
+The load-bearing idea is that these are *separable*
+and a repo is not owned by any one forge: the same repo lives on many
+mirrors, each a node that hosts a clone URL and points at the one shared
+anchor. The `clone`/`web` tags carry *this* node's mirror URLs; the
+`anchor` tag carries the mirror-independent Bitcoin root; a viewer that
+sees two forges announce the same `d`/`anchor` learns they are mirrors of
+one repo. So the forge is deliberately a replaceable node in a
+mirror-set, not the repo's home — losing one node loses a mirror, not the
+project.
+
+**Who signs the announcement** is the one real custody choice, and it is
+the same shape as the anchoring one (Finding 18). The forge signs with a
+**forge-instance key** (persisted `0600`, POC custody), not the
+maintainer's nostr key. For a *mirror announcement* that is the honest
+claim and needs no maintainer-key custody: the event asserts "this node
+hosts these URLs, anchored here," which is exactly what the node is
+entitled to say. The `maintainers` tag still names the maintainer's
+pubkey (for nostr-owned repos the owner **is** that hex pubkey), leaving
+room for a canonical **maintainer-signed** 30617 to supersede the
+mirror's in any viewer that prefers it. The principled upgrade is,
+again, client-side signing (NIP-07/xlogin) with the forge as pure relay —
+at which point the forge signs nothing and this custody note dissolves,
+just as Finding 18's does for the trail key. Until then a forge-signed
+mirror announcement is a sound, clearly-scoped discovery layer, and
+keeping emission **opt-in** (`config.announceRelays`, empty ⇒ off) means
+a node broadcasts to the wider network only when its operator says so.

@@ -40,6 +40,8 @@
 //                 POST api/repos/<o>/<n>/marks/enable        (owner: genesis mark)
 //                 POST api/repos/<o>/<n>/marks/<i>/txo       (owner: record on-chain txo)
 //                 GET  <prefix>/<owner>/<name>/blocktrails.json  (CORS-readable trail doc)
+//   nostr         POST api/repos/<o>/<n>/announce    (owner: publish NIP-34 30617 + 30618 to relays)
+//                 GET  api/repos/<o>/<n>/nostr        (the signed 30617 + 30618 that WOULD be published)
 //   fork          POST <prefix>/api/repos/<o>/<n>/fork
 //   push tokens   <prefix>/api/token                 (POST, any getAgent credential)
 //   hosted words  <prefix>/api/hosted/<hex>/<uuid>   (GET public, DELETE author-only)
@@ -126,7 +128,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { secp256k1 } from '@noble/curves/secp256k1';
+import { schnorr, secp256k1 } from '@noble/curves/secp256k1';
 
 const execFileP = promisify(execFile);
 
@@ -1483,6 +1485,218 @@ export async function activate(api) {
   /** recordTip as a fire-safe hook: log, never throw into the caller. */
   const recordTipSafe = (owner, name) => recordTip(owner, name)
     .catch((err) => api.log.warn(`forge: recordTip ${owner}/${name} failed: ${err.message}`));
+
+  // ------------------------------------------ nostr discovery (NIP-34)
+  // A repo lives on many forges (mirrors); the Blocktrails mark (a Bitcoin
+  // tx) is the source of truth; Nostr NIP-34 events are the discovery +
+  // notification layer. This forge PUBLISHES a kind-30617 "repo
+  // announcement" (name, description, clone/web mirror URLs, relays,
+  // maintainers, and — when anchored — the blocktrails.json + genesis txid)
+  // signed by a stable per-instance forge key, to the operator-configured
+  // relays. ngit (a kind-30617 viewer) then shows the repo.
+  //
+  // WHO SIGNS: the forge signs with a FORGE-INSTANCE key, not the
+  // maintainer's own nostr key (README Finding). For a mirror announcement
+  // that is the honest claim — "this instance hosts these clone URLs" — and
+  // it needs no custody of the maintainer's key; the `maintainers` tag still
+  // names the maintainer's pubkey (for nostr-owned repos, the owner IS that
+  // hex pubkey) so a canonical maintainer-signed announcement can supersede
+  // it. Testnet/POC posture, same as the anchor key (also forge-held).
+
+  // Announce identity: config.announceKey (32-byte hex) wins; else a key
+  // persisted at pluginDir/announce-key (0600), generated once. Stable
+  // across restarts so the forge keeps one nostr identity.
+  const announceKeyFile = path.join(api.storage.pluginDir(), 'announce-key');
+  let announceSk;
+  if (typeof api.config.announceKey === 'string' && NOSTR_HEX.test(api.config.announceKey.toLowerCase())) {
+    announceSk = api.config.announceKey.toLowerCase();
+  } else {
+    try {
+      const onDisk = fs.readFileSync(announceKeyFile, 'utf8').trim();
+      announceSk = NOSTR_HEX.test(onDisk) ? onDisk : null;
+    } catch { announceSk = null; }
+    if (!announceSk) {
+      announceSk = Buffer.from(schnorr.utils.randomPrivateKey()).toString('hex');
+      fs.writeFileSync(announceKeyFile, `${announceSk}\n`, { mode: 0o600 });
+    }
+  }
+  const announcePubkey = Buffer.from(schnorr.getPublicKey(announceSk)).toString('hex');
+
+  // config.announceRelays: opt-in list of ws(s):// relay URLs. Empty/unset
+  // => emission DISABLED (a documented no-op; relays are NEVER hardcoded
+  // always-on — the operator opts in, see the README ngit relay suggestion).
+  const announceRelays = (Array.isArray(api.config.announceRelays) ? api.config.announceRelays : [])
+    .filter((r) => typeof r === 'string' && /^wss?:\/\/[^\s;'"]+$/i.test(r));
+  const NOSTR_RELAY_TIMEOUT_MS = 5000;
+
+  /**
+   * A signed NIP-01 event over the announce key: id = sha256 of the
+   * canonical serialize [0,pubkey,created_at,kind,tags,content]; sig =
+   * schnorr(id). Runtime Date.now() is fine here (plugin runtime, not a
+   * workflow script).
+   */
+  function signAnnounceEvent({ kind, tags, content }) {
+    const ev = { pubkey: announcePubkey, created_at: Math.floor(Date.now() / 1000), kind, tags, content };
+    ev.id = crypto.createHash('sha256')
+      .update(JSON.stringify([0, ev.pubkey, ev.created_at, ev.kind, ev.tags, ev.content]), 'utf8')
+      .digest('hex');
+    ev.sig = Buffer.from(schnorr.sign(ev.id, announceSk)).toString('hex');
+    return ev;
+  }
+
+  /**
+   * buildRepoEvent(owner, name) -> a signed kind-30617 NIP-34 repo
+   * announcement. Tags: d (repo id), name, description, web, clone, relays
+   * (when configured), maintainers (nostr-owned repos: owner IS the hex
+   * pubkey), and — when the repo is anchored (a marks file with a 'marked'
+   * mark) — r (the blocktrails.json verification doc) + a custom anchor tag
+   * ['anchor', <chain>, <genesis-txid>] pointing at the Bitcoin
+   * source-of-truth. content = the description.
+   */
+  async function buildRepoEvent(owner, name) {
+    const summary = await repoSummary(owner, name);
+    const description = String(summary.description || '').slice(0, DESCRIPTION_CAP);
+    const base = `${publicOrigin()}${prefix}/${owner}/${name}`;
+    const tags = [
+      ['d', `${owner}/${name}`],
+      ['name', name],
+      ['description', description],
+      ['web', base],
+      ['clone', `${base}.git`],
+    ];
+    if (announceRelays.length) tags.push(['relays', ...announceRelays]);
+    if (NOSTR_HEX.test(owner)) tags.push(['maintainers', owner]); // owner IS the pubkey
+    const trail = loadTrail(owner, name);
+    // Marks are recorded strictly in order (N spends N-1), so a marked mark 0
+    // IS the genesis anchor — the Bitcoin tx a consumer treats as truth.
+    const genesis = trail && trail.marks[0];
+    if (genesis && genesis.status === 'marked') {
+      tags.push(['r', `${base}/blocktrails.json`]);
+      tags.push(['anchor', trail.chain, genesis.txid]);
+    }
+    return signAnnounceEvent({ kind: 30617, tags, content: description });
+  }
+
+  /**
+   * buildStateEvent(owner, name) -> a signed kind-30618 NIP-34 repo STATE
+   * event. Replaceable (NIP-33), keyed by the SAME d = `<owner>/<name>` as
+   * the 30617, so a consumer correlates announcement and state. Carries the
+   * repo's refs so a subscriber (e.g. nostr-git-sync) can `git checkout` a
+   * precise commit:
+   *   - one ['refs/heads/<branch>', '<full-sha>'] tag PER local head (the
+   *     default branch always present when the repo is non-empty)
+   *   - ['HEAD', 'ref: refs/heads/<defaultBranch>'] (the symbolic default)
+   *   - when anchored (marks file with a 'marked' genesis) the SAME
+   *     ['anchor', <chain>, <genesis-txid>] + ['r', <blocktrails.json url>]
+   *     as the 30617 — so a subscriber can require Bitcoin-anchored state
+   *     before pulling.
+   * content is '' (empty, per the state-event convention). Signed with the
+   * SAME announce key as the 30617.
+   */
+  async function buildStateEvent(owner, name) {
+    const dir = repoDirOf(owner, name);
+    const branch = await defaultBranch(dir);
+    const base = `${publicOrigin()}${prefix}/${owner}/${name}`;
+    const tags = [['d', `${owner}/${name}`]];
+    // Every local head with its FULL commit sha (rev-parse-precise). Empty
+    // repo => no head tags; the HEAD tag still names the default branch.
+    let heads = [];
+    try {
+      const out = await gitText(dir, ['for-each-ref', '--format=%(refname)%00%(objectname)', 'refs/heads']);
+      heads = out.split('\n').filter(Boolean).map((l) => l.split('\0'));
+    } catch { /* empty/bare-only repo has no heads yet */ }
+    // Default branch first (the ref a consumer treats as the tip), then the rest.
+    heads.sort((a, b) => (a[0] === `refs/heads/${branch}` ? -1 : b[0] === `refs/heads/${branch}` ? 1 : a[0].localeCompare(b[0])));
+    for (const [refname, sha] of heads) tags.push([refname, sha]);
+    tags.push(['HEAD', `ref: refs/heads/${branch}`]);
+    const trail = loadTrail(owner, name);
+    const genesis = trail && trail.marks[0];
+    if (genesis && genesis.status === 'marked') {
+      tags.push(['r', `${base}/blocktrails.json`]);
+      tags.push(['anchor', trail.chain, genesis.txid]);
+    }
+    return signAnnounceEvent({ kind: 30618, tags, content: '' });
+  }
+
+  // ws (the WebSocket client) is loaded LAZILY, only when a publish actually
+  // happens — emission is opt-in, so the common (no-relays) path never
+  // touches it and activation never depends on it.
+  let WebSocketImpl = null;
+  async function getWebSocket() {
+    if (WebSocketImpl) return WebSocketImpl;
+    const mod = await import('ws');
+    WebSocketImpl = mod.default;
+    return WebSocketImpl;
+  }
+
+  /** Publish one event to one relay: send ["EVENT",e], await the relay's
+   *  ["OK",id,ok,reason]. Bounded ~5s; never throws — resolves a result. */
+  function publishToRelay(WS, event, relay, timeoutMs) {
+    return new Promise((resolve) => {
+      let settled = false;
+      let ws;
+      const done = (r) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { if (ws) ws.close(); } catch { /* already closing */ }
+        resolve(r);
+      };
+      const timer = setTimeout(() => done({ relay, ok: false, error: 'timeout' }), timeoutMs);
+      try { ws = new WS(relay); } catch (err) { return done({ relay, ok: false, error: err.message }); }
+      ws.on('open', () => {
+        try { ws.send(JSON.stringify(['EVENT', event])); } catch (err) { done({ relay, ok: false, error: err.message }); }
+      });
+      ws.on('message', (data) => {
+        let msg;
+        try { msg = JSON.parse(data.toString()); } catch { return; }
+        if (Array.isArray(msg) && msg[0] === 'OK' && msg[1] === event.id) {
+          done(msg[2] ? { relay, ok: true } : { relay, ok: false, error: String(msg[3] ?? 'rejected') });
+        }
+      });
+      ws.on('error', (err) => done({ relay, ok: false, error: err.message }));
+      ws.on('close', () => done({ relay, ok: false, error: 'closed before OK' }));
+    });
+  }
+
+  /** Publish to every configured relay in parallel. Returns per-relay
+   *  {relay, ok, error?}[]; a single relay failing never rejects the whole. */
+  async function publishEvent(event, relays = announceRelays, timeoutMs = NOSTR_RELAY_TIMEOUT_MS) {
+    if (!relays.length) return [];
+    const WS = await getWebSocket();
+    return Promise.all(relays.map((relay) => publishToRelay(WS, event, relay, timeoutMs)));
+  }
+
+  /**
+   * Build + publish BOTH NIP-34 events for one repo: the 30617 announcement
+   * (discovery: clone/web URLs, anchor) AND the 30618 repo-state (the refs a
+   * subscriber checks out). Returns both. `event`/`relays` stay the 30617
+   * (backward-compat); `state`/`stateRelays` are the 30618; `events` lists
+   * both in emission order (30617 then 30618).
+   */
+  async function announceRepo(owner, name) {
+    if (!announceRelays.length) return { published: false, event: null, state: null, events: [], relays: [], stateRelays: [] };
+    const event = await buildRepoEvent(owner, name);
+    const state = await buildStateEvent(owner, name);
+    const relays = await publishEvent(event);
+    const stateRelays = await publishEvent(state);
+    return { published: true, event, state, events: [event, state], relays, stateRelays };
+  }
+
+  /** announceRepo as a fire-safe hook: log the tally, never throw. */
+  const announceRepoSafe = (owner, name) => announceRepo(owner, name)
+    .then((r) => {
+      if (r.published) {
+        api.log.info(`forge: announced ${owner}/${name} (NIP-34 30617 ${r.event.id.slice(0, 8)}… + 30618 state ${r.state.id.slice(0, 8)}…) to `
+          + `${r.relays.filter((x) => x.ok).length}/${r.relays.length} relay(s)`);
+      }
+    })
+    .catch((err) => api.log.warn(`forge: announce ${owner}/${name} failed: ${err.message}`));
+
+  api.log.info(`forge: nostr announce identity ${npubShort(announcePubkey)} (${announcePubkey.slice(0, 8)}…) — `
+    + (announceRelays.length
+      ? `NIP-34 emission to ${announceRelays.length} relay(s)`
+      : 'emission DISABLED (set config.announceRelays to opt in)'));
 
   // ------------------------------------------------- labels model (polish)
   // The per-repo label SET lives in the repo's issues index file
@@ -3986,6 +4200,11 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
       Object.assign(mark, { txid, vout: p.vout, amount: p.amount, status: 'marked', markedAt: Math.floor(Date.now() / 1000) });
       saveTrail(owner, name, trail);
       api.log.info(`forge: mark #${mark.index} of ${owner}/${name} recorded as ${txid.slice(0, 10)}…:${p.vout} (claim recorded, not verified)`);
+      // Discovery layer (NIP-34): a mark flipping to 'marked' means the repo
+      // now has a Bitcoin anchor — announce it (WITH its anchor tags) so ngit
+      // and relays learn the source-of-truth. Fire-and-forget: a no-op when
+      // no relays are configured, and never blocks the txo response.
+      announceRepoSafe(owner, name);
       return sendJson(reply, 200, { index: mark.index, status: 'marked', txid, vout: p.vout, amount: p.amount });
     });
   }
@@ -4017,6 +4236,70 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
       return apiMarkTxo(request, reply, owner, name, +tail[0]);
     }
     return apiErr(reply, 404, 'not found');
+  }
+
+  // ---- tier 3.6: NIP-34 nostr discovery (announce + read-back) --------
+
+  /**
+   * POST api/repos/<o>/<n>/announce (owner only) — build BOTH the kind-30617
+   * repo announcement and the kind-30618 repo-state event and publish them to
+   * the configured relays. With no relays configured this is a clear 200 no-op
+   * (so callers/tests need no live relay). Returns { published, event:
+   * {id, kind, tags} (30617), state: {id, kind, tags} (30618), relays:
+   * [{relay, ok}], stateRelays: [{relay, ok}] }.
+   */
+  async function apiAnnounce(request, reply, owner, name) {
+    await readJsonBody(request); // no body needed; buffered for NIP-98 payload tags
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    if (ownerFromAgent(agent) !== owner) return apiErr(reply, 403, 'only the repo owner may announce this repository');
+    const event = await buildRepoEvent(owner, name);
+    const state = await buildStateEvent(owner, name);
+    const viewOf = (e) => ({ id: e.id, pubkey: e.pubkey, kind: e.kind, tags: e.tags });
+    const eventView = viewOf(event);
+    const stateView = viewOf(state);
+    if (!announceRelays.length) {
+      return sendJson(reply, 200, {
+        published: false,
+        reason: 'no relays configured — set config.announceRelays to publish (NIP-34 emission is opt-in)',
+        event: eventView,
+        state: stateView,
+        relays: [],
+      });
+    }
+    const relays = await publishEvent(event);
+    const stateRelays = await publishEvent(state);
+    api.log.info(`forge: ${owner}/${name} announced on demand (30617 ${event.id.slice(0, 8)}… + 30618 ${state.id.slice(0, 8)}…) to `
+      + `${relays.filter((r) => r.ok).length}/${relays.length} relay(s)`);
+    const relayView = (rs) => rs.map((r) => ({ relay: r.relay, ok: r.ok, ...(r.error ? { error: r.error } : {}) }));
+    return sendJson(reply, 200, {
+      published: true,
+      event: eventView,
+      state: stateView,
+      relays: relayView(relays),
+      stateRelays: relayView(stateRelays),
+    });
+  }
+
+  /**
+   * GET api/repos/<o>/<n>/nostr — the (freshly built, signed) events that
+   * WOULD be published: the kind-30617 announcement (`event`) AND the
+   * kind-30618 repo-state (`state`), plus both in `events`, the announce
+   * pubkey/npub and the configured relays. A human/subscriber can inspect the
+   * exact NIP-34 shapes (and the commit-precise refs) without a relay.
+   */
+  async function apiNostr(reply, owner, name) {
+    const event = await buildRepoEvent(owner, name);
+    const state = await buildStateEvent(owner, name);
+    return sendJson(reply, 200, {
+      pubkey: announcePubkey,
+      npub: npubEncode(announcePubkey),
+      relays: announceRelays,
+      relaysConfigured: announceRelays.length > 0,
+      event,       // the kind-30617 announcement (backward-compat field)
+      state,       // the kind-30618 repo-state event (commit-precise refs)
+      events: [event, state],
+    });
   }
 
   /**
@@ -4174,13 +4457,18 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
 
     const action = rest[2];
     const tail = rest.slice(3);
-    if (!['issues', 'pulls', 'fork', 'labels', 'marks'].includes(action) && !isRead) return apiErr(reply, 405, 'method not allowed');
+    if (!['issues', 'pulls', 'fork', 'labels', 'marks', 'announce'].includes(action) && !isRead) return apiErr(reply, 405, 'method not allowed');
     try {
       switch (action) {
         case 'issues': return await apiIssuesHandler(request, reply, owner, name, tail);
         case 'pulls': return await apiPullsHandler(request, reply, owner, name, tail);
         case 'labels': return await apiLabelsHandler(request, reply, owner, name, tail);
         case 'marks': return await apiMarksHandler(request, reply, owner, name, tail);
+        case 'announce':
+          if (tail.length !== 0) return apiErr(reply, 404, 'not found');
+          if (request.method !== 'POST') return apiErr(reply, 405, 'method not allowed');
+          return await apiAnnounce(request, reply, owner, name);
+        case 'nostr': return tail.length === 0 && isRead ? await apiNostr(reply, owner, name) : apiErr(reply, 404, 'not found');
         case 'search': return tail.length === 0 ? await apiSearch(reply, owner, name, request.query) : apiErr(reply, 404, 'not found');
         case 'releases': return tail.length === 0 ? await apiReleases(reply, owner, name) : apiErr(reply, 404, 'not found');
         case 'fork':

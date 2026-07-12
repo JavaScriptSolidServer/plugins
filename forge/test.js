@@ -2095,6 +2095,149 @@ describe('forge plugin', () => {
     });
   });
 
+  // ------------------------------------- tier 3.6: nostr discovery (NIP-34)
+  // The discovery layer over the marks (Bitcoin source-of-truth): the forge
+  // signs a kind-30617 repo announcement (clone/web mirror URLs, relays,
+  // maintainers, and — when anchored — blocktrails.json + the genesis txid)
+  // with a stable per-instance key. These tests exercise the pure/HTTP parts
+  // on the default (no-relays) instance; the live-relay emission runs in an
+  // isolated instance at the end of the file.
+  describe('nostr discovery (NIP-34 kind-30617 repo announcements)', () => {
+    const announceKeyFile = () => path.join(jss.root, '.plugins', 'forge', 'announce-key');
+    const nostrOf = async (owner, name) => (await fetch(`${base}/forge/api/repos/${owner}/${name}/nostr`)).json();
+    const tagVal = (tags, k) => (tags.find((t) => t[0] === k) || []).slice(1);
+    const recomputeId = (ev) => crypto.createHash('sha256')
+      .update(JSON.stringify([0, ev.pubkey, ev.created_at, ev.kind, ev.tags, ev.content]), 'utf8')
+      .digest('hex');
+
+    it('the announce key is generated once and persisted 0600', () => {
+      const f = announceKeyFile();
+      assert.ok(fs.existsSync(f), 'announce-key persisted under pluginDir/forge');
+      assert.match(fs.readFileSync(f, 'utf8').trim(), /^[0-9a-f]{64}$/, '32-byte hex privkey');
+      assert.strictEqual(fs.statSync(f).mode & 0o777, 0o600, 'key file is 0600');
+    });
+
+    it('GET /nostr returns a valid signed kind-30617 with the required tags (d/name/web/clone/description)', async () => {
+      const j = await nostrOf('casey', 'demo');
+      assert.match(j.pubkey, /^[0-9a-f]{64}$/, 'x-only announce pubkey');
+      assert.strictEqual(j.npub, npubEncode(j.pubkey), 'npub encodes the announce pubkey');
+      assert.strictEqual(j.relaysConfigured, false, 'default instance opts out of emission');
+      const skHex = fs.readFileSync(announceKeyFile(), 'utf8').trim();
+      assert.strictEqual(j.pubkey, bytesToHex(schnorr.getPublicKey(skHex)), 'pubkey derives from the persisted key');
+      // stable identity across calls (same persisted key)
+      assert.strictEqual((await nostrOf('casey', 'demo')).pubkey, j.pubkey, 'stable announce identity');
+
+      const ev = j.event;
+      assert.strictEqual(ev.kind, 30617, 'NIP-34 repo announcement kind');
+      assert.strictEqual(ev.pubkey, j.pubkey);
+      assert.strictEqual(ev.id, recomputeId(ev), 'NIP-01 id = sha256 of the canonical serialization');
+      assert.ok(schnorr.verify(ev.sig, ev.id, ev.pubkey), 'schnorr sig verifies against the id');
+      assert.deepStrictEqual(tagVal(ev.tags, 'd'), ['casey/demo'], 'd = owner/name');
+      assert.deepStrictEqual(tagVal(ev.tags, 'name'), ['demo']);
+      assert.deepStrictEqual(tagVal(ev.tags, 'web'), [`${base}/forge/casey/demo`]);
+      assert.deepStrictEqual(tagVal(ev.tags, 'clone'), [`${base}/forge/casey/demo.git`]);
+      assert.strictEqual(ev.content, tagVal(ev.tags, 'description')[0] ?? '', 'content = description');
+      // unconfigured relays => no relays tag; WebID owner => no maintainers tag;
+      // unanchored repo => no r/anchor tags
+      assert.ok(!ev.tags.some((t) => t[0] === 'relays'), 'no relays tag when unconfigured');
+      assert.ok(!ev.tags.some((t) => t[0] === 'maintainers'), 'WebID owner has no hex maintainer');
+      assert.ok(!ev.tags.some((t) => t[0] === 'anchor' || t[0] === 'r'), 'unanchored repo has no anchor tags');
+    });
+
+    it('an anchored repo carries the blocktrails.json (r) and anchor (chain, genesis-txid) tags', async () => {
+      // casey/trail had mark 0 recorded as marked in the anchoring suite above
+      const marks = await (await fetch(`${base}/forge/api/repos/casey/trail/marks`)).json();
+      const genesis = marks.marks[0];
+      assert.strictEqual(genesis.status, 'marked', 'precondition: genesis mark is on-chain');
+      const { event: ev } = await nostrOf('casey', 'trail');
+      assert.deepStrictEqual(tagVal(ev.tags, 'r'), [`${base}/forge/casey/trail/blocktrails.json`],
+        'r points at the verifier-readable trail doc');
+      assert.deepStrictEqual(tagVal(ev.tags, 'anchor'), ['tbtc4', genesis.txid],
+        'anchor = [chain, genesis txid] — the Bitcoin source-of-truth');
+    });
+
+    it('GET /nostr also returns a valid signed kind-30618 repo-state (HEAD + refs/heads/<default> at the real tip)', async () => {
+      // Recompute the live default-branch tip independently (casey/demo's main
+      // moves across the merge tests above), so the assertion is commit-precise.
+      const ls = (await git(['ls-remote', `${base}/forge/casey/demo.git`, 'refs/heads/main'])).stdout.trim();
+      const headSha = ls.split(/\s+/)[0];
+      assert.match(headSha, /^[0-9a-f]{40}$/, 'ls-remote gives the real HEAD sha');
+
+      const j = await nostrOf('casey', 'demo');
+      const st = j.state;
+      assert.ok(st, 'the read-back carries the 30618 state event');
+      assert.strictEqual(st.kind, 30618, 'NIP-34 repo-state kind');
+      assert.strictEqual(st.pubkey, j.pubkey, 'signed by the SAME announce key as the 30617');
+      assert.strictEqual(st.id, recomputeId(st), 'NIP-01 id = sha256 of the canonical serialization');
+      assert.ok(schnorr.verify(st.sig, st.id, st.pubkey), 'schnorr sig verifies against the id');
+      assert.strictEqual(st.content, '', 'state events carry empty content');
+      // Same d as the 30617 correlates the announcement and its state.
+      assert.deepStrictEqual(tagVal(st.tags, 'd'), ['casey/demo'], 'd = owner/name');
+      assert.deepStrictEqual(tagVal(j.event.tags, 'd'), tagVal(st.tags, 'd'), '30617 and 30618 share the d');
+      assert.deepStrictEqual(tagVal(st.tags, 'HEAD'), ['ref: refs/heads/main'], 'HEAD is the symbolic default branch');
+      assert.deepStrictEqual(tagVal(st.tags, 'refs/heads/main'), [headSha], 'default-branch ref carries the real HEAD sha');
+      assert.ok(!st.tags.some((t) => t[0] === 'anchor' || t[0] === 'r'), 'unanchored repo state has no anchor tags');
+      // events[] lists both, in emission order (announcement then state).
+      assert.deepStrictEqual(j.events.map((e) => e.kind), [30617, 30618], 'events = [30617, 30618]');
+    });
+
+    it('an anchored repo state (30618) also carries the anchor (chain, genesis-txid) + r tags', async () => {
+      const marks = await (await fetch(`${base}/forge/api/repos/casey/trail/marks`)).json();
+      const genesis = marks.marks[0];
+      assert.strictEqual(genesis.status, 'marked', 'precondition: genesis mark is on-chain');
+      const { state: st } = await nostrOf('casey', 'trail');
+      assert.strictEqual(st.kind, 30618);
+      assert.deepStrictEqual(tagVal(st.tags, 'anchor'), ['tbtc4', genesis.txid],
+        'anchor = [chain, genesis txid] — subscribers can require Bitcoin-anchored state');
+      assert.deepStrictEqual(tagVal(st.tags, 'r'), [`${base}/forge/casey/trail/blocktrails.json`],
+        'r hands off to the verifier-readable trail doc');
+      assert.ok(st.tags.some((t) => t[0] === 'refs/heads/main' && /^[0-9a-f]{40}$/.test(t[1])),
+        'the anchored state still names the default-branch tip');
+    });
+
+    it('a nostr-owned repo names the owner pubkey in a maintainers tag', async () => {
+      const sk = bytesToHex(schnorr.utils.randomPrivateKey());
+      const pk = bytesToHex(schnorr.getPublicKey(sk));
+      const turl = `${base}/forge/api/token`;
+      const token = (await (await fetch(turl, { method: 'POST', headers: { authorization: nip98Header(sk, turl, 'POST') } })).json()).token;
+      const wdir = path.join(tmp, 'mrepo');
+      fs.mkdirSync(wdir, { recursive: true });
+      fs.writeFileSync(path.join(wdir, 'README.md'), '# mrepo\n\nnostr-owned mirror.\n');
+      await git(['init', '--quiet'], { cwd: wdir });
+      await git(['add', '-A'], { cwd: wdir });
+      await git(['commit', '--quiet', '-m', 'init'], { cwd: wdir });
+      await git([...authFlag(token), 'push', `${base}/forge/${pk}/mrepo.git`, 'main'], { cwd: wdir });
+      const { event: ev } = await nostrOf(pk, 'mrepo');
+      assert.deepStrictEqual(tagVal(ev.tags, 'maintainers'), [pk], 'owner hex pubkey is the maintainer');
+    });
+
+    it('POST /announce is owner-only, and with no relays configured is a clear no-op', async () => {
+      const url = `${base}/forge/api/repos/casey/demo/announce`;
+      const anon = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+      assert.strictEqual(anon.status, 401, 'anonymous is 401');
+      const other = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${rival.access_token}` },
+        body: '{}',
+      });
+      assert.strictEqual(other.status, 403, 'a non-owner is 403');
+      const mine = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${casey.access_token}` },
+        body: '{}',
+      });
+      assert.strictEqual(mine.status, 200);
+      const j = await mine.json();
+      assert.strictEqual(j.published, false, 'no relays => nothing published');
+      assert.match(j.reason, /no relays configured/i);
+      assert.deepStrictEqual(j.relays, []);
+      assert.strictEqual(j.event.kind, 30617, 'the unpublished event is still returned for inspection');
+      assert.strictEqual(j.state.kind, 30618, 'the unpublished 30618 state event is also returned for inspection');
+      assert.deepStrictEqual((j.state.tags.find((t) => t[0] === 'd') || []).slice(1), ['casey/demo'],
+        'state event shares the announcement d — built but not published with no relays (no crash)');
+    });
+  });
+
   // ---------------------------------------------------------- edge cases
 
   it('a repo with no README renders its home page without error', async () => {
@@ -2158,5 +2301,125 @@ describe('forge plugin', () => {
     } finally {
       await priv.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// NIP-34 emission against a LIVE relay — an in-process ws relay that accepts
+// one EVENT and replies OK. Its own JSS instance (config.announceRelays set)
+// keeps it isolated: booting a JSS regenerates the process-global IdP keys, so
+// this must run AFTER the main suite (which it does — a top-level describe
+// under --test-concurrency=1). Proves publishEvent's send/OK round-trip, the
+// per-relay result shape, and the auto-announce-on-anchor trigger.
+describe('forge NIP-34 emission to a live relay (in-process ws)', () => {
+  let relay;      // WebSocketServer
+  let received;   // parsed EVENT payloads the relay accepted
+  let relayUrl;
+  let jss;
+  let base;
+  let owner;
+  const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-nostr-'));
+
+  const until = async (fn, what, ms = 5000) => {
+    const t0 = Date.now();
+    for (;;) {
+      const v = await fn();
+      if (v) return v;
+      if (Date.now() - t0 > ms) throw new Error(`timed out waiting for ${what}`);
+      await new Promise((r) => { setTimeout(r, 50); });
+    }
+  };
+
+  // This suite runs after the main one, which removes the shared gitHome in
+  // its after() — so give git a private identity here.
+  const g = (args, opts = {}) => git(args, { ...opts, env: { HOME: tmp2, ...(opts.env ?? {}) } });
+
+  before(async () => {
+    fs.writeFileSync(path.join(tmp2, '.gitconfig'),
+      '[user]\n\temail = mira@example.org\n\tname = Mira\n[init]\n\tdefaultBranch = main\n');
+    received = [];
+    const { WebSocketServer } = await import('ws');
+    relay = new WebSocketServer({ port: 0 });
+    await new Promise((r) => relay.on('listening', r));
+    relayUrl = `ws://127.0.0.1:${relay.address().port}`;
+    relay.on('connection', (ws) => {
+      ws.on('message', (data) => {
+        let msg;
+        try { msg = JSON.parse(data.toString()); } catch { return; }
+        if (Array.isArray(msg) && msg[0] === 'EVENT') {
+          received.push(msg[1]);
+          ws.send(JSON.stringify(['OK', msg[1].id, true, '']));
+        }
+      });
+    });
+
+    jss = await startJss({
+      idp: true,
+      plugins: [{ id: 'forge', module: module_, prefix: '/forge', config: { announceRelays: [relayUrl] } }],
+    });
+    base = jss.base;
+    owner = await registerAndMint(base, 'mira');
+
+    const wdir = path.join(tmp2, 'proj');
+    fs.mkdirSync(wdir, { recursive: true });
+    fs.writeFileSync(path.join(wdir, 'README.md'), '# proj\n\na mirrored project.\n');
+    await g(['init', '--quiet'], { cwd: wdir });
+    await g(['add', '-A'], { cwd: wdir });
+    await g(['commit', '--quiet', '-m', 'init'], { cwd: wdir });
+    await g([...authFlag(owner.access_token), 'push', `${base}/forge/mira/proj.git`, 'main'], { cwd: wdir });
+  });
+
+  after(async () => {
+    if (jss) await jss.close();
+    await new Promise((r) => relay.close(r));
+    fs.rmSync(tmp2, { recursive: true, force: true });
+  });
+
+  it('POST /announce publishes BOTH the signed 30617 and the 30618 state to the relay and parses the OKs', async () => {
+    const url = `${base}/forge/api/repos/mira/proj/announce`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${owner.access_token}` },
+      body: '{}',
+    });
+    assert.strictEqual(res.status, 200);
+    const j = await res.json();
+    assert.strictEqual(j.published, true, 'relays configured => published');
+    assert.strictEqual(j.relays.length, 1);
+    assert.strictEqual(j.relays[0].relay, relayUrl);
+    assert.strictEqual(j.relays[0].ok, true, 'the forge parsed the relay OK true (30617)');
+    assert.strictEqual(j.stateRelays.length, 1);
+    assert.strictEqual(j.stateRelays[0].ok, true, 'the forge parsed the relay OK true (30618)');
+    const got = await until(() => received.find((e) => e.id === j.event.id), 'the announced event at the relay');
+    assert.strictEqual(got.kind, 30617);
+    assert.ok(schnorr.verify(got.sig, got.id, got.pubkey), 'the delivered event is validly signed');
+    assert.ok(got.tags.some((t) => t[0] === 'relays' && t.includes(relayUrl)), 'relays tag lists the configured relay');
+    assert.ok(got.tags.some((t) => t[0] === 'clone' && t[1] === `${base}/forge/mira/proj.git`), 'clone URL is the mirror URL');
+    // the 30618 state event landed too, with the default-branch ref + HEAD tag
+    const st = await until(() => received.find((e) => e.id === j.state.id), 'the repo-state event at the relay');
+    assert.strictEqual(st.kind, 30618);
+    assert.ok(schnorr.verify(st.sig, st.id, st.pubkey), 'the delivered state event is validly signed');
+    assert.deepStrictEqual((st.tags.find((t) => t[0] === 'd') || []).slice(1), ['mira/proj'], 'same d as the 30617');
+    assert.ok(st.tags.some((t) => t[0] === 'HEAD' && t[1] === 'ref: refs/heads/main'), 'HEAD names the default branch');
+    assert.ok(st.tags.some((t) => t[0] === 'refs/heads/main' && /^[0-9a-f]{40}$/.test(t[1])), 'default-branch ref carries a full sha');
+  });
+
+  it('recording a mark txo auto-announces the repo WITH its anchor tags', async () => {
+    const marksApi = `${base}/forge/api/repos/mira/proj/marks`;
+    const authed = { 'content-type': 'application/json', authorization: `Bearer ${owner.access_token}` };
+    assert.strictEqual((await fetch(`${marksApi}/enable`, { method: 'POST', headers: authed, body: '{}' })).status, 201);
+    const before = received.length;
+    const txid = 'a'.repeat(64);
+    const rec = await fetch(`${marksApi}/0/txo`, { method: 'POST', headers: authed, body: JSON.stringify({ txid, vout: 0, amount: 250000 }) });
+    assert.strictEqual(rec.status, 200);
+    // fire-and-forget on-anchor announce: wait for the anchored event
+    const anchored = await until(
+      () => received.slice(before).find((e) => e.tags.some((t) => t[0] === 'anchor')),
+      'the on-anchor announcement',
+    );
+    assert.deepStrictEqual((anchored.tags.find((t) => t[0] === 'anchor') || []).slice(1), ['tbtc4', txid],
+      'anchor tag = [chain, the genesis txid just recorded]');
+    assert.ok(anchored.tags.some((t) => t[0] === 'r' && t[1] === `${base}/forge/mira/proj/blocktrails.json`),
+      'r tag hands off to blocktrails.json');
   });
 });
