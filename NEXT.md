@@ -180,6 +180,15 @@ Still genuinely plugin-shaped and distinct:
   (capability + shortlink composition), a music/podcast pod (gallery's
   Range finding makes byte-range playback free), a turn-based game over
   relay + pod state. Demos compose existing plugins; loopback only.
+- **Phanpy Wave B — real federation** (Wave A is DONE, 2026-07-12: the
+  mastodon/ shim is Phanpy-grade for local use — timelines, threads,
+  media, notifications from the AP inbox, PKCE; serve a Phanpy dist at
+  any origin and point it at the server). Wave B = inbound HTTP-Signature
+  verification (SECURITY.md accepted-risk #1), remote actor resolution,
+  Like/Announce/Follow delivery, ingest of followed actors' posts —
+  outbound-fetch class, activitypub/'s SSRF gates are the pattern; use
+  federation-demo/ as the regression harness. Streaming stays blocked on
+  api.events (#603); Phanpy polls fine.
 
 Prefer plugins that open a **new capability class** or add a **new
 independent consumer of an already-named seam** (that strengthens the

@@ -34,6 +34,18 @@ are candidates, each with a consumer in this repo attached.
 
 ## Candidate seams (ranked by how many independent plugins demanded them)
 
+**New (2026-07-12, found standing up Phanpy against serve.js): agent
+resolution is Host-sensitive.** A WebID minted under the idpIssuer host
+(`localhost:<port>`) fails core's ownership check when the same request
+arrives via `127.0.0.1:<port>` — same server, same valid token, 403.
+Every loopback-forwarding plugin is exposed: the loopback bind MUST use
+the issuer's host (serve.js now does), and a reverse-proxied deployment
+whose loopback carries a different Host header would hit the same wall.
+Test suites never see it because helpers.js uses 127.0.0.1 for both.
+Seam-shaped ask: either core matches agents host-insensitively for
+loopback binds, or `api.serverInfo` should bless one canonical loopback
+URL that is guaranteed ownership-safe.
+
 Twelve plugins in, the ranking is now empirical — a seam's rank is how many
 ports reached for it without coordinating.
 
