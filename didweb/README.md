@@ -115,13 +115,17 @@ pod card at `podsRoot` if present, else from a minted server key.
    DID under the always-safe `<prefix>/<user>/did.json`, and the test asserts
    that mount is byte-identical.
 
-3. **`config.podsRoot` + `config.baseUrl` repetition, again** (see `webfinger/`,
-   `nip05/`, `notifications/`). A plugin can learn neither the data root nor
-   its own origin, so both are repeated in config and can be pointed at the
-   wrong place — here the failure mode is that the resolver *confidently mints
-   a valid-looking DID* off a stale/empty pod or a mismatched host, which a
-   resolver then caches. `api.storage.serverRoot` (read-only) and
-   `api.serverInfo` remain the candidate seams. Subdomain-mode did:web
+3. **`config.baseUrl` repetition — RESOLVED by `api.serverInfo()` (#601,
+   merged JSS 0.0.218).** The did:web `id` (`did:web:<host>`) and every
+   service URL now derive from `api.serverInfo().baseUrl`, resolved at
+   request time; `config.baseUrl` is an *optional* override and the boot no
+   longer hard-fails without it. This mattered most here of all the
+   consumers — a mismatched host silently mints a valid-looking DID whose
+   `id` doesn't match the URL it was fetched from, which a resolver then
+   caches — so landing the seam fixes a *silent-corruption* failure, not just
+   a config chore. **`config.podsRoot` is still a repetition** (see
+   `nip05/`): a plugin can't learn the *data root* — the remaining
+   `api.storage.serverRoot` candidate. Subdomain-mode did:web
    (`did:web:alice.pod.example` → `https://alice.pod.example/.well-known/did.json`)
    is out of reach for the same reason `nip05/` couldn't do per-host filtering:
    a plugin can read `request.headers.host` but has no way to learn the base

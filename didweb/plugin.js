@@ -204,24 +204,21 @@ async function hasCard(dir) {
 export async function activate(api) {
   const prefix = api.prefix || '/didweb';
   const podsRoot = api.config.podsRoot ?? null;
-  const baseUrl = (api.config.baseUrl || '').replace(/\/$/, '');
+  // Origin from api.serverInfo() (#601), resolved at REQUEST time (with port 0
+  // the real port exists only once listening); config.baseUrl is an optional
+  // override for reverse-proxy edge cases. The did:web id (did:web:<host>) and
+  // every service URL derive from it — this used to require config.baseUrl and
+  // hard-fail boot; that finding is the serverInfo seam, merged in JSS 0.0.218.
+  const resolveBaseUrl = () => (api.config.baseUrl
+    ? String(api.config.baseUrl).replace(/\/$/, '')
+    : api.serverInfo().baseUrl.replace(/\/$/, ''));
+  // did:web host = the baseUrl authority with the port colon percent-encoded.
+  const resolveEncHost = () => new URL(resolveBaseUrl()).host.replace(/:/g, '%3A');
   // Optional: an AP-actor path template (as webfinger/ uses) → a service entry.
   const actorPathTemplate = api.config.actorPathTemplate || null;
   // Optional: arbitrary extra service entries appended verbatim.
   const extraServices = Array.isArray(api.config.serviceEndpoints)
     ? api.config.serviceEndpoints : [];
-
-  if (!baseUrl) {
-    // A DID document is nothing but absolute URLs and a did:web id derived
-    // from this server's own host, and the plugin api exposes no server
-    // origin (same finding as webfinger/, activitypub/, mastodon/). Without
-    // it there is no truthful `id` to mint — hard boot failure.
-    throw new Error(
-      'didweb plugin requires config.baseUrl — the plugin api exposes no server '
-      + 'origin, and the did:web id (did:web:<host>) plus every service URL is '
-      + 'derived from it (same finding as webfinger/activitypub/mastodon).',
-    );
-  }
   if (!podsRoot) {
     // Still activate: the root/server DID (`did:web:<host>`) is servable from
     // a minted key alone, and a purely additive resolver shouldn't fail the
@@ -230,11 +227,6 @@ export async function activate(api) {
       + 'resolves; every pathed did:web:<host>:<user> will 404 '
       + '(the plugin api cannot learn the data root itself)');
   }
-
-  // did:web host = the baseUrl authority with the port colon percent-encoded.
-  const host = new URL(baseUrl).host;           // e.g. "pod.example" or "127.0.0.1:3000"
-  const encHost = host.replace(/:/g, '%3A');    // did:web percent-encodes the port colon
-  const didFor = (user) => (user ? `did:web:${encHost}:${user}` : `did:web:${encHost}`);
 
   // Minted Ed25519 keys persist here, one JSON per scope (root → `_root`).
   const keysDir = path.join(api.storage.pluginDir(), 'keys');
@@ -276,6 +268,9 @@ export async function activate(api) {
    */
   async function buildDidDoc(user) {
     if (user !== null && !(await podExists(user))) return null;
+    const baseUrl = resolveBaseUrl();
+    const encHost = resolveEncHost();
+    const didFor = (u) => (u ? `did:web:${encHost}:${u}` : `did:web:${encHost}`);
     const did = didFor(user);
     const podPath = user ? `/${user}/` : '/';
     const webid = `${baseUrl}${podPath}profile/card#me`;
@@ -349,7 +344,7 @@ export async function activate(api) {
     const user = request.params.user;
     if (!LOCAL_PART.test(user) || user.startsWith('.')) return notFound(reply, 'no such DID');
     const doc = await buildDidDoc(user);
-    if (!doc) return notFound(reply, `no such DID: did:web:${encHost}:${user}`);
+    if (!doc) return notFound(reply, `no such DID: did:web:${resolveEncHost()}:${user}`);
     return sendDoc(reply, doc);
   }
 
@@ -386,7 +381,9 @@ export async function activate(api) {
       + `serving pathed DIDs under ${prefix}/<user>/did.json only`);
   }
 
-  api.log.info(`didweb: root DID did:web:${encHost} at `
+  // Host isn't logged here: the did:web host comes from api.serverInfo() at
+  // request time, and at activate the ephemeral port may not be resolved yet.
+  api.log.info('didweb: root DID at '
     + `${wellKnown ? '/.well-known/did.json and ' : ''}${prefix}/did.json; `
     + `pathed DIDs at ${pathed ? '/<user>/did.json and ' : ''}${prefix}/<user>/did.json`
     + (podsRoot ? ` from ${podsRoot}` : ' (no podsRoot: pathed DIDs 404)'));

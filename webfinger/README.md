@@ -130,13 +130,14 @@ lifted out of `--activitypub` into an always-on, multi-protocol plugin.
    let the endpoint actually be the shared, extensible surface the issue
    describes.
 
-3. **`config.podsRoot` / `baseUrl` repetition (as in nip05, notifications,
-   mastodon, webdav).** A plugin cannot learn the data root or the server's
-   own origin, so the operator repeats both in config. Here `baseUrl` is a
-   hard requirement — every URL in a JRD (WebID, profile page, actor,
-   issuer) is absolute against it — so unlike nip05 the plugin *hard-fails*
-   boot without it. `podsRoot` is the same repetition nip05 documents, with
-   the same failure mode: point it at the wrong directory and every lookup
-   confidently 404s while the rest of the server works.
-   `api.storage.serverRoot` and `api.serverInfo` (both read-only) remain the
-   candidate seams.
+3. **`baseUrl` repetition — RESOLVED by `api.serverInfo()` (#601, merged JSS
+   0.0.218).** A plugin now learns its own origin: every JRD URL (WebID,
+   profile page, actor, issuer) is built from `api.serverInfo().baseUrl`,
+   resolved at request time. `config.baseUrl` remains an *optional* override
+   for reverse-proxy edge cases, and the boot no longer hard-fails without
+   it. This was the origin half of the old finding; `api.serverInfo` was one
+   of the top-demanded seams (~23 consumers) and landing it retired that
+   demand here. **`config.podsRoot` is still a repetition** (as in nip05):
+   a plugin cannot learn the *data root*, and pointing it at the wrong
+   directory confidently 404s every lookup while the rest of the server
+   works — the remaining `api.storage.serverRoot` candidate.

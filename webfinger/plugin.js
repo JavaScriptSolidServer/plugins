@@ -96,25 +96,20 @@ export function parseResource(resource) {
 export async function activate(api) {
   const prefix = api.prefix || '/webfinger';
   const podsRoot = api.config.podsRoot ?? null;
-  const baseUrl = (api.config.baseUrl || '').replace(/\/$/, '');
+  // The server's own origin comes from api.serverInfo() (#601), resolved at
+  // REQUEST time (with port 0 the real port exists only once listening).
+  // config.baseUrl stays as an optional override for reverse-proxy edge
+  // cases. Every URL in a JRD (WebID, profile page, actor, issuer) is
+  // absolute against it — this used to require config.baseUrl and hard-fail
+  // boot; that whole finding is the serverInfo seam, merged in JSS 0.0.218.
+  const resolveBaseUrl = () => (api.config.baseUrl
+    ? String(api.config.baseUrl).replace(/\/$/, '')
+    : api.serverInfo().baseUrl.replace(/\/$/, ''));
   // `null`/`''` disables the `self` (ActivityPub actor) link — "IF
   // applicable" from the issue: a deployment without AP actors omits it.
   const actorPathTemplate = 'actorPathTemplate' in api.config
     ? api.config.actorPathTemplate
     : '/<user>/actor';
-
-  if (!baseUrl) {
-    // A JRD is nothing but absolute URLs of this server's own origin, and
-    // the plugin api exposes no server origin (same finding as mastodon/,
-    // notifications/, webdav/). Without it there is nothing truthful to
-    // serve, so unlike nip05 (whose document carries no self-origin URLs)
-    // this is a hard boot failure.
-    throw new Error(
-      'webfinger plugin requires config.baseUrl — the plugin api exposes no '
-      + 'server origin, and every URL in a JRD (WebID, profile page, actor, '
-      + 'issuer) is absolute against it (same finding as mastodon/notifications).',
-    );
-  }
   if (!podsRoot) {
     // Without a data root the plugin cannot resolve any user, so every
     // query 404s. Still activate (a purely additive discovery endpoint
@@ -138,7 +133,7 @@ export async function activate(api) {
   }
 
   /** Build the JRD for a resolved pod. `subject` echoes the query verbatim. */
-  function buildJrd(user, subject) {
+  function buildJrd(user, subject, baseUrl) {
     const podPath = user ? `/${user}/` : '/';
     const webid = `${baseUrl}${podPath}profile/card#me`;
     const profilePage = `${baseUrl}${podPath}profile/card`;
@@ -186,7 +181,7 @@ export async function activate(api) {
     }
     return reply
       .header('content-type', 'application/jrd+json; charset=utf-8')
-      .send(buildJrd(parsed.user, resource));
+      .send(buildJrd(parsed.user, resource, resolveBaseUrl()));
   }
 
   // Contract-safe mount: under the plugin's own prefix (WAC-exempt via the

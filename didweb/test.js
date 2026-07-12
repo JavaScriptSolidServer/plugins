@@ -91,7 +91,10 @@ describe('didweb plugin', () => {
       plugins: [{
         module: PLUGIN,
         prefix: '/didweb',
-        config: { podsRoot: root, baseUrl: base, actorPathTemplate: '/ap/<user>/actor' },
+        // No baseUrl: the did:web host + service URLs now come from
+        // api.serverInfo() (#601). The encHost assertions below (derived from
+        // the real probed origin) must still hold — that's the retrofit proof.
+        config: { podsRoot: root, actorPathTemplate: '/ap/<user>/actor' },
       }],
     });
   });

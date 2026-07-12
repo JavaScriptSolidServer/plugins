@@ -54,7 +54,10 @@ describe('webfinger plugin', () => {
       plugins: [{
         module: PLUGIN,
         prefix: '/webfinger',
-        config: { podsRoot: root, baseUrl: base },
+        // No baseUrl: the origin now comes from api.serverInfo() (#601).
+        // The JRD's absolute URLs (issuer, actor, WebID) below must still
+        // resolve to the server's real origin — that's the retrofit proof.
+        config: { podsRoot: root },
       }],
     });
   });
