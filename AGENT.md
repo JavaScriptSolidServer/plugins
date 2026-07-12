@@ -11,7 +11,7 @@ Out-of-tree plugins for [JavaScript Solid
 Server](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer),
 built on its **#206 loader** (`createServer({ plugins })`, JSS ≥ 0.0.215).
 It is an *experiment*: prove the plugin api by using it, and treat every
-wall you hit as a finding, not a blocker. **35 plugins, 471 tests today.**
+wall you hit as a finding, not a blocker. **35 plugins, 485 tests today.**
 
 ### The one rule that makes the experiment valid
 
@@ -198,7 +198,7 @@ Full ranking in `NOTES.md`. The ones you'll hit:
 ## Current state
 
 35 plugins (7 ports + 28 features) + the two-server `federation-demo/`,
-471 tests, all green (`npm test`).
+485 tests, all green (`npm test`).
 A four-axis security review ([SECURITY.md](./SECURITY.md)) hardened the
 inbound-federation and query surfaces; the WAC-deferral pattern held.
 `compose.test.js` runs every plugin on a single server from pure config.
