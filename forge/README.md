@@ -287,8 +287,13 @@ Every issues page embeds one dependency-free inline
 
 - offers a login box — username/password → `POST /idp/credentials`,
   token kept in localStorage, "Signed in as X" + sign-out;
-- drives new-issue/comment/close/reopen through `fetch` + Bearer against
-  the JSON API, then **reloads — the server always renders the truth**;
+- drives new-issue/comment/close/reopen through `fetch` + Bearer (or
+  `xlogin.authFetch` for nostr/Solid) against the JSON API, then
+  **reloads — the server always renders the truth**;
+- for a **Solid (DPoP) login**, first `authFetch`-PUTs the body into the
+  author's own pod (a fresh per-request proof the server could never
+  forward) and posts the forge only the `resourceUrl` pointer — Finding
+  21, the capstone; nostr and plain-Bearer keep posting `{title, body}`;
 - touches the DOM only via `textContent`/`createElement`; fetched
   strings never meet `innerHTML`.
 
@@ -992,3 +997,67 @@ importing it:
   divergence is written down here and self-described in the served
   document (`derivation`, `stateHash` fields) so a future re-deriving
   verifier knows exactly what it is looking at.
+
+### 21. Request-bound proofs make server-side pod writes impossible — the client writes, the forge validates a pointer (the capstone)
+
+Tier 2's storage beat is a server-side loopback PUT into the author's
+pod that FORWARDS the caller's `Authorization` header. That works for a
+plain Bearer (a bearer is replayable to any URL), but it is
+STRUCTURALLY impossible for the two proofs that actually matter for a
+pod-native forge: **Solid-OIDC DPoP and NIP-98 are bound to ONE request
+URI** (DPoP's `htu`, NIP-98's `u`). The browser signs a proof whose URI
+is the forge API URL; forward that same proof to a *different* URL (the
+pod-write) and it has no valid binding → the pod answers 401 → *"your
+pod refused the write"*. The server cannot re-sign, because the signing
+key lives in the browser (WebAuthn/NIP-07), not on the host. This is
+the same request-bound wall Finding 9 hit for git pushes — here it
+blocks the pod WRITE instead of the git wire.
+
+The WAC-correct fix moves the write to the only party that can sign for
+it. The **client** (`window.xlogin.authFetch`, which mints a FRESH DPoP
+or NIP-98 proof per request) PUTs the JSON-LD body directly into the
+author's OWN pod — `htu`/`u` now name the pod URL, so WAC governs a real
+write the author owns — and then POSTs the forge only a POINTER
+(`resourceUrl`). The forge stores it in the index identically to a
+server-written pointer (`{author, resourceUrl, at}`), so the display
+path (public loopback GET → `doc.body` → rendered markdown) reads a
+pointer-based issue byte-for-byte the same as a body-based one. Proven
+in the tests: a pointer issue renders the same `<strong>` as a
+body-written one.
+
+Two design points that make it safe:
+
+- **Pointer-injection defense.** A `resourceUrl` is a client-supplied
+  path, so the forge treats it as hostile: the path MUST start with
+  exactly `${podPathFromAgent(agent)}public/forge/${owner}--${name}/`,
+  end in `.jsonld`, and contain no `..` — else 403. The allowed prefix
+  is keyed to the CALLER's pod (derived from the authenticated agent,
+  not from the request body), so a caller can register pointers only
+  into ITS OWN pod's forge area for THIS repo; eve cannot point at
+  casey's pod, and casey cannot point at another repo's dir or escape
+  `public/forge/`. Then an UNAUTHENTICATED loopback GET confirms the
+  resource is really there and PUBLICLY readable (400 if not) — the
+  same public read the display path uses, so registration validates
+  exactly what rendering will later fetch. The read is deliberately
+  unauthenticated: bodies live under `public/forge/`, the GET is itself
+  request-bound and could not carry a forwarded proof anyway, and a
+  private body would render as removed for everyone — so requiring
+  public-readability at registration is honest about the display
+  contract.
+- **The index author is authoritative, not the doc.** The thread entry
+  records the AUTHENTICATED agent as `author`; the pod document's own
+  `author` field is cosmetic. A doc that lies about its author changes
+  nothing the forge trusts.
+
+Backward compatibility is total: `resourceUrl` is optional, and only a
+pod agent (`podPathFromAgent` truthy) whose request carries it takes the
+pointer branch. A plain Bearer with no `resourceUrl` still gets the
+server-side write (tier 2 unchanged); a did:nostr agent still gets
+forge-hosted storage (tier 2.5 unchanged, `resourceUrl` ignored — a key
+has no pod to point at, which is Finding 10 restated). The client only
+takes the pod-write path for `xlogin.type === 'solid'`; nostr sessions
+and plain-Bearer logins post `{title, body}` as before. No CSP change:
+the `authFetch` PUT is same-origin (`connect-src 'self'` already admits
+it). The one seam this still wants is the same `api.podOf` ask from
+Finding 10 — a did:nostr key with provisioned storage could take this
+exact client-write path and the hosted asymmetry would finally vanish.

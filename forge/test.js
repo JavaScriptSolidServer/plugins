@@ -699,6 +699,141 @@ describe('forge plugin', () => {
     });
   });
 
+  // ------------------- capstone: client-written pod body + validated pointer
+  // A WebID/Solid (DPoP) proof is bound to ONE request URI, so the forge
+  // CANNOT forward the caller's credential to a second URL (the pod write).
+  // The BROWSER writes the body into its OWN pod (a fresh per-request proof)
+  // and hands the forge only a POINTER; the forge validates the pointer names
+  // a resource inside the AUTHOR'S OWN pod forge area for THIS repo, confirms
+  // it exists + is publicly readable, then stores it exactly like a
+  // server-written pointer. Here a plain Bearer stands in for the browser's
+  // authFetch write (podPathFromAgent treats a Bearer WebID user as a pod
+  // owner), so the SERVER CONTRACT is exercised end-to-end.
+
+  describe('capstone (pointer registration: body written client-side into the pod)', () => {
+    let apiBase;
+    let eve;                 // a second pod user, for the cross-user injection proof
+    let ptrIssueNum;         // the pointer-based issue number
+    const authed = (token) => ({ 'content-type': 'application/json', authorization: `Bearer ${token}` });
+    const podPut = (token, rel, doc) => fetch(`${base}${rel}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/ld+json', authorization: `Bearer ${token}` },
+      body: JSON.stringify(doc),
+    });
+    const relIssue = () => `/casey/public/forge/casey--demo/issue-${crypto.randomUUID()}.jsonld`;
+
+    before(async () => {
+      apiBase = `${base}/forge/api/repos/casey/demo`;
+      eve = await registerAndMint(base, 'eve');
+    });
+
+    it("client PUTs the body into casey's pod, then registers only the pointer (201)", async () => {
+      const rel = relIssue();
+      const doc = {
+        type: 'ForgeIssue', repo: 'casey/demo', title: 'Pointer issue',
+        body: 'written **client-side** into my own pod', published: new Date().toISOString(),
+        author: casey.webid,
+      };
+      const put = await podPut(casey.access_token, rel, doc);
+      assert.ok([200, 201, 204, 205].includes(put.status), `client pod PUT ok: ${put.status}`);
+
+      const res = await fetch(`${apiBase}/issues`, {
+        method: 'POST', headers: authed(casey.access_token),
+        body: JSON.stringify({ title: 'Pointer issue', resourceUrl: rel }),
+      });
+      assert.strictEqual(res.status, 201);
+      const j = await res.json();
+      ptrIssueNum = j.number;
+      assert.ok(j.resourceUrl.includes('/casey/public/forge/casey--demo/issue-'), 'pointer recorded in casey pod area');
+      assert.ok(j.resourceUrl.endsWith('.jsonld'));
+      assert.ok(!j.hosted, 'a pod pointer is NOT forge-hosted');
+      // the stored pointer really resolves to the client-written resource
+      const direct = await fetch(j.resourceUrl);
+      assert.strictEqual(direct.status, 200);
+      assert.strictEqual((await direct.json()).author, casey.webid);
+    });
+
+    it('a pointer-based issue renders IDENTICALLY to a body-based one', async () => {
+      const t = await (await fetch(`${apiBase}/issues/${ptrIssueNum}`)).json();
+      assert.strictEqual(t.thread[0].author, casey.webid);
+      assert.strictEqual(t.thread[0].removed, false);
+      assert.ok(t.thread[0].body.includes('client-side'), 'body re-fetched from the pod');
+      assert.ok(t.thread[0].html.includes('<strong>client-side</strong>'), 'markdown rendered the same as body-based');
+      const html = await (await fetch(`${base}/forge/casey/demo/issues/${ptrIssueNum}`)).text();
+      assert.ok(html.includes('<strong>client-side</strong>'), 'HTML thread page renders the pointer body');
+    });
+
+    it("eve comments via a pointer into EVE's own pod (cross-pod, WAC-correct)", async () => {
+      const rel = `/eve/public/forge/casey--demo/comment-${crypto.randomUUID()}.jsonld`;
+      const doc = {
+        type: 'ForgeComment', repo: 'casey/demo', issue: ptrIssueNum,
+        body: 'chiming in from `my own pod`', published: new Date().toISOString(), author: eve.webid,
+      };
+      const put = await podPut(eve.access_token, rel, doc);
+      assert.ok([200, 201, 204, 205].includes(put.status), `eve pod PUT ok: ${put.status}`);
+      const res = await fetch(`${apiBase}/issues/${ptrIssueNum}/comments`, {
+        method: 'POST', headers: authed(eve.access_token),
+        body: JSON.stringify({ resourceUrl: rel }),
+      });
+      assert.strictEqual(res.status, 201);
+      const t = await (await fetch(`${apiBase}/issues/${ptrIssueNum}`)).json();
+      const c = t.thread[t.thread.length - 1];
+      assert.strictEqual(c.author, eve.webid, 'pointer records the authenticated author, not the doc claim');
+      assert.ok(c.resourceUrl.includes('/eve/public/forge/casey--demo/comment-'), "comment body lives in EVE's pod");
+      assert.ok(c.html.includes('<code>my own pod</code>'));
+    });
+
+    it('pointer-injection defense: a pointer OUTSIDE the author area is 403', async () => {
+      const bad = [
+        '/dana/public/forge/casey--demo/issue-x.jsonld',      // a different pod
+        '/casey/private/forge/casey--demo/issue-x.jsonld',    // outside public/forge
+        '/casey/public/forge/casey--other/issue-x.jsonld',    // a different repo dir
+        '/casey/public/forge/casey--demo/../secret.jsonld',   // path traversal
+        '/casey/public/forge/casey--demo/note.txt',           // not a .jsonld leaf
+      ];
+      for (const resourceUrl of bad) {
+        const res = await fetch(`${apiBase}/issues`, {
+          method: 'POST', headers: authed(casey.access_token),
+          body: JSON.stringify({ title: 'evil', resourceUrl }),
+        });
+        assert.strictEqual(res.status, 403, `rejected ${resourceUrl}`);
+      }
+    });
+
+    it("cross-user injection: eve cannot register a pointer into casey's pod area (403)", async () => {
+      const res = await fetch(`${apiBase}/issues`, {
+        method: 'POST', headers: authed(eve.access_token),
+        body: JSON.stringify({ title: 'steal', resourceUrl: '/casey/public/forge/casey--demo/issue-x.jsonld' }),
+      });
+      assert.strictEqual(res.status, 403, 'the allowed prefix is keyed to the CALLER pod');
+    });
+
+    it('a pointer to a resource that is not there is 400', async () => {
+      const res = await fetch(`${apiBase}/issues`, {
+        method: 'POST', headers: authed(casey.access_token),
+        body: JSON.stringify({ title: 'ghost', resourceUrl: relIssue() }),
+      });
+      assert.strictEqual(res.status, 400, 'no such resource in the pod');
+    });
+
+    it('a pointer to a non-forge document (no readable body) is 400', async () => {
+      const rel = relIssue();
+      await podPut(casey.access_token, rel, { note: 'not a forge doc' });
+      const res = await fetch(`${apiBase}/issues`, {
+        method: 'POST', headers: authed(casey.access_token),
+        body: JSON.stringify({ title: 'malformed', resourceUrl: rel }),
+      });
+      assert.strictEqual(res.status, 400, 'the resource exists but has no string body');
+    });
+
+    it('the client script exposes owner/name + does client pod writes for Solid', async () => {
+      const html = await (await fetch(`${base}/forge/casey/demo/issues/new`)).text();
+      assert.ok(html.includes('"owner":"casey"') && html.includes('"name":"demo"'), 'CFG carries owner/name');
+      assert.ok(html.includes('podWrite'), 'the client pod-write helper is shipped');
+      assert.ok(html.includes("x.type==='solid'"), 'only Solid logins take the client-write path');
+    });
+  });
+
   // ------------------------------------------ tier 2.5: did:nostr agents
   // Canonical identity is did:nostr:<64-hex> — the hex pubkey IS the forge
   // namespace; npub is display-only. git cannot sign per-request NIP-98

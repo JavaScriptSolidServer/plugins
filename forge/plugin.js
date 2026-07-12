@@ -1654,6 +1654,55 @@ export async function activate(api) {
     return { url: stored.url, hosted: !!hex };
   }
 
+  /**
+   * The capstone storage beat (WAC-native authored words). A WebID/Solid
+   * (DPoP) — or NIP-98 — proof is cryptographically bound to ONE request URI
+   * (DPoP `htu`, NIP-98 `u`): the forge CANNOT forward the caller's
+   * credential to a SECOND URL (the pod write) because the proof names the
+   * API URL, not the pod resource. So the BROWSER writes the body into its
+   * OWN pod (a fresh per-request proof, minted by xlogin.authFetch), and the
+   * forge is handed only a POINTER. Here the forge VALIDATES that pointer:
+   *  - it must name a resource inside THIS author's OWN pod forge area for
+   *    THIS repo — `${podPath}public/forge/${owner}--${name}/…​.jsonld`, no
+   *    traversal (pointer-injection defense: a caller can register only its
+   *    own pod's resources for this one repo);
+   *  - it must really be there and PUBLICLY readable — an UNAUTHENTICATED
+   *    loopback GET, exactly how resolveEntry re-fetches bodies for display
+   *    (bodies live under public/forge/, so the read is request-agnostic and
+   *    needs no forwarded proof).
+   * On success the pointer is stored identically to a server-written one.
+   * Returns { url } or { status, error }.
+   */
+  async function registerPointer(request, agent, owner, name, resourceUrl) {
+    const podPath = podPathFromAgent(agent);
+    if (!podPath) return { status: 403, error: 'pointer registration requires a pod agent' };
+    const p = resourcePathOf(resourceUrl);
+    if (!p) return { status: 400, error: 'invalid resourceUrl' };
+    const allowed = `${podPath}public/forge/${owner}--${name}/`;
+    if (!p.startsWith(allowed) || !p.endsWith('.jsonld') || p.includes('..')) {
+      return { status: 403, error: 'resourceUrl must be inside your own pod forge area for this repo' };
+    }
+    let res;
+    try {
+      res = await lb(p, {
+        headers: { accept: 'application/ld+json' },
+        signal: AbortSignal.timeout(THREAD_FETCH_TIMEOUT_MS),
+      });
+    } catch (err) {
+      return { status: 400, error: `pointer not found in your pod: ${err.message}` };
+    }
+    if (!res.ok) {
+      try { await res.body?.cancel(); } catch { /* drained */ }
+      return { status: 400, error: 'pointer not found in your pod' };
+    }
+    let doc;
+    try { doc = await res.json(); } catch { doc = null; }
+    if (!doc || typeof doc.body !== 'string' || doc.body.length > ISSUE_BODY_CAP) {
+      return { status: 400, error: 'pointer is not a readable forge document' };
+    }
+    return { url: `${publicOrigin()}${p}` };
+  }
+
   /** Loopback path of a stored resource URL (absolute or path form). */
   function resourcePathOf(resourceUrl) {
     if (typeof resourceUrl !== 'string') return null;
@@ -2336,12 +2385,33 @@ async function call(path,body,method){
   if(!res.ok)throw new Error((j&&j.error)||('HTTP '+res.status));
   return j||{};
 }
+// A Solid/DPoP proof is bound to ONE request URI, so the SERVER cannot
+// forward it to write the pod: the browser signs a FRESH proof per request
+// and writes the body into its own pod, then hands the forge a pointer.
+const Sol=()=>{const x=X();return (x&&x.type==='solid')?x:null};
+async function podWrite(doc,filePrefix){
+  const id=new URL(String(window.xlogin.id));
+  const segs=id.pathname.split('/').filter(Boolean);
+  const podPath=(segs.length>=2&&segs[0]!=='profile')?'/'+segs[0]+'/':'/';
+  const resourcePath=podPath+'public/forge/'+CFG.owner+'--'+CFG.name+'/'+filePrefix+'-'+crypto.randomUUID()+'.jsonld';
+  const res=await window.xlogin.authFetch(id.origin+resourcePath,
+    {method:'PUT',headers:{'content-type':'application/ld+json'},body:JSON.stringify(doc)});
+  if(!(res.ok||res.status===201||res.status===204))throw new Error('could not write to your pod: '+res.status);
+  return resourcePath;
+}
 const si=document.getElementById('submit-issue');
 if(si)si.onclick=async function(){
   setMsg('');
   try{
-    const r=await call('/issues',{title:document.getElementById('f-title').value,
-      body:document.getElementById('f-body').value});
+    const title=document.getElementById('f-title').value;
+    const bodyText=document.getElementById('f-body').value;
+    let payload={title:title,body:bodyText};
+    if(Sol()){
+      const doc={type:'ForgeIssue',repo:CFG.owner+'/'+CFG.name,title:title,body:bodyText,
+        published:new Date().toISOString(),author:window.xlogin.id};
+      payload={title:title,resourceUrl:await podWrite(doc,'issue')};
+    }
+    const r=await call('/issues',payload);
     location.href=CFG.base+'/issues/'+r.number;
   }catch(e){setMsg(String(e.message||e))}
 };
@@ -2349,8 +2419,15 @@ const sp=document.getElementById('submit-pull');
 if(sp)sp.onclick=async function(){
   setMsg('');
   try{
-    const r=await call('/pulls',{title:document.getElementById('f-title').value,
-      body:document.getElementById('f-body').value,base:CFG.prBase,head:CFG.prHead});
+    const title=document.getElementById('f-title').value;
+    const bodyText=document.getElementById('f-body').value;
+    let payload={title:title,body:bodyText,base:CFG.prBase,head:CFG.prHead};
+    if(Sol()){
+      const doc={type:'ForgePullRequest',repo:CFG.owner+'/'+CFG.name,title:title,body:bodyText,
+        base:CFG.prBase,head:CFG.prHead,published:new Date().toISOString(),author:window.xlogin.id};
+      payload={title:title,base:CFG.prBase,head:CFG.prHead,resourceUrl:await podWrite(doc,'pull')};
+    }
+    const r=await call('/pulls',payload);
     location.href=CFG.base+'/pulls/'+r.number;
   }catch(e){setMsg(String(e.message||e))}
 };
@@ -2358,7 +2435,17 @@ const sc=document.getElementById('submit-comment');
 if(sc)sc.onclick=async function(){
   setMsg('');
   try{
-    await call(CFG.thread+'/comments',{body:document.getElementById('f-body').value});
+    const bodyText=document.getElementById('f-body').value;
+    let payload={body:bodyText};
+    if(Sol()){
+      const isPull=String(CFG.thread||'').indexOf('/pulls/')===0;
+      const num=parseInt(String(CFG.thread||'').split('/').pop(),10);
+      const doc={type:'ForgeComment',repo:CFG.owner+'/'+CFG.name,
+        published:new Date().toISOString(),author:window.xlogin.id,body:bodyText};
+      if(isPull)doc.pull=num;else doc.issue=num;
+      payload={resourceUrl:await podWrite(doc,'comment')};
+    }
+    await call(CFG.thread+'/comments',payload);
     location.reload();
   }catch(e){setMsg(String(e.message||e))}
 };
@@ -2494,7 +2581,7 @@ ${authBox('Commenting, closing, or reopening')}
 <button id="submit-comment" class="btn btn-primary" type="button" disabled>Comment</button>
 </div></div></div>
 </div></main>
-${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: `/issues/${issue.number}`, state: issue.state })}`;
+${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base, thread: `/issues/${issue.number}`, state: issue.state })}`;
     return sendHtml(reply, 200, page(`${issue.title} · #${issue.number} · ${owner}/${name}`, body));
   }
 
@@ -2513,7 +2600,7 @@ ${authBox('Opening an issue')}
 <button id="submit-issue" class="btn btn-primary" type="button" disabled>Submit new issue</button>
 </div></div></div>
 </div></main>
-${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null, state: null })}`;
+${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base, thread: null, state: null })}`;
     return sendHtml(reply, 200, page(`New issue · ${owner}/${name}`, body));
   }
 
@@ -2675,7 +2762,7 @@ ${pr.state !== 'merged' ? `<button id="toggle-state" class="btn" type="button" d
 <button id="submit-comment" class="btn btn-primary" type="button" disabled>Comment</button>
 </div></div></div>
 </div></main>
-${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: `/pulls/${pr.number}`, state: pr.state, expectedBase: info?.baseSha ?? null })}`;
+${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base, thread: `/pulls/${pr.number}`, state: pr.state, expectedBase: info?.baseSha ?? null })}`;
     return sendHtml(reply, 200, page(`${pr.title} · #${pr.number} · ${owner}/${name}`, body));
   }
 
@@ -2733,7 +2820,7 @@ ${authBox('Opening a pull request')}
 <button id="submit-pull" class="btn btn-primary" type="button" disabled>Create pull request</button>
 </div></div></div>
 </div></main>
-${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null, state: null, prBase: baseRef, prHead: headSpec })}`;
+${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base, thread: null, state: null, prBase: baseRef, prHead: headSpec })}`;
     return sendHtml(reply, 200, page(`New pull request · ${owner}/${name}`, body));
   }
 
@@ -2856,7 +2943,7 @@ ${authBox('Enabling anchoring')}
 </div>
 </div>
 </div></main>
-${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null, state: null })}`;
+${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base, thread: null, state: null })}`;
       return sendHtml(reply, 200, page(`Anchors · ${owner}/${name}`, body));
     }
 
@@ -2924,7 +3011,7 @@ ${rows}
 </table></div>
 ${fundBox}
 </div></main>
-${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null, state: null, markIndex: firstPending ? firstPending.index : null })}`;
+${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base, thread: null, state: null, markIndex: firstPending ? firstPending.index : null })}`;
     return sendHtml(reply, 200, page(`Anchors · ${owner}/${name}`, body));
   }
 
@@ -3141,6 +3228,9 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
     if (!p) return apiErr(reply, 400, 'invalid JSON body');
     const title = typeof p.title === 'string' ? p.title.trim() : '';
     const bodyText = typeof p.body === 'string' ? p.body : '';
+    // Capstone: a pod agent may hand a POINTER (client already wrote the body
+    // into its own pod via authFetch) instead of a server-written body.
+    const usePointer = !!podPath && typeof p.resourceUrl === 'string' && p.resourceUrl.length > 0;
     if (!title || title.length > ISSUE_TITLE_CAP) return apiErr(reply, 422, `title required (1-${ISSUE_TITLE_CAP} chars)`);
     if (bodyText.length > ISSUE_BODY_CAP) return apiErr(reply, 422, 'body too large');
     return withIssueLock(owner, name, async () => {
@@ -3158,7 +3248,9 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
       // did:nostr agents have no pod: the forge hosts their words (2.5).
       const stored = nostrHex
         ? storeHosted(nostrHex, { ...doc, hosted: true })
-        : await storeAuthored(request, podPath, owner, name, doc, `issue-${crypto.randomUUID()}.jsonld`);
+        : usePointer
+          ? await registerPointer(request, agent, owner, name, p.resourceUrl)
+          : await storeAuthored(request, podPath, owner, name, doc, `issue-${crypto.randomUUID()}.jsonld`);
       if (stored.error) return apiErr(reply, stored.status, stored.error);
       const at = Math.floor(Date.now() / 1000);
       idx.next = number + 1;
@@ -3189,7 +3281,8 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
     if (!podPath && !nostrHex) return apiErr(reply, 403, 'no pod namespace for this agent');
     if (!p) return apiErr(reply, 400, 'invalid JSON body');
     const bodyText = typeof p.body === 'string' ? p.body : '';
-    if (!bodyText.trim()) return apiErr(reply, 422, 'body required');
+    const usePointer = !!podPath && typeof p.resourceUrl === 'string' && p.resourceUrl.length > 0;
+    if (!usePointer && !bodyText.trim()) return apiErr(reply, 422, 'body required');
     if (bodyText.length > ISSUE_BODY_CAP) return apiErr(reply, 422, 'body too large');
     return withIssueLock(owner, name, async () => {
       const idx = loadIssueIndex(owner, name);
@@ -3206,7 +3299,9 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
       };
       const stored = nostrHex
         ? storeHosted(nostrHex, { ...doc, hosted: true })
-        : await storeAuthored(request, podPath, owner, name, doc, `comment-${crypto.randomUUID()}.jsonld`);
+        : usePointer
+          ? await registerPointer(request, agent, owner, name, p.resourceUrl)
+          : await storeAuthored(request, podPath, owner, name, doc, `comment-${crypto.randomUUID()}.jsonld`);
       if (stored.error) return apiErr(reply, stored.status, stored.error);
       issue.thread.push({
         author: agent,
@@ -3624,7 +3719,10 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
         published: new Date().toISOString(),
         author: agent,
       };
-      const stored = await persistBody(request, agent, owner, name, doc, 'pull');
+      const usePointer = !!podPathFromAgent(agent) && typeof p.resourceUrl === 'string' && p.resourceUrl.length > 0;
+      const stored = usePointer
+        ? await registerPointer(request, agent, owner, name, p.resourceUrl)
+        : await persistBody(request, agent, owner, name, doc, 'pull');
       if (stored.error) return apiErr(reply, stored.status, stored.error);
       const at = Math.floor(Date.now() / 1000);
       idx.next = number + 1;
@@ -3655,7 +3753,8 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
     if (!agent) return reply;
     if (!p) return apiErr(reply, 400, 'invalid JSON body');
     const bodyText = typeof p.body === 'string' ? p.body : '';
-    if (!bodyText.trim()) return apiErr(reply, 422, 'body required');
+    const usePointer = !!podPathFromAgent(agent) && typeof p.resourceUrl === 'string' && p.resourceUrl.length > 0;
+    if (!usePointer && !bodyText.trim()) return apiErr(reply, 422, 'body required');
     if (bodyText.length > ISSUE_BODY_CAP) return apiErr(reply, 422, 'body too large');
     return withPullLock(owner, name, async () => {
       const idx = loadPullIndex(owner, name);
@@ -3670,7 +3769,9 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
         published: new Date().toISOString(),
         author: agent,
       };
-      const stored = await persistBody(request, agent, owner, name, doc, 'comment');
+      const stored = usePointer
+        ? await registerPointer(request, agent, owner, name, p.resourceUrl)
+        : await persistBody(request, agent, owner, name, doc, 'comment');
       if (stored.error) return apiErr(reply, stored.status, stored.error);
       pr.thread.push({
         author: agent,
