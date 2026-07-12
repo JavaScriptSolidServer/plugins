@@ -119,7 +119,7 @@ shipped upstream** (the loader plus four seams and the id fix in JSS
 0.0.218/0.0.219, each consumed here), **2 more plugin-able with no
 blocker**, **4 clusters blocked on a named seam** (each with a
 proof-of-need consumer), the rest core-by-nature or product-scale.
-**35 plugins total, 485 tests** (plus the two-server `federation-demo/`
+**35 plugins total, 515 tests** (plus the two-server `federation-demo/`
 scenario). The plugin api reaches most of the backlog today; ranked by
 demand, the seams that would unlock the most next are `api.authorize`
 (4 consumers, 3 hard-blocked) and `api.events` (7 consumers — matrix

@@ -8,7 +8,7 @@ plugin), `NOTES.md` (the findings/seams — the real deliverable), and
 
 ## Where things stand
 
-- **35 plugins, 485 tests, all green** (`npm test`; the three
+- **35 plugins, 515 tests, all green** (`npm test`; the three
   `notifications/` fs.watch tests need a free inotify instance — see
   Footguns), all pushed to
   `github.com/JavaScriptSolidServer/plugins` (branch `gh-pages`).
