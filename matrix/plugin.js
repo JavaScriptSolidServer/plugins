@@ -23,9 +23,11 @@
 // to its prefix, and each `/_matrix/client/...` route outranks core's LDP
 // `GET /*` wildcard on Fastify's route-specificity ordering. That the whole
 // Matrix Client-Server surface lives at ONE fixed root OUTSIDE the plugin's
-// own prefix — which the plugin cannot WAC-exempt itself — is the headline
-// finding (README "Findings"): the Nth independent confirmation of the
-// mastodon/bluesky reserved-path seam, now for a CHAT protocol.
+// own prefix is the headline finding (README "Findings"): the Nth
+// independent confirmation of the mastodon/bluesky reserved-path seam, now
+// for a CHAT protocol; as of JSS 0.0.219 the plugin claims + WAC-exempts
+// that root itself via api.reservePath (#602), so the operator no longer
+// touches appPaths.
 //
 // --------------------------------------------------------- the token bridge
 //
@@ -182,6 +184,15 @@ export async function activate(api) {
   });
 
   // =================================================================== routes
+
+  // Claim + WAC-exempt the fixed Matrix root (#602, JSS 0.0.219). A literal
+  // reservation exempts the whole /_matrix subtree but is READ-ONLY by
+  // default, so widen to exactly the write verbs the routes below implement:
+  // POST (login, createRoom) and PUT (send-event). DELETE/PATCH stay gated
+  // on purpose — exempting a verb no route implements would let it fall
+  // through to core's LDP write wildcards as an unauthenticated storage
+  // write.
+  api.reservePath('/_matrix', { methods: ['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT'] });
 
   // Preflight for the whole shim surface (Element is a browser app).
   api.fastify.options('/_matrix/*', (request, reply) => cors(reply).code(204).send());
@@ -406,11 +417,10 @@ export async function activate(api) {
   });
 
   api.log.info(`matrix: Client-Server shim at /_matrix/client/* → pods via ${loopback} (Phase 1)`);
-  // The load-bearing caveat (see README "Findings"): these absolute routes
-  // register fine, but they are only reachable if the operator has WAC-
-  // exempted the /_matrix root. A plugin gets ONE prefix pushed to appPaths
-  // and cannot self-exempt a fixed protocol root — so the operator must pass
-  // `appPaths: ['/_matrix']` to createServer. Same seam as mastodon/bluesky/.
-  api.log.warn('matrix: /_matrix must be in appPaths or WAC will 401 every client '
-    + 'request — the one-prefix plugin model cannot self-exempt a fixed protocol root');
+  // The formerly load-bearing caveat, now closed (see README "Findings"):
+  // before JSS 0.0.219 a plugin got ONE prefix pushed to appPaths and could
+  // not self-exempt a fixed protocol root, so the operator had to pass
+  // `appPaths: ['/_matrix']` or WAC 401'd every client call. The
+  // api.reservePath call above (#602) claims the root at activate time —
+  // same seam, same closure, as mastodon/bluesky/.
 }

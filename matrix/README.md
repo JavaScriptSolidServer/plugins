@@ -10,7 +10,8 @@ timeline is the events you appended to it.
 This is the **chat-protocol** entry in the API-shim family — after the two
 microblog shims (`mastodon/`, `bluesky/`) it confirms the same two seams a
 third time, now against a fixed `/_matrix` root: the reserved-path/`appPaths`
-gap and the `/idp/credentials` token bridge.
+gap (since **closed** by `api.reservePath()`, JSS 0.0.219) and the
+`/idp/credentials` token bridge.
 
 ```
 plugins: [{
@@ -22,15 +23,11 @@ plugins: [{
 }]
 ```
 
-…**and** — the load-bearing caveat — the operator must WAC-exempt the fixed
-Matrix root, because a plugin cannot do it itself (see [Findings](#findings)):
-
-```
-createServer({
-  appPaths: ['/_matrix'],   // REQUIRED: or WAC 401s every client call
-  plugins: [ … ],
-})
-```
+That's the whole setup. As of JSS 0.0.219 the plugin claims and WAC-exempts
+the fixed `/_matrix` root itself via `api.reservePath()` at activate time
+(#602) — no `appPaths` widening required. (Before 0.0.219 the operator had to
+pass `appPaths: ['/_matrix']` by hand or WAC 401'd every client call — see
+[Findings](#findings).)
 
 ## Pointing a client at it
 
@@ -123,7 +120,7 @@ that require the field.
 
 ## Findings
 
-### 1. Matrix's fixed `/_matrix` root doesn't fit the one-prefix plugin model — the Nth confirmation, now for a chat protocol
+### 1. Matrix's fixed `/_matrix` root doesn't fit the one-prefix plugin model — the Nth confirmation, now for a chat protocol (CLOSED: `api.reservePath`, JSS 0.0.219)
 
 The same seam `mastodon/` (`/api`+`/oauth`) and `bluesky/` (`/xrpc`) found,
 confirmed a **third** time and for a **different protocol family** (real-time
@@ -135,20 +132,32 @@ chat, not microblogging). A Matrix client hits **fixed absolute paths** under
   prefix (`api.fastify` is the real scoped instance), and these static/param
   routes outrank core's LDP `GET /*` wildcard on Fastify's specificity
   ordering. Registration is fine.
-- **Authorization does not.** `/_matrix` is an ordinary pod path, not
-  `/.well-known/*` (which core blanket-exempts). The WAC hook skips only paths
-  in `appPaths`, and the loader pushes a plugin's **single `prefix`** there.
-  A plugin has no way to push more roots — there is no `api.reservePath()` /
-  `api.appPaths.add()` — so it **cannot self-exempt its own surface**, and
-  every unexempted client call is 401'd by WAC before the handler runs.
+- **Authorization did not (before 0.0.219).** `/_matrix` is an ordinary pod
+  path, not `/.well-known/*` (which core blanket-exempts). The WAC hook skips
+  only paths in `appPaths`, and the loader pushes a plugin's **single
+  `prefix`** there. A plugin had no way to push more roots — there was no
+  `api.reservePath()` / `api.appPaths.add()` — so it **could not self-exempt
+  its own surface**, and every unexempted client call was 401'd by WAC before
+  the handler ran.
 
-The honest consequence: this shim is only usable if the **operator** widens
-`appPaths` by hand (`appPaths: ['/_matrix']`). That the finding now holds
-across **social (`activitypub`) → microblog (`mastodon`, `bluesky`) → chat
-(`matrix`)** is the point: the one-prefix model can't express *any* app whose
-routes are dictated by an external protocol at a fixed absolute root,
-regardless of protocol family. An `api.reservePath()` surface would close it
-uniformly.
+The honest consequence, at the time: the shim was only usable if the
+**operator** widened `appPaths` by hand (`appPaths: ['/_matrix']`). That the
+finding held across **social (`activitypub`) → microblog (`mastodon`,
+`bluesky`) → chat (`matrix`)** was the point: the one-prefix model couldn't
+express *any* app whose routes are dictated by an external protocol at a
+fixed absolute root, regardless of protocol family — an `api.reservePath()`
+surface would close it uniformly.
+
+**Closed — JSS 0.0.219 shipped exactly that seam (#602), consumed here.**
+`activate()` now calls `api.reservePath('/_matrix', { methods: ['GET',
+'HEAD', 'OPTIONS', 'POST', 'PUT'] })`: the literal reservation WAC-exempts
+the whole `/_matrix` subtree, widened to exactly the write verbs the routes
+implement (POST login/createRoom, PUT send-event) and no further — exempting
+a verb no route implements would let it fall through to core's LDP write
+wildcards as an unauthenticated storage write. A second plugin reserving the
+same root fails the boot loudly (naming both claimants), and route
+registration stays the plugin's job. The operator no longer touches
+`appPaths`.
 
 ### 2. The `/idp/credentials` token bridge generalizes to a 4th protocol
 

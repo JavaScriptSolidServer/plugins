@@ -11,8 +11,9 @@
 // Same probe-port-then-boot dance as mastodon/ and bluesky/: the shim needs
 // its server origin in config before listen (finding: api.serverInfo), and
 // idp:true gives us the /idp/register + /idp/credentials the token bridge
-// rides on. The fixed `/_matrix` root is widened into appPaths by hand (the
-// reserved-path finding — the operator must, a plugin can't self-exempt).
+// rides on. The fixed `/_matrix` root is self-reserved via api.reservePath
+// (#602), consumed as of JSS 0.0.219 — the reserved-path finding, closed:
+// the operator no longer widens appPaths by hand.
 
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
@@ -49,10 +50,9 @@ describe('matrix plugin', () => {
     jss = await startJss({
       port,
       idp: true,
-      // The finding in action: Matrix's fixed Client-Server root (/_matrix)
-      // is an absolute path no single plugin `prefix` can own, so the plugin
-      // can't self-exempt it from WAC — the operator widens appPaths by hand.
-      appPaths: ['/_matrix'],
+      // No appPaths here — the closed finding in action: the plugin claims
+      // + WAC-exempts the fixed /_matrix root itself via api.reservePath
+      // (#602), consumed as of JSS 0.0.219.
       plugins: [{ module: module_, config: { baseUrl: base } }],
     });
     const reg = await fetch(`${base}/idp/register`, {
