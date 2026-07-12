@@ -9,9 +9,10 @@
 //   auth boundary → POST /ap/<user>/outbox        no Bearer → 401
 //
 // Same probe-port-then-boot dance as mastodon/: the plugin needs its origin
-// in config before listen (finding: api.serverInfo), idp:true gives the
-// /idp/register + /idp/credentials the owner Bearer rides on, and appPaths
-// widens WAC past the plugin's single prefix to the fixed AP root.
+// in config before listen (finding: api.serverInfo), and idp:true gives the
+// /idp/register + /idp/credentials the owner Bearer rides on. No appPaths:
+// since JSS 0.0.219 the plugin reserves the fixed /ap root itself
+// (api.reservePath, #602).
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
@@ -48,10 +49,12 @@ describe('activitypub plugin', () => {
     jss = await startJss({
       port,
       idp: true,
-      // The finding in action: the fixed AP paths live OUTSIDE the plugin's
-      // single prefix, and the loader WAC-exempts only that prefix. Keeping
-      // everything under one /ap root means the operator exempts ONE path.
-      appPaths: ['/ap'],
+      // No appPaths: the fixed AP paths live OUTSIDE the plugin's single
+      // prefix, and as of JSS 0.0.219 the plugin claims + WAC-exempts the
+      // one /ap root itself via api.reservePath (#602) — the literal-root
+      // half of the finding, consumed. The SHARPER half stays open: the
+      // natural AP layout wants paths interleaved with the pod's /<user>/
+      // namespace (the parameterized case), and /ap is still the workaround.
       // NOTE: allowPrivateDelivery is deliberately NOT set — the instance runs
       // the DEFAULT (closed) SSRF policy, so the loopback-actor test below
       // exercises the real production default. maxInbox is lowered only so the

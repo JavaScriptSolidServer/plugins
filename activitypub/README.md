@@ -26,9 +26,10 @@ plugins: [{
 }]
 ```
 
-Because the AP paths are fixed and live outside the plugin's mount prefix, the
-operator must widen WAC: `createServer({ appPaths: ['/ap'], … })`. See
-**Findings**.
+The AP paths are fixed and live outside the plugin's mount prefix. Since JSS
+0.0.219 the plugin claims + WAC-exempts the `/ap` root itself at activate time
+via `api.reservePath('/ap', { methods: [...] })` (#602) — the operator no
+longer passes `appPaths`. See **Findings**.
 
 ## Endpoints
 
@@ -55,7 +56,7 @@ GET  /ap/fedialice/followers                   → contains bob
 POST /ap/fedialice/outbox  (no Bearer)         → 401
 ```
 
-**12 tests, all green:**
+**15 tests, all green:**
 
 ```bash
 cd .../plugins && node --test --test-concurrency=1 activitypub/test.js
@@ -141,24 +142,29 @@ real WAC, actor discovery composable with the webfinger/nip05 pattern — with
 replacing it. Two things it hits:
 
 1. **The fixed AP paths re-hit the reserved-path / `appPaths` seam
-   (Nth confirmation).** ActivityPub endpoints are conventionally
-   actor-rooted absolute paths (`/<user>/inbox`, `/<user>/outbox`, …) that
-   *collide with the pod's own LDP namespace* (`/<user>/…` **is** the pod).
-   Even mounted under one configurable root (`/ap`, chosen precisely to keep
-   it to **one** extra path — the bluesky/ move), the loader still WAC-exempts
-   only the plugin's single `prefix`; the AP root is not it, so **every
-   federation request 401s until the operator hand-passes
-   `appPaths: ['/ap']`**. This is the **same seam** mastodon/ (`/api` +
-   `/oauth`) and bluesky/ (`/xrpc`) hit — now a **fourth** independent
-   API-shim confirming it. The AP case sharpens the reason the seam is
-   *reservePath*, not *more prefixes*: the natural AP layout wants paths
-   **interleaved with** pod paths under the same `/<user>/` root, which no
-   single mount prefix can carve out. The seam NOTES.md already names —
-   `api.reservePath('/ap')` (or `paths: […]` in the plugin entry): the loader
-   exempts *and* claims each declared path and reports collisions — would let
-   this plugin own its surface and choose the canonical `/<user>/inbox` layout
-   without the operator editing `createServer`. Cross-ref NOTES §5 and
-   `mastodon/` + `bluesky/` "Findings".
+   (Nth confirmation) — the literal-root half is now CLOSED.** ActivityPub
+   endpoints are conventionally actor-rooted absolute paths (`/<user>/inbox`,
+   `/<user>/outbox`, …) that *collide with the pod's own LDP namespace*
+   (`/<user>/…` **is** the pod). Even mounted under one configurable root
+   (`/ap`, chosen precisely to keep it to **one** extra path — the bluesky/
+   move), the loader WAC-exempts only the plugin's single `prefix`; the AP
+   root is not it, so **every federation request 401'd until the operator
+   hand-passed `appPaths: ['/ap']`**. This was the **same seam** mastodon/
+   (`/api` + `/oauth`) and bluesky/ (`/xrpc`) hit — a **fourth** independent
+   API-shim confirming it. **Consumed as of JSS 0.0.219**: the seam shipped
+   as `api.reservePath` (#602) and this plugin now claims + WAC-exempts `/ap`
+   itself at activate time (methods widened to exactly the implemented verbs
+   — POST for the inbox/outbox, nothing wider, since an exemption on an
+   unimplemented write verb would fall through to LDP as an unauthenticated
+   write; collisions with another claimant fail the boot loudly). **The
+   SHARPER half remains open**: the AP case is why the seam is *reservePath*,
+   not *more prefixes* — the natural AP layout wants paths **interleaved
+   with** pod paths under the same `/<user>/` root, i.e. the parameterized
+   case, which the literal-subtree claim doesn't give a plugin a way to own
+   for a *whole namespace* (`/:user/inbox` for every user alongside the pod's
+   own `/:user/…` documents). `/ap` is still the workaround root; the
+   canonical `/<user>/inbox` layout is still out of reach. Cross-ref NOTES §5
+   and `mastodon/` + `bluesky/` "Findings".
 
 2. **Real federation needs HTTP Signature sign/verify — signing is in-plugin,
    verify needs a remote key fetch (both doable, no core seam).** Outbound

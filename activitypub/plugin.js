@@ -24,12 +24,14 @@
 // the pod's own LDP namespace (`/<user>/...` IS the pod). Like mastodon/
 // (fixed `/api` + `/oauth`) and bluesky/ (`/xrpc`), a plugin gets ONE mount
 // `prefix` and the loader WAC-exempts only that one prefix. To keep the AP
-// surface to a SINGLE extra root the operator must exempt, everything here
-// lives under one configurable base — `/ap/<user>/actor`, `/ap/<user>/outbox`,
-// … (default `apRoot: '/ap'`). This deviates from the AP convention of
-// actor-rooted absolute paths; the deviation, and the reserved-path/appPaths
-// seam it re-hits, are the README "Findings" (Nth confirmation of #582's
-// `api.reservePath`).
+// surface to a SINGLE extra root, everything here lives under one
+// configurable base — `/ap/<user>/actor`, `/ap/<user>/outbox`, … (default
+// `apRoot: '/ap'`). Since JSS 0.0.219 the plugin claims + WAC-exempts that
+// root ITSELF via `api.reservePath` (#602) — no more hand-passed
+// `appPaths: ['/ap']`. The deviation from AP's actor-rooted absolute paths
+// remains: the natural layout wants paths interleaved with the pod's
+// `/<user>/` namespace, and /ap is still the workaround root — the open
+// half of the README "Findings".
 //
 // -------------------------------------------------------- HTTP Signatures
 //
@@ -229,8 +231,17 @@ export async function activate(api) {
   }
   const loopback = (api.config.loopbackUrl || baseUrl).replace(/\/$/, '');
   // ONE extra root (default /ap): every AP path lives under it, so the
-  // operator exempts a single path via appPaths (see README findings).
+  // plugin claims a single path (see README findings).
   const apRoot = (api.config.apRoot || '/ap').replace(/\/$/, '');
+
+  // Claim + WAC-exempt the AP root (api.reservePath, #602, JSS 0.0.219):
+  // a literal path exempts the whole subtree, and a second plugin claiming
+  // it fails the boot loudly. Reservations are READ-ONLY by default
+  // (GET/HEAD/OPTIONS); POST is widened because the routes below implement
+  // it (inbox, and the owner-authed outbox). Nothing wider — exempting a
+  // write verb with no route would fall through to LDP's wildcards as an
+  // unauthenticated storage write.
+  api.reservePath(apRoot, { methods: ['GET', 'HEAD', 'OPTIONS', 'POST'] });
 
   const dir = api.storage.pluginDir();
   const keysDir = path.join(dir, 'keys');
@@ -605,7 +616,5 @@ export async function activate(api) {
     return ap(reply, 200, collection(user, 'following', loadState(user).following.map((f) => (typeof f === 'string' ? f : f.actor))));
   });
 
-  api.log.info(`activitypub: AP actor surface at ${apRoot}/<user>/{actor,outbox,inbox,followers,following} → pods via ${loopback} (issues #51/#164 Phase 1)`);
-  api.log.warn(`activitypub: ${apRoot} must be in appPaths or WAC will 401 every `
-    + 'federation request — the one-prefix plugin model cannot self-exempt fixed AP paths (see README findings)');
+  api.log.info(`activitypub: AP actor surface at ${apRoot}/<user>/{actor,outbox,inbox,followers,following} → pods via ${loopback} (issues #51/#164 Phase 1; root reserved via api.reservePath)`);
 }
