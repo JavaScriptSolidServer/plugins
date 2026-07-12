@@ -1323,6 +1323,296 @@ describe('forge plugin', () => {
     });
   });
 
+  // -------------------- polish wave: labels, search, releases, ref hygiene
+  // Labels: per-repo set in the issues index (GitHub's defaults until the
+  // first write), names on items, colored chips, ?label= filters. Search:
+  // read-time git grep + ls-tree over the default branch, bounded. Releases:
+  // every tag with streamed tar.gz/zip archives. Ref hygiene: refs/forge/*
+  // no longer rides ls-remote (uploadpack.hideRefs, creation + lazy heal).
+
+  describe('labels, search, releases and ref hygiene (polish wave)', () => {
+    let dana;
+    let apiBase;
+    const authed = (token) => ({ 'content-type': 'application/json', authorization: `Bearer ${token}` });
+
+    before(async () => {
+      dana = await mintToken(base, 'dana');
+      apiBase = `${base}/forge/api/repos/casey/demo`;
+    });
+
+    it("GitHub's default label set is served before any label was ever touched", async () => {
+      const res = await fetch(`${apiBase}/labels`);
+      assert.strictEqual(res.status, 200);
+      const { labels } = await res.json();
+      assert.deepStrictEqual(labels, [
+        { name: 'bug', color: 'd73a4a' },
+        { name: 'enhancement', color: 'a2eeef' },
+        { name: 'documentation', color: '0075ca' },
+        { name: 'question', color: 'd876e3' },
+        { name: 'wontfix', color: 'ffffff' },
+      ]);
+    });
+
+    it('label CRUD is owner-only; create validates color and 409s duplicates', async () => {
+      const mk = (token) => fetch(`${apiBase}/labels`, {
+        method: 'POST',
+        headers: token ? authed(token) : { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'triage', color: '00ff00' }),
+      });
+      assert.strictEqual((await mk(null)).status, 401, 'anonymous create');
+      assert.strictEqual((await mk(dana.access_token)).status, 403, 'non-owner create');
+
+      const res = await mk(casey.access_token);
+      assert.strictEqual(res.status, 201);
+      assert.deepStrictEqual(await res.json(), { name: 'triage', color: '00ff00' });
+      assert.strictEqual((await mk(casey.access_token)).status, 409, 'duplicate name');
+
+      const bad = await fetch(`${apiBase}/labels`, {
+        method: 'POST',
+        headers: authed(casey.access_token),
+        body: JSON.stringify({ name: 'x', color: 'red' }),
+      });
+      assert.strictEqual(bad.status, 422, 'color must be 6 hex digits');
+
+      const { labels } = await (await fetch(`${apiBase}/labels`)).json();
+      assert.deepStrictEqual(labels.map((l) => l.name),
+        ['bug', 'enhancement', 'documentation', 'question', 'wontfix', 'triage'],
+        'first write materialized the defaults and appended the custom label');
+    });
+
+    it('owner labels an issue; chips render with luminance-aware text; JSON is additive', async () => {
+      const res = await fetch(`${apiBase}/issues/2/labels`, {
+        method: 'PUT',
+        headers: authed(casey.access_token),
+        body: JSON.stringify({ labels: ['bug', 'triage'] }),
+      });
+      assert.strictEqual(res.status, 200);
+      assert.deepStrictEqual(await res.json(), { number: 2, labels: ['bug', 'triage'] });
+
+      const t = await (await fetch(`${apiBase}/issues/2`)).json();
+      assert.deepStrictEqual(t.labels, [
+        { name: 'bug', color: 'd73a4a' },
+        { name: 'triage', color: '00ff00' },
+      ], 'detail JSON resolves names to {name, color}');
+
+      const html = await (await fetch(`${base}/forge/casey/demo/issues/2`)).text();
+      assert.ok(html.includes('background:#d73a4a;color:#ffffff'), 'dark chip gets white text');
+      assert.ok(html.includes('background:#00ff00;color:#1f2328'), 'bright chip gets dark text');
+      assert.ok(html.includes('>bug</span>'), 'chip carries the label name');
+
+      const list = await (await fetch(`${base}/forge/casey/demo/issues`)).text();
+      assert.ok(list.includes('label-chip'), 'chips on the list rows too');
+    });
+
+    it('owner labels a pull request; the pulls list row shows the chip', async () => {
+      const res = await fetch(`${apiBase}/pulls/5/labels`, {
+        method: 'PUT',
+        headers: authed(casey.access_token),
+        body: JSON.stringify({ labels: ['enhancement'] }),
+      });
+      assert.strictEqual(res.status, 200);
+      const pr = await (await fetch(`${apiBase}/pulls/5`)).json();
+      assert.deepStrictEqual(pr.labels, [{ name: 'enhancement', color: 'a2eeef' }]);
+      const list = await (await fetch(`${base}/forge/casey/demo/pulls`)).text();
+      assert.ok(list.includes('>enhancement</span>'), 'chip on the open-PR row');
+    });
+
+    it('?label= filters both lists and composes with the state filter', async () => {
+      const li = await (await fetch(`${apiBase}/issues?label=triage`)).json();
+      assert.deepStrictEqual(li.issues.map((i) => i.number), [2]);
+      const closedTriage = await (await fetch(`${apiBase}/issues?state=closed&label=triage`)).json();
+      assert.deepStrictEqual(closedTriage.issues, [], 'label filter composes with state');
+
+      const lp = await (await fetch(`${apiBase}/pulls?label=enhancement`)).json();
+      assert.deepStrictEqual(lp.pulls.map((p) => p.number), [5]);
+      const none = await (await fetch(`${apiBase}/pulls?label=bug`)).json();
+      assert.deepStrictEqual(none.pulls, []);
+
+      const html = await (await fetch(`${base}/forge/casey/demo/issues?label=wontfix`)).text();
+      assert.ok(html.includes('No open issues.'), 'HTML list honors the filter (clean empty state)');
+    });
+
+    it('a non-owner non-author cannot set labels; unknown names are 422; authors may', async () => {
+      const forbidden = await fetch(`${apiBase}/issues/2/labels`, {
+        method: 'PUT',
+        headers: authed(dana.access_token), // dana: not the owner, not the author of #2
+        body: JSON.stringify({ labels: ['bug'] }),
+      });
+      assert.strictEqual(forbidden.status, 403);
+      const anon = await fetch(`${apiBase}/issues/2/labels`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ labels: ['bug'] }),
+      });
+      assert.strictEqual(anon.status, 401);
+      const unknown = await fetch(`${apiBase}/issues/2/labels`, {
+        method: 'PUT',
+        headers: authed(casey.access_token),
+        body: JSON.stringify({ labels: ['no-such-label'] }),
+      });
+      assert.strictEqual(unknown.status, 422, 'names are validated against the repo set');
+
+      const own = await fetch(`${apiBase}/issues/3/labels`, {
+        method: 'PUT',
+        headers: authed(dana.access_token), // dana authored #3
+        body: JSON.stringify({ labels: ['question'] }),
+      });
+      assert.strictEqual(own.status, 200, 'the item author may label without owning the repo');
+    });
+
+    it('label rename cascades onto items; delete cascades OFF issues and pulls', async () => {
+      const re = await fetch(`${apiBase}/labels/triage`, {
+        method: 'PATCH',
+        headers: authed(casey.access_token),
+        body: JSON.stringify({ name: 'needs-triage', color: '112233' }),
+      });
+      assert.strictEqual(re.status, 200);
+      assert.deepStrictEqual(await re.json(), { name: 'needs-triage', color: '112233' });
+      let t = await (await fetch(`${apiBase}/issues/2`)).json();
+      assert.deepStrictEqual(t.labels.map((l) => l.name), ['bug', 'needs-triage'], 'rename followed the assignment');
+
+      const del = await fetch(`${apiBase}/labels/needs-triage`, { method: 'DELETE', headers: authed(casey.access_token) });
+      assert.strictEqual(del.status, 200);
+      t = await (await fetch(`${apiBase}/issues/2`)).json();
+      assert.deepStrictEqual(t.labels.map((l) => l.name), ['bug'], 'deleted label fell off the issue');
+      assert.strictEqual((await fetch(`${apiBase}/labels/needs-triage`, {
+        method: 'DELETE', headers: authed(casey.access_token),
+      })).status, 404, 'second delete is a clean 404');
+
+      const del2 = await fetch(`${apiBase}/labels/enhancement`, { method: 'DELETE', headers: authed(casey.access_token) });
+      assert.strictEqual(del2.status, 200);
+      const pr = await (await fetch(`${apiBase}/pulls/5`)).json();
+      assert.deepStrictEqual(pr.labels, [], 'delete cascades off pull requests too');
+    });
+
+    it('the repo list ?q= filter is a plain server-side GET form (no JS)', async () => {
+      const html = await (await fetch(`${base}/forge/?q=nrepo`)).text();
+      assert.ok(html.includes('name="q"'), 'search box rendered');
+      assert.ok(html.includes('/nrepo'), 'matching repo listed');
+      assert.ok(!html.includes('/forge/casey/demo"'), 'non-matching repos filtered out');
+
+      const byDesc = await (await fetch(`${base}/forge/?q=angle`)).text();
+      assert.ok(byDesc.includes('/forge/casey/demo'), 'description substring matches');
+
+      const none = await (await fetch(`${base}/forge/?q=zzz-nothing-here`)).text();
+      assert.ok(none.includes('No repositories match'), 'clean empty state');
+    });
+
+    it('in-repo search greps the default branch: path + line + excerpt, bounded shape', async () => {
+      const s = await (await fetch(`${apiBase}/search?q=subdir`)).json();
+      assert.strictEqual(s.q, 'subdir');
+      assert.strictEqual(s.ref, 'main');
+      assert.strictEqual(s.truncated, false);
+      assert.ok(Array.isArray(s.paths));
+      const hit = s.matches.find((m) => m.path === 'docs/notes.txt');
+      assert.ok(hit, `known string found: ${JSON.stringify(s.matches)}`);
+      assert.strictEqual(hit.line, 1);
+      assert.ok(hit.text.includes('notes live in a subdir'), 'line excerpt');
+
+      const p = await (await fetch(`${apiBase}/search?q=notes`)).json();
+      assert.ok(p.paths.includes('docs/notes.txt'), 'file paths matched by name');
+
+      const html = await (await fetch(`${base}/forge/casey/demo/search?q=subdir`)).text();
+      assert.ok(html.includes('docs/notes.txt'), 'path shown');
+      assert.ok(html.includes('#L1'), 'line-anchored blob link');
+      assert.ok(html.includes('notes live in a subdir'), 'excerpt shown');
+
+      const home = await (await fetch(`${base}/forge/casey/demo`)).text();
+      assert.ok(home.includes('action="/forge/casey/demo/search"'), 'search box on the Code tab');
+
+      assert.strictEqual((await fetch(`${apiBase}/search`)).status, 422, 'q is required on the api');
+    });
+
+    it('search misses cleanly and hostile queries/excerpts render escaped', async () => {
+      const miss = await (await fetch(`${apiBase}/search?q=zqxjkwv`)).json();
+      assert.deepStrictEqual({ paths: miss.paths, matches: miss.matches }, { paths: [], matches: [] });
+      const html = await (await fetch(`${base}/forge/casey/demo/search?q=zqxjkwv`)).text();
+      assert.ok(html.includes('No results'), 'clean empty state');
+
+      const evil = await (await fetch(`${base}/forge/casey/demo/search?q=${encodeURIComponent('<script>alert(9)</script>')}`)).text();
+      assert.ok(!evil.includes('<script>alert(9)'), 'no literal script tag from the query');
+      assert.ok(evil.includes('&lt;script&gt;alert(9)'), 'query visible but escaped');
+
+      // excerpts are escaped too: README.md really contains a <script> line
+      const x = await (await fetch(`${base}/forge/casey/demo/search?q=${encodeURIComponent('<script>')}`)).text();
+      assert.ok(x.includes('&lt;script&gt;'), 'matching excerpt visible, escaped');
+      assert.ok(!x.includes('<script>alert'), 'no literal attack markup from excerpts');
+    });
+
+    it('releases: every tag newest first, annotated message shown, download links', async () => {
+      await git(['tag', '-a', 'v2.0', '-m', 'Second release with search'], { cwd: work });
+      await git([...authFlag(casey.access_token), 'push', '--quiet', remote, 'v2.0'], { cwd: work });
+
+      const { releases } = await (await fetch(`${apiBase}/releases`)).json();
+      assert.deepStrictEqual(releases.map((r) => r.tag), ['v2.0', 'v1.0'], 'newest first');
+      assert.strictEqual(releases[0].annotated, true);
+      assert.strictEqual(releases[0].message, 'Second release with search', "the annotated tag's message");
+      assert.strictEqual(releases[1].annotated, false);
+      assert.strictEqual(releases[1].message, null, 'lightweight tags have no message');
+      assert.match(releases[0].sha, /^[0-9a-f]{40,64}$/, 'peeled to the commit sha');
+      assert.strictEqual(releases[0].tarball, '/forge/casey/demo/archive/v2.0.tar.gz');
+      assert.strictEqual(releases[0].zipball, '/forge/casey/demo/archive/v2.0.zip');
+
+      const html = await (await fetch(`${base}/forge/casey/demo/releases`)).text();
+      assert.ok(html.includes('v2.0') && html.includes('Second release with search'), 'release card');
+      assert.ok(html.includes('archive/v2.0.tar.gz') && html.includes('archive/v1.0.zip'), 'download buttons');
+
+      const tags = await (await fetch(`${base}/forge/casey/demo/tags`)).text();
+      assert.ok(tags.includes('href="/forge/casey/demo/releases"'), 'the Tags tab links to Releases');
+    });
+
+    it('archive tar.gz streams, and a real tar round-trips a known file', async () => {
+      const res = await fetch(`${base}/forge/casey/demo/archive/v2.0.tar.gz`);
+      assert.strictEqual(res.status, 200);
+      assert.match(res.headers.get('content-type'), /^application\/gzip/);
+      assert.match(res.headers.get('content-disposition') ?? '', /attachment; filename="demo-v2\.0\.tar\.gz"/);
+
+      const tarPath = path.join(tmp, 'demo-v2.0.tar.gz');
+      fs.writeFileSync(tarPath, Buffer.from(await res.arrayBuffer()));
+      const extractDir = path.join(tmp, 'extract');
+      fs.mkdirSync(extractDir, { recursive: true });
+      await execFileP('tar', ['-xzf', tarPath, '-C', extractDir]);
+      assert.strictEqual(
+        fs.readFileSync(path.join(extractDir, 'demo-v2.0', 'docs', 'notes.txt'), 'utf8'),
+        'notes live in a subdir\none more note\n',
+        'a known file round-trips byte-identical through git archive + tar',
+      );
+    });
+
+    it('archive zip has the right content-type and disposition; bogus refs are 404', async () => {
+      const zip = await fetch(`${base}/forge/casey/demo/archive/main.zip`);
+      assert.strictEqual(zip.status, 200);
+      assert.match(zip.headers.get('content-type'), /^application\/zip/);
+      assert.match(zip.headers.get('content-disposition') ?? '', /attachment; filename="demo-main\.zip"/);
+      const bytes = Buffer.from(await zip.arrayBuffer());
+      assert.strictEqual(bytes.subarray(0, 2).toString('latin1'), 'PK', 'a real zip stream');
+
+      assert.strictEqual((await fetch(`${base}/forge/casey/demo/archive/nosuchtag.tar.gz`)).status, 404);
+      assert.strictEqual((await fetch(`${base}/forge/casey/demo/archive/v2.0.rar`)).status, 404, 'unknown format');
+      const evil = await fetch(`${base}/forge/casey/demo/archive/..%2fmain.tar.gz`);
+      assert.ok(evil.status >= 400 && evil.status < 500, `traversal-ish ref got ${evil.status}`);
+    });
+
+    it('refs/forge/* are hidden from ls-remote; the lazy config heals old repos', async () => {
+      const dir = repoDir('casey', 'demo');
+      const internal = (await git(['-C', dir, 'for-each-ref', 'refs/forge'])).stdout;
+      assert.ok(internal.includes('refs/forge/heads/dana/feature'), 'the internal compare refs really exist');
+
+      let ls = (await git(['ls-remote', remote])).stdout;
+      assert.ok(!ls.includes('refs/forge/'), 'hidden by the creation-time config (closes Finding 15)');
+
+      // simulate a pre-polish repo: drop the config and the refs ride again
+      await git(['-C', dir, 'config', '--unset', 'uploadpack.hideRefs']);
+      ls = (await git(['ls-remote', remote])).stdout;
+      assert.ok(ls.includes('refs/forge/'), 'without the config the refs leak (the Finding 15 behavior)');
+
+      // any compare that path-fetches a cross-repo head re-applies it lazily
+      assert.strictEqual((await fetch(`${apiBase}/compare/main...dana:feature`)).status, 200);
+      ls = (await git(['ls-remote', remote])).stdout;
+      assert.ok(!ls.includes('refs/forge/'), 'the first compare-fetch healed the config');
+    });
+  });
+
   // ---------------------------------------------------------- edge cases
 
   it('a repo with no README renders its home page without error', async () => {

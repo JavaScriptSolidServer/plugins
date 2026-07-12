@@ -1,4 +1,4 @@
-# forge — a personal git forge (tier 1: hosting + browsing; tier 2: issues; tier 2.5: nostr agents + xlogin; tier 3a: forks + pull requests)
+# forge — a personal git forge (tier 1: hosting + browsing; tier 2: issues; tier 2.5: nostr agents + xlogin; tier 3a: forks + pull requests; polish: labels, search, releases)
 
 The useful slice of Gogs/Gitea as a JSS plugin: push a repo over smart
 HTTP, get a GitHub-style (light theme) web UI for it — repo list, file
@@ -11,7 +11,12 @@ architecture below). Tier 2.5 makes **did:nostr agents first-class**
 issue bodies for podless agents) and puts the vendored **xlogin** widget
 on the issues pages. Tier 3a adds **forks, compare, and pull requests
 with real merges** (`merge-tree --write-tree` + `commit-tree` +
-compare-and-swap `update-ref` — see "Forks & pull requests").
+compare-and-swap `update-ref` — see "Forks & pull requests"). The polish
+wave adds **labels** on issues and PRs (GitHub's default set, colored
+chips, `?label=` filters), **read-time search** (repo-list filter +
+in-repo `git grep`, bounded, no index), **releases** (every tag with
+streamed tar.gz/zip archives), and hides the internal compare refs from
+`ls-remote` (closing Finding 15).
 Zero npm dependencies, zero build step, no
 framework: every page is server-rendered HTML with inline CSS, all git
 work is done by the system `git` binary, and the wire protocol is
@@ -70,11 +75,14 @@ git -c http.extraHeader="Authorization: Bearer <token>" push forge main
 | `.../commits/<ref>?page=N` | log, 30/page: message, short sha, author, relative time, identicon |
 | `.../commit/<sha>` | full commit with GitHub-style unified diff (collapsible per-file sections, +N/−M counts) |
 | `.../branches`, `.../tags` | ref lists |
-| `.../issues?state=open\|closed&page=N` | issue list: GitHub-style filter tabs, green open / purple closed icons, relative times, comment counts |
+| `.../issues?state=open\|closed&label=<name>&page=N` | issue list: GitHub-style filter tabs, label chips, green open / purple closed icons, relative times, comment counts |
+| `.../search?q=<text>` | read-time code search over the DEFAULT branch: `git grep` hits (path:line + escaped excerpt) plus matching file paths — bounded, no index |
+| `.../releases` | every tag, newest first: annotated-tag message, commit link, tar.gz + zip download buttons (linked from the Tags tab) |
+| `.../archive/<ref>.tar.gz`, `.../archive/<ref>.zip` | `git archive` streamed (attachment, `--prefix=<repo>-<ref>/`); unresolvable refs are 404 |
 | `.../issues/<n>` | thread: issue body then comments in comment boxes (identicon, author → WebID link, relative time, `owner` badge), markdown bodies |
 | `.../issues/new` | new-issue form (vanilla-JS client, see below) |
 | `.../compare/<base>...[<owner>:]<ref>` | compare view: ahead/behind counts, the ahead commit list, the structured diff, an "Open pull request" button |
-| `.../pulls?state=open\|merged\|closed&page=N` | PR list: three-state filter tabs — green open, purple merged, red closed |
+| `.../pulls?state=open\|merged\|closed&label=<name>&page=N` | PR list: three-state filter tabs — green open, purple merged, red closed — plus label chips |
 | `.../pulls/<n>` | PR conversation: state banner (merged / closed / clean-with-merge-button / conflict list), thread, comment form |
 | `.../pulls/<n>/commits`, `.../pulls/<n>/files` | GitHub-style sub-tabs: the ahead commits, the structured diff |
 | `.../pulls/new?base=...&head=...` | new-PR form (from the compare page) |
@@ -146,6 +154,36 @@ Tier 3a (additive):
   (stale `expectedBase`, or a race caught by update-ref's old-value
   guard); 501 naming the git version when `merge-tree --write-tree` is
   missing (needs git ≥ 2.38).
+
+Polish wave (additive):
+
+- Issue/pull list entries and details gain `labels:
+  [{ name, color }]` (resolved against the repo's label set; empty array
+  when unlabeled — pre-polish consumers keep working).
+- `GET api/repos/<o>/<n>/labels` → `{ labels: [{ name, color }] }` —
+  GitHub's default set (`bug` #d73a4a, `enhancement` #a2eeef,
+  `documentation` #0075ca, `question` #d876e3, `wontfix` #ffffff) until
+  the first label write materializes it into the repo's index.
+- `POST .../labels` `{name, color}` (OWNER only; color = 6 hex digits,
+  name 1–50 printable chars) → 201 `{ name, color }`; 409 on a
+  (case-insensitive) duplicate.
+- `PATCH .../labels/<name>` `{name?, color?}` (owner) → `{ name, color }`
+  — a rename cascades onto every issue and pull carrying it.
+- `DELETE .../labels/<name>` (owner) → `{ name, deleted: true }` — the
+  label falls off every issue and pull (items store names, so a recolor
+  needs no cascade at all).
+- `PUT .../issues/<n>/labels` / `PUT .../pulls/<n>/labels`
+  `{labels: [names]}` (repo owner or the item's author) → `{ number,
+  labels }` — replaces the item's set; unknown names are 422 (max 20).
+- `GET .../issues?label=<name>` / `GET .../pulls?label=<name>` — filters,
+  composing with `state`.
+- `GET .../search?q=<text>` →
+  `{ q, ref, paths: [...], matches: [{ path, line, text }], truncated }`
+  — read-time grep of the default branch (see "Search"); 422 without `q`.
+- `GET .../releases` →
+  `{ releases: [{ tag, sha, at, annotated, message, tarball, zipball }] }`
+  — every tag, newest first; `message` is the first line of an annotated
+  tag's message, `null` for lightweight tags; `sha` is the peeled commit.
 
 Errors are `{ error }` with 4xx. `cloneUrl` is absolute: the origin comes
 from `api.serverInfo` (#601) at request time, with `config.baseUrl` as
@@ -292,6 +330,51 @@ somewhere to keep the words (pod or hosted); close/reopen are for the
 target repo owner or the PR author; **merge is target repo owner
 only**. Anonymous writes are 401, everything else 403 — house rules.
 
+## Labels (polish)
+
+The per-repo label SET lives in the repo's issues index file
+(`idx.labels`); until the first label write, GitHub's default five apply
+(and are what `GET .../labels` serves), so every repo has useful labels
+with zero setup. Items — issues AND pull requests — store label **names**
+only: a recolor is one index write with no cascade, while rename/delete
+cascade over both the issues and pulls indexes under their locks. Chips
+render GitHub-style (rounded-full, background = the label color,
+black-ish/white text picked by perceptual luminance, hairline border so
+`wontfix`'s white survives). Authorization is two-level, matching the
+close/reopen beat: the label set is the OWNER's (CRUD), a given item's
+labels are settable by the owner **or that item's author**.
+
+## Search (polish)
+
+Deliberately **read-time only — nothing is indexed**:
+
+- The repo list (`<prefix>/?q=`) is a plain GET form (no JS): a
+  case-insensitive substring filter over `owner/name` and description of
+  the (already capped at 200) repo cards.
+- In-repo (`.../search?q=`, HTML + api): one `git ls-tree -r --name-only`
+  pass for path matches plus one `git grep -I -n -i -F` over the
+  **default branch** — `-F` means literal substring (no regex
+  injection), `-I` skips binaries, `-i` case-insensitive. Bounds, all
+  hard: 256-char query, 100 grep hits, 100 path matches, 5 hits per file
+  (`--max-count`, git ≥ 2.38 — the same floor merge-tree already probes;
+  on older gits the per-file bound drops and the total cap still holds),
+  200-char excerpts, escaped like everything else. The documented cost:
+  O(repo) work per query, which is the right trade at personal-forge
+  scale; an index would be cache-invalidation machinery the plugin api
+  cannot power yet (Finding 5's family).
+
+## Releases (polish)
+
+`.../releases` lists **every tag, newest first** (`for-each-ref
+--sort=-creatordate`) — annotated tags show the first line of their tag
+message, lightweight tags are marked as such — each with tar.gz and zip
+download buttons. `.../archive/<ref>.tar.gz|.zip` runs `git archive
+--format=… --prefix=<repo>-<ref>/ <ref>` and **streams the child's
+stdout** to the response (attachment disposition, no buffering); the ref
+is validated (`okRef`/sha) and resolved with `rev-parse` *before* any
+header goes out, so a bogus ref is a clean 404. Any resolvable ref works
+— tags, branches, shas — which is exactly GitHub's archive behavior.
+
 ## Nostr agents (tier 2.5)
 
 ### Identity model — hex canonical, npub display-only
@@ -436,7 +519,8 @@ detection is a NUL sniff over the first 8 KB.
 - Client-side JavaScript is the clone-box copy button (degrades to a
   selectable input) and the issues client above (degrades to read-only
   pages). The page CSP grants `connect-src 'self'` — exactly enough for
-  the client's same-origin fetches, nothing outbound.
+  the client's same-origin fetches, nothing outbound — and
+  `form-action 'self'` for the no-JS search forms (Finding 16).
 
 ## Deliberate cuts
 
@@ -444,9 +528,11 @@ detection is a NUL sniff over the first 8 KB.
   bundle came from. A `<pre>` with line numbers covers tier-1 browsing;
   highlighting is a candidate for a later wave *if* it can be done
   server-side and dependency-free.
-- **No search, no webhooks** — later tiers (see Findings 3). Issues
-  arrived in tier 2; PRs arrived in tier 3a with the same pod-native
-  treatment (bodies in pods, spine in pluginDir).
+- **No search index, no webhooks** — search arrived in the polish wave
+  as bounded read-time grep (see "Search"); webhooks still want
+  `api.events` (see Findings 3). Issues arrived in tier 2; PRs arrived
+  in tier 3a with the same pod-native treatment (bodies in pods, spine
+  in pluginDir).
 - **No browser-git** — every byte of git logic is the system binary;
   server-side rendering made the old client bundle unnecessary.
 
@@ -691,3 +777,24 @@ proportional to compared branches. The alternative (fetch into a
 temp ref + delete) re-downloads objects on every compare AND still
 leaves the objects in the odb until gc. If it ever grates,
 `uploadpack.hideRefs=refs/forge` per repo is the one-line cure.
+
+**Closed in the polish wave**: the one-line cure is applied —
+`uploadpack.hideRefs=refs/forge/` is set in every repo's git config at
+creation (materialize AND fork), and lazily on the first compare-fetch
+for repos that predate it (a cheap config-file read skips the git spawn
+once the line exists). Test-proven with a real `git ls-remote`: the
+internal refs exist in the repo, and do not ride the wire.
+
+### 16. CSP form-action 'none' blocks even a plain GET form
+
+The search boxes are the no-JS ideal — `<form method="get">`, a text
+input, the server filters — and they silently did nothing under the
+tier-1 CSP, because `form-action 'none'` governs ALL form submissions,
+navigation-only GET forms included (unlike `connect-src`, which only
+sees script-initiated fetches). The delta is `form-action 'self'`: form
+targets stay same-origin, which is exactly what the search forms need
+and all they can reach. Worth writing down because the failure mode is
+invisible — the page renders, the button clicks, nothing happens, and
+only the browser console says why. Same lesson as Finding 8's
+connect-src discovery: each new *kind* of page interactivity trips a
+different CSP directive.

@@ -1,6 +1,7 @@
 // forge — a personal git forge (tier 1: hosting + browsing; tier 2: issues
 // + comments; tier 2.5: first-class did:nostr agents + the xlogin widget;
-// tier 3a: forks, compare, and pull requests with REAL merges)
+// tier 3a: forks, compare, and pull requests with REAL merges; polish:
+// labels, read-time search, releases/archives, hidden compare refs)
 // as a #206 loader plugin. The useful slice of Gogs/Gitea: push
 // a repo, get a GitHub-style web UI for it — with the constraints that
 // killed the last attempt made absolute: zero npm dependencies, zero build
@@ -23,7 +24,11 @@
 //   commits       <prefix>/<owner>/<name>/commits/<ref>?page=N
 //   commit        <prefix>/<owner>/<name>/commit/<sha>
 //   refs          <prefix>/<owner>/<name>/{branches,tags}
-//   issues        <prefix>/<owner>/<name>/issues[?state=|/new|/<n>]
+//   issues        <prefix>/<owner>/<name>/issues[?state=&label=|/new|/<n>]
+//   search        <prefix>/<owner>/<name>/search?q=          (default branch, read-time)
+//   releases      <prefix>/<owner>/<name>/releases           (every tag, newest first)
+//   archive       <prefix>/<owner>/<name>/archive/<ref>.{tar.gz,zip}
+//   labels        <prefix>/api/repos/<o>/<n>/labels[/<name>] (+ PUT .../{issues,pulls}/<n>/labels)
 //   compare       <prefix>/<owner>/<name>/compare/<base>...[<owner>:]<ref>
 //   pulls         <prefix>/<owner>/<name>/pulls[?state=|/new|/<n>[/commits|/files]]
 //   fork          POST <prefix>/api/repos/<o>/<n>/fork
@@ -136,6 +141,23 @@ const THREAD_FETCH_CONCURRENCY = 8;     // parallel loopback GETs at read time
 const THREAD_FETCH_TIMEOUT_MS = 8000;
 const ISSUE_NUM_RE = /^[1-9][0-9]{0,8}$/;
 
+// Polish wave: labels (GitHub's default set), search bounds, archive bounds.
+const DEFAULT_LABELS = [
+  { name: 'bug', color: 'd73a4a' },
+  { name: 'enhancement', color: 'a2eeef' },
+  { name: 'documentation', color: '0075ca' },
+  { name: 'question', color: 'd876e3' },
+  { name: 'wontfix', color: 'ffffff' },
+];
+const LABEL_NAME_RE = /^[^\x00-\x1f\x7f]{1,50}$/; // printable, 1-50 chars
+const LABEL_COLOR_RE = /^[0-9a-fA-F]{6}$/;
+const LABELS_PER_ITEM = 20;
+const SEARCH_QUERY_CAP = 256;   // chars of query
+const SEARCH_HIT_CAP = 100;     // total grep hits returned
+const SEARCH_PATH_CAP = 100;    // total path matches returned
+const SEARCH_PER_FILE_CAP = 5;  // grep --max-count per file
+const SEARCH_EXCERPT_CAP = 200; // chars of line excerpt
+
 // ---------------------------------------------------------------- helpers
 
 const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
@@ -165,6 +187,22 @@ function relTime(unixSecs) {
     }
   }
   return '';
+}
+
+/**
+ * GitHub-style chip readability: perceptual luminance of the (validated
+ * 6-hex) label color decides black-ish or white text on the chip.
+ */
+function labelTextColor(hex) {
+  const r = parseInt(hex.slice(0, 2), 16);
+  const g = parseInt(hex.slice(2, 4), 16);
+  const b = parseInt(hex.slice(4, 6), 16);
+  return (0.299 * r + 0.587 * g + 0.114 * b) > 140 ? '#1f2328' : '#ffffff';
+}
+
+/** Rounded-full colored chips for resolved label defs [{name, color}]. */
+function labelChips(labels) {
+  return labels.map((l) => `<span class="label-chip" style="background:#${esc(l.color)};color:${labelTextColor(l.color)}">${esc(l.name)}</span>`).join(' ');
 }
 
 function fmtBytes(n) {
@@ -630,6 +668,13 @@ h1.page{font-size:24px;margin:0 0 16px}
   border-radius:8px;padding:10px 16px;margin-bottom:16px;font-size:13px}
 .aheadbehind{display:inline-block;border:1px solid #d0d7de;border-radius:6px;padding:2px 10px;
   font-size:12px;color:#59636e}
+.label-chip{display:inline-block;padding:0 8px;border-radius:999px;font-size:12px;font-weight:500;
+  line-height:18px;border:1px solid rgba(31,35,40,0.12);vertical-align:middle;white-space:nowrap}
+.searchform{display:flex;gap:8px;align-items:center}
+.searchform input{padding:5px 12px;border:1px solid #d0d7de;border-radius:6px;font-size:14px;
+  background:#ffffff;min-width:220px}
+.excerpt{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;
+  white-space:pre-wrap;word-break:break-all;color:#1f2328}
 `;
 
 // connect-src 'self' is load-bearing for tier 2: the issues client drives
@@ -648,9 +693,11 @@ function buildCsp(cspConnect) {
   const extra = (Array.isArray(cspConnect) ? cspConnect : [])
     .filter((o) => typeof o === 'string' && /^https?:\/\/[^\s;'"]+$/.test(o));
   const connect = ["'self'", ...extra].join(' ');
+  // form-action is 'self', not 'none': the search boxes are plain GET
+  // forms (no JS), and CSP form-action blocks even those (a Finding).
   return "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' https: data:; "
     + `script-src 'unsafe-inline' 'self' https://esm.sh; connect-src ${connect}; `
-    + "base-uri 'none'; form-action 'none'";
+    + "base-uri 'none'; form-action 'self'";
 }
 
 // ---------------------------------------------------------------- activate
@@ -968,6 +1015,19 @@ export async function activate(api) {
     return count;
   }
 
+  /**
+   * Finding 15's cure (ref hygiene): the internal compare refs
+   * (refs/forge/*) must not ride ls-remote. Set at repo creation, and
+   * lazily here for repos that predate the config — the cheap fs read
+   * skips the git spawn once the line exists.
+   */
+  async function ensureForgeRefsHidden(dir) {
+    try {
+      if (/hideRefs\s*=\s*refs\/forge\//.test(fs.readFileSync(path.join(dir, 'config'), 'utf8'))) return;
+    } catch { /* unreadable config: attempt the write anyway */ }
+    await execFileP('git', ['-C', dir, 'config', 'uploadpack.hideRefs', 'refs/forge/'], { env: gitEnv }).catch(() => {});
+  }
+
   /** 'ref' or 'owner:ref' -> { owner, ref } (validated), or null. */
   function parseHeadSpec(baseOwner, headSpec) {
     if (typeof headSpec !== 'string' || headSpec.length > 320) return null;
@@ -998,6 +1058,7 @@ export async function activate(api) {
     }
     const headDir = repoDirOf(parsed.owner, name);
     if (!fs.existsSync(headDir)) return null;
+    await ensureForgeRefsHidden(dir); // lazy heal for pre-polish repos
     const localRef = `refs/forge/heads/${parsed.owner}/${parsed.ref}`;
     try {
       await execFileP('git', ['-C', dir, 'fetch', '--quiet', '--no-tags', headDir,
@@ -1166,6 +1227,90 @@ export async function activate(api) {
   }
   function openPullCount(owner, name) {
     return Object.values(loadPullIndex(owner, name).pulls).filter((p) => p.state === 'open').length;
+  }
+
+  // ------------------------------------------------- labels model (polish)
+  // The per-repo label SET lives in the repo's issues index file
+  // (idx.labels); GitHub's default set applies until the first label write
+  // materializes it. Items (issues AND pulls) store label NAMES only, so a
+  // recolor needs no cascade; rename/delete cascade over both indexes.
+
+  /** The effective label set: idx.labels, or the (unmaterialized) defaults. */
+  function labelDefs(owner, name) {
+    const idx = loadIssueIndex(owner, name);
+    return Array.isArray(idx.labels) ? idx.labels : DEFAULT_LABELS.map((l) => ({ ...l }));
+  }
+  /** First label WRITE materializes the defaults into the index. */
+  function ensureLabels(idx) {
+    if (!Array.isArray(idx.labels)) idx.labels = DEFAULT_LABELS.map((l) => ({ ...l }));
+    return idx.labels;
+  }
+  /** Item label names -> [{name, color}] against the repo's defs. */
+  function resolveLabels(names, defs) {
+    return (Array.isArray(names) ? names : []).map((n) => defs.find((d) => d.name === n) ?? { name: n, color: 'ededed' });
+  }
+
+  // ------------------------------------------------- search model (polish)
+  // Read-time only, deliberately UNindexed: one `git ls-tree` for path
+  // matches plus one `git grep -I -n -i -F` over the DEFAULT branch,
+  // bounded (query 256 chars, 100 hits, 100 paths, 5 hits/file, 200-char
+  // excerpts). The documented cost: O(repo) per query, fine at forge scale.
+  async function searchData(owner, name, q) {
+    const dir = repoDirOf(owner, name);
+    const branch = await defaultBranch(dir);
+    const out = { q, ref: branch, paths: [], matches: [], truncated: false };
+    const needle = q.toLowerCase();
+    try {
+      for (const p of (await gitText(dir, ['ls-tree', '-r', '--name-only', '-z', branch])).split('\0')) {
+        if (!p || !p.toLowerCase().includes(needle)) continue;
+        if (out.paths.length >= SEARCH_PATH_CAP) { out.truncated = true; break; }
+        out.paths.push(p);
+      }
+    } catch { /* empty repo: nothing to search */ }
+    try {
+      // -I skips binaries; -F is literal (no regex injection); -z makes the
+      // output parseable even for paths containing ':' — the record shape
+      // is `<tree>:<path>\0<line>\0<text>\n`. --max-count needs git >= 2.38
+      // (the merge-tree floor, already probed); without it the total cap
+      // still holds, one file can just dominate.
+      const args = ['grep', '-I', '-n', '-i', '-F', '-z'];
+      if (mergeTreeOk) args.push(`--max-count=${SEARCH_PER_FILE_CAP}`);
+      const hits = await gitText(dir, [...args, '-e', q, branch]);
+      for (const line of hits.split('\n')) {
+        if (!line) continue;
+        const [treePath, lineNo, ...text] = line.split('\0');
+        if (lineNo === undefined) continue;
+        if (out.matches.length >= SEARCH_HIT_CAP) { out.truncated = true; break; }
+        out.matches.push({
+          path: treePath.slice(treePath.indexOf(':') + 1),
+          line: +lineNo,
+          text: text.join('\0').slice(0, SEARCH_EXCERPT_CAP),
+        });
+      }
+    } catch { /* git grep exits 1 on no match — an empty result, not an error */ }
+    return out;
+  }
+
+  // ----------------------------------------------- releases model (polish)
+  /** Every tag, newest first; annotated tags carry their message line. */
+  async function listReleases(owner, name) {
+    const dir = repoDirOf(owner, name);
+    const out = await gitText(dir, ['for-each-ref', '--sort=-creatordate', 'refs/tags',
+      '--format=%(refname:short)%00%(objecttype)%00%(creatordate:unix)%00%(objectname)%00%(*objectname)%00%(contents:subject)']);
+    const base = `${prefix}/${owner}/${name}`;
+    return out.split('\n').filter(Boolean).map((l) => {
+      const [tag, otype, when, oname, peeled, subject] = l.split('\0');
+      const annotated = otype === 'tag';
+      return {
+        tag,
+        sha: annotated ? (peeled || oname) : oname, // the commit the tag points at
+        at: +when,
+        annotated,
+        message: annotated ? subject : null, // first line of the tag message
+        tarball: `${base}/archive/${tag}.tar.gz`,
+        zipball: `${base}/archive/${tag}.zip`,
+      };
+    });
   }
 
   /** The head of a PR as a compare spec (owner:ref — same-repo included). */
@@ -1354,6 +1499,7 @@ export async function activate(api) {
     fs.mkdirSync(path.join(reposDir, owner), { recursive: true });
     await execFileP('git', ['init', '--bare', '--quiet', dir], { env: gitEnv });
     await execFileP('git', ['-C', dir, 'config', 'http.receivepack', 'true'], { env: gitEnv });
+    await execFileP('git', ['-C', dir, 'config', 'uploadpack.hideRefs', 'refs/forge/'], { env: gitEnv });
     fs.writeFileSync(path.join(dir, 'hooks', 'post-receive'), POST_RECEIVE_HOOK, { mode: 0o755 });
     fs.writeFileSync(path.join(dir, META_FILE), JSON.stringify({ createdAt: Date.now(), creator: agent ?? null }, null, 2));
     api.log.info(`forge: created ${owner}/${name}.git for ${agent}`);
@@ -1518,8 +1664,9 @@ ${body}
 <span class="muted">${relTime(c.at)}</span>`;
   }
 
-  async function indexPage(reply, ownerFilter = null) {
-    const cards = [];
+  async function indexPage(reply, ownerFilter = null, query = null) {
+    const q = typeof query?.q === 'string' ? query.q.trim().slice(0, SEARCH_QUERY_CAP) : '';
+    let cards = [];
     for (const owner of (ownerFilter ? [ownerFilter] : listOwners())) {
       for (const name of listRepoNames(owner)) {
         if (cards.length >= 200) break;
@@ -1527,16 +1674,29 @@ ${body}
       }
     }
     cards.sort((a, b) => (b.lastPush ?? 0) - (a.lastPush ?? 0));
+    const hadAny = cards.length > 0;
+    if (q) {
+      const needle = q.toLowerCase();
+      cards = cards.filter((r) => `${r.owner}/${r.name}`.toLowerCase().includes(needle)
+        || r.description.toLowerCase().includes(needle));
+    }
+    // A plain GET form — server-side substring filter, no JS involved.
+    const searchBox = `<form class="searchform" method="get" action="${prefix}/" style="margin-bottom:16px">
+<input type="search" name="q" value="${esc(q)}" placeholder="Find a repository&hellip;" aria-label="Find a repository">
+<button class="btn" type="submit">Search</button></form>`;
+    const emptyCard = q && hadAny
+      ? `<div class="empty"><h3>No repositories match</h3><p class="muted">Nothing named or described like <code>${esc(q)}</code>.</p></div>`
+      : null;
     const body = cards.length ? cards.map((r) => `<div class="repocard">
 <h3>${ICON_REPO} <a href="${prefix}/${r.owner}">${esc(dispOwner(r.owner))}</a><span class="muted">/</span><a href="${prefix}/${r.owner}/${r.name}"><b>${esc(r.name)}</b></a> <span class="badge">${privateRepos ? 'Private' : 'Public'}</span></h3>
 ${r.parent ? `<div class="muted" style="font-size:12px">forked from <a href="${prefix}/${r.parent}">${esc(r.parent)}</a></div>` : ''}
 ${r.description ? `<div class="muted">${esc(r.description)}</div>` : ''}
 ${r.lastPush ? `<div class="muted" style="font-size:12px;margin-top:4px">Updated ${relTime(r.lastPush)}</div>` : '<div class="muted" style="font-size:12px;margin-top:4px">Empty repository</div>'}
 </div>`).join('\n')
-      : `<div class="empty"><h3>No repositories yet</h3><p class="muted">Push to create one:</p>
+      : emptyCard ?? `<div class="empty"><h3>No repositories yet</h3><p class="muted">Push to create one:</p>
 <pre>git remote add forge &lt;origin&gt;${prefix}/&lt;your-username&gt;/&lt;name&gt;.git
 git push forge main</pre></div>`;
-    return sendHtml(reply, 200, page('Repositories · Forge', `<main><div class="container"><h1 class="page">Repositories</h1>${body}</div></main>`));
+    return sendHtml(reply, 200, page('Repositories · Forge', `<main><div class="container"><h1 class="page">Repositories</h1>${searchBox}${body}</div></main>`));
   }
 
   async function ownerPage(reply, owner) {
@@ -1649,7 +1809,10 @@ ${lineage}${pushHint}
 ${description ? `<p class="muted" style="margin:0 0 16px">${esc(description)}</p>` : ''}
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
 ${branchSelector(owner, name, 'tree', branch, branches, tags, '')}
+<div style="display:flex;gap:8px;align-items:center">
+<form class="searchform" method="get" action="${base}/search"><input type="search" name="q" placeholder="Search code&hellip;" aria-label="Search code" style="min-width:180px"></form>
 ${cloneBox(owner, name)}
+</div>
 </div>
 <div class="box">
 <div class="commitbar">${tip ? commitLine(owner, name, tip) : ''}</div>
@@ -1817,7 +1980,10 @@ ${kind === 'branches' && r.name === branch ? '<span class="badge">default</span>
 <a class="sha" href="${base}/commit/${esc(r.sha)}">${esc(r.sha)}</a>
 <span class="muted" style="font-size:12px">${relTime(r.when)}</span></div>`).join('\n');
     const body = `${repoStrip(owner, name, kind, branch)}<main><div class="container">
-<h1 class="page">${kind === 'branches' ? 'Branches' : 'Tags'}</h1>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+<h1 class="page" style="margin:0">${kind === 'branches' ? 'Branches' : 'Tags'}</h1>
+${kind === 'tags' ? `<a class="btn" href="${base}/releases">${ICON_TAG} Releases</a>` : ''}
+</div>
 <div class="list">${rows || `<div class="row muted">No ${kind} yet.</div>`}</div>
 </div></main>`;
     return sendHtml(reply, 200, page(`${kind} · ${owner}/${name}`, body));
@@ -1961,24 +2127,29 @@ renderAuth();wireForms();
     const openCount = all.filter((i) => i.state === 'open').length;
     const closedCount = all.length - openCount;
     const state = query?.state === 'closed' ? 'closed' : 'open';
+    const label = typeof query?.label === 'string' && query.label ? query.label.slice(0, 50) : null;
+    const lq = label ? `&label=${encodeURIComponent(label)}` : '';
+    const defs = Array.isArray(idx.labels) ? idx.labels : DEFAULT_LABELS;
     const pageNo = Math.max(1, Math.min(10000, parseInt(query?.page, 10) || 1));
-    const filtered = all.filter((i) => i.state === state);
+    const filtered = all.filter((i) => i.state === state
+      && (!label || (Array.isArray(i.labels) && i.labels.includes(label))));
     const slice = filtered.slice((pageNo - 1) * ISSUES_PER_PAGE, pageNo * ISSUES_PER_PAGE);
     const base = `${prefix}/${owner}/${name}`;
     const rows = slice.map((i) => {
       const n = i.thread.length - 1;
       return `<div class="row">${i.state === 'open' ? ICON_ISSUE_OPEN : ICON_ISSUE_CLOSED}
-<div class="grow"><a class="ititle" href="${base}/issues/${i.number}">${esc(i.title)}</a>
+<div class="grow"><a class="ititle" href="${base}/issues/${i.number}">${esc(i.title)}</a> ${labelChips(resolveLabels(i.labels, defs))}
 <div class="muted" style="font-size:12px">#${i.number} opened ${relTime(i.createdAt)} by <a href="${esc(authorHref(i.author))}">${esc(displayName(i.author))}</a></div></div>
 ${n ? `<span class="muted" style="font-size:12px">${n} comment${n === 1 ? '' : 's'}</span>` : ''}</div>`;
     }).join('\n');
     const filterTabs = `<div class="fstate">
-<a class="${state === 'open' ? 'active' : ''}" href="${base}/issues?state=open">${ICON_ISSUE_OPEN} ${openCount} Open</a>
-<a class="${state === 'closed' ? 'active' : ''}" href="${base}/issues?state=closed">${ICON_ISSUE_CLOSED} ${closedCount} Closed</a>
+<a class="${state === 'open' ? 'active' : ''}" href="${base}/issues?state=open${lq}">${ICON_ISSUE_OPEN} ${openCount} Open</a>
+<a class="${state === 'closed' ? 'active' : ''}" href="${base}/issues?state=closed${lq}">${ICON_ISSUE_CLOSED} ${closedCount} Closed</a>
+${label ? `<span class="muted">label: ${labelChips(resolveLabels([label], defs))} <a href="${base}/issues?state=${state}">&times; clear</a></span>` : ''}
 </div>`;
     const pager = `<div class="pager">
-${pageNo > 1 ? `<a class="btn" href="${base}/issues?state=${state}&page=${pageNo - 1}">&larr; Newer</a>` : ''}
-${filtered.length > pageNo * ISSUES_PER_PAGE ? `<a class="btn" href="${base}/issues?state=${state}&page=${pageNo + 1}">Older &rarr;</a>` : ''}
+${pageNo > 1 ? `<a class="btn" href="${base}/issues?state=${state}${lq}&page=${pageNo - 1}">&larr; Newer</a>` : ''}
+${filtered.length > pageNo * ISSUES_PER_PAGE ? `<a class="btn" href="${base}/issues?state=${state}${lq}&page=${pageNo + 1}">Older &rarr;</a>` : ''}
 </div>`;
     const body = `${repoStrip(owner, name, 'issues', branch)}<main><div class="container">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
@@ -2022,6 +2193,7 @@ ${pager}
 <h1 class="page" style="margin-bottom:8px">${esc(issue.title)} <span class="muted" style="font-weight:400">#${issue.number}</span></h1>
 <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px">
 <span class="state-pill ${open ? 'state-open' : 'state-closed'}">${open ? 'Open' : 'Closed'}</span>
+${labelChips(resolveLabels(issue.labels, Array.isArray(idx.labels) ? idx.labels : DEFAULT_LABELS))}
 <span class="muted"><b>${esc(displayName(issue.author))}</b> opened this issue ${relTime(issue.createdAt)} &middot; ${nComments} comment${nComments === 1 ? '' : 's'}</span>
 </div>
 ${boxes}
@@ -2105,26 +2277,31 @@ ${renderDiff(cmp.files)}
     const all = Object.values(idx.pulls).sort((a, b) => b.number - a.number);
     const count = (s) => all.filter((p) => p.state === s).length;
     const state = ['merged', 'closed'].includes(query?.state) ? query.state : 'open';
+    const label = typeof query?.label === 'string' && query.label ? query.label.slice(0, 50) : null;
+    const lq = label ? `&label=${encodeURIComponent(label)}` : '';
+    const defs = labelDefs(owner, name); // the label SET lives with the issues index
     const pageNo = Math.max(1, Math.min(10000, parseInt(query?.page, 10) || 1));
-    const filtered = all.filter((p) => p.state === state);
+    const filtered = all.filter((p) => p.state === state
+      && (!label || (Array.isArray(p.labels) && p.labels.includes(label))));
     const slice = filtered.slice((pageNo - 1) * ISSUES_PER_PAGE, pageNo * ISSUES_PER_PAGE);
     const base = `${prefix}/${owner}/${name}`;
     const rows = slice.map((p) => {
       const nc = p.thread.length - 1;
       return `<div class="row">${PR_STATE[p.state].icon}
-<div class="grow"><a class="ititle" href="${base}/pulls/${p.number}">${esc(p.title)}</a>
+<div class="grow"><a class="ititle" href="${base}/pulls/${p.number}">${esc(p.title)}</a> ${labelChips(resolveLabels(p.labels, defs))}
 <div class="muted" style="font-size:12px">#${p.number} opened ${relTime(p.createdAt)} by <a href="${esc(authorHref(p.author))}">${esc(displayName(p.author))}</a>
 &middot; <span class="mono">${esc(dispOwner(p.head.owner))}:${esc(p.head.ref)} &rarr; ${esc(p.base)}</span></div></div>
 ${nc ? `<span class="muted" style="font-size:12px">${nc} comment${nc === 1 ? '' : 's'}</span>` : ''}</div>`;
     }).join('\n');
     const filterTabs = `<div class="fstate">
-<a class="${state === 'open' ? 'active' : ''}" href="${base}/pulls?state=open">${ICON_PR_OPEN} ${count('open')} Open</a>
-<a class="${state === 'merged' ? 'active' : ''}" href="${base}/pulls?state=merged">${ICON_PR_MERGED} ${count('merged')} Merged</a>
-<a class="${state === 'closed' ? 'active' : ''}" href="${base}/pulls?state=closed">${ICON_PR_CLOSED} ${count('closed')} Closed</a>
+<a class="${state === 'open' ? 'active' : ''}" href="${base}/pulls?state=open${lq}">${ICON_PR_OPEN} ${count('open')} Open</a>
+<a class="${state === 'merged' ? 'active' : ''}" href="${base}/pulls?state=merged${lq}">${ICON_PR_MERGED} ${count('merged')} Merged</a>
+<a class="${state === 'closed' ? 'active' : ''}" href="${base}/pulls?state=closed${lq}">${ICON_PR_CLOSED} ${count('closed')} Closed</a>
+${label ? `<span class="muted">label: ${labelChips(resolveLabels([label], defs))} <a href="${base}/pulls?state=${state}">&times; clear</a></span>` : ''}
 </div>`;
     const pager = `<div class="pager">
-${pageNo > 1 ? `<a class="btn" href="${base}/pulls?state=${state}&page=${pageNo - 1}">&larr; Newer</a>` : ''}
-${filtered.length > pageNo * ISSUES_PER_PAGE ? `<a class="btn" href="${base}/pulls?state=${state}&page=${pageNo + 1}">Older &rarr;</a>` : ''}
+${pageNo > 1 ? `<a class="btn" href="${base}/pulls?state=${state}${lq}&page=${pageNo - 1}">&larr; Newer</a>` : ''}
+${filtered.length > pageNo * ISSUES_PER_PAGE ? `<a class="btn" href="${base}/pulls?state=${state}${lq}&page=${pageNo + 1}">Older &rarr;</a>` : ''}
 </div>`;
     const body = `${repoStrip(owner, name, 'pulls', branch)}<main><div class="container">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
@@ -2145,7 +2322,7 @@ ${pager}
     return `<div class="fstate" style="border:1px solid #d0d7de;border-radius:8px;margin-bottom:16px">${tabs}</div>`;
   }
 
-  function pullHeadline(pr) {
+  function pullHeadline(pr, owner, name) {
     const st = PR_STATE[pr.state];
     const who = pr.state === 'merged' ? displayName(pr.merged?.mergedBy ?? pr.author) : displayName(pr.author);
     const verb = pr.state === 'merged'
@@ -2153,6 +2330,7 @@ ${pager}
       : `wants to merge <span class="mono">${esc(dispOwner(pr.head.owner))}:${esc(pr.head.ref)}</span> into <b>${esc(pr.base)}</b>`;
     return `<div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
 <span class="state-pill ${st.pill}">${st.label}</span>
+${labelChips(resolveLabels(pr.labels, labelDefs(owner, name)))}
 <span class="muted"><b>${esc(who)}</b> ${verb}</span>
 </div>`;
   }
@@ -2196,7 +2374,7 @@ ${pager}
     const nComments = pr.thread.length - 1;
     const body = `${repoStrip(owner, name, 'pulls', branch)}<main><div class="container">
 <h1 class="page" style="margin-bottom:8px">${esc(pr.title)} <span class="muted" style="font-weight:400">#${pr.number}</span></h1>
-${pullHeadline(pr)}
+${pullHeadline(pr, owner, name)}
 ${pullSubTabs(base, pr.number, 'conversation')}
 ${boxes}
 ${mergeBox}
@@ -2222,7 +2400,7 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: `/pu
     const base = `${prefix}/${owner}/${name}`;
     const body = `${repoStrip(owner, name, 'pulls', branch)}<main><div class="container">
 <h1 class="page" style="margin-bottom:8px">${esc(pr.title)} <span class="muted" style="font-weight:400">#${pr.number}</span></h1>
-${pullHeadline(pr)}
+${pullHeadline(pr, owner, name)}
 ${pullSubTabs(base, pr.number, 'commits')}
 <div class="list">${commitRows(owner, name, commits) || '<div class="row muted">No commits.</div>'}</div>
 ${hasMore ? '<p class="muted">Only the first 30 commits are shown.</p>' : ''}
@@ -2238,7 +2416,7 @@ ${hasMore ? '<p class="muted">Only the first 30 commits are shown.</p>' : ''}
     const base = `${prefix}/${owner}/${name}`;
     const body = `${repoStrip(owner, name, 'pulls', branch)}<main><div class="container">
 <h1 class="page" style="margin-bottom:8px">${esc(pr.title)} <span class="muted" style="font-weight:400">#${pr.number}</span></h1>
-${pullHeadline(pr)}
+${pullHeadline(pr, owner, name)}
 ${pullSubTabs(base, pr.number, 'files')}
 ${renderDiff(files)}
 </div></main>`;
@@ -2270,6 +2448,92 @@ ${authBox('Opening a pull request')}
 </div></main>
 ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null, state: null, prBase: baseRef, prHead: headSpec })}`;
     return sendHtml(reply, 200, page(`New pull request · ${owner}/${name}`, body));
+  }
+
+  // ------------------------------------- search + releases pages (polish)
+
+  async function searchPage(reply, owner, name, query) {
+    const q = typeof query?.q === 'string' ? query.q.trim().slice(0, SEARCH_QUERY_CAP) : '';
+    const branch = await defaultBranch(repoDirOf(owner, name));
+    const base = `${prefix}/${owner}/${name}`;
+    const form = `<form class="searchform" method="get" action="${base}/search">
+<input type="search" name="q" value="${esc(q)}" placeholder="Search this repository&hellip;" aria-label="Search this repository">
+<button class="btn" type="submit">Search</button></form>`;
+    let results;
+    if (!q) {
+      results = `<p class="muted">Greps the default branch (<b>${esc(branch)}</b>) for a literal, case-insensitive substring — bounded, no index.</p>`;
+    } else {
+      const data = await searchData(owner, name, q);
+      const matchRows = data.matches.map((m) => `<div class="row">${ICON_FILE}
+<div class="grow"><a class="mono" style="font-size:12px" href="${base}/blob/${branch}/${esc(m.path)}#L${m.line}">${esc(m.path)}:${m.line}</a>
+<div class="excerpt">${esc(m.text)}</div></div></div>`).join('\n');
+      const pathRows = data.paths.map((p) => `<div class="row">${ICON_FILE}
+<div class="grow"><a href="${base}/blob/${branch}/${esc(p)}">${esc(p)}</a></div></div>`).join('\n');
+      results = (data.matches.length || data.paths.length)
+        ? `${data.matches.length ? `<h3>${data.matches.length}${data.truncated ? '+' : ''} code match${data.matches.length === 1 ? '' : 'es'}</h3><div class="list">${matchRows}</div>` : ''}
+${data.paths.length ? `<h3>${data.paths.length} matching file path${data.paths.length === 1 ? '' : 's'}</h3><div class="list">${pathRows}</div>` : ''}
+${data.truncated ? `<p class="muted">Results are capped (${SEARCH_HIT_CAP} code matches, ${SEARCH_PATH_CAP} paths); narrow the query for the rest.</p>` : ''}`
+        : `<div class="empty"><h3>No results</h3><p class="muted">Nothing on <b>${esc(branch)}</b> matches <code>${esc(q)}</code>.</p></div>`;
+    }
+    const body = `${repoStrip(owner, name, 'code', branch)}<main><div class="container">
+<h1 class="page">Search</h1>
+${form}
+<div style="margin-top:16px">${results}</div>
+</div></main>`;
+    return sendHtml(reply, 200, page(`Search · ${owner}/${name}`, body));
+  }
+
+  async function releasesPage(reply, owner, name) {
+    const branch = await defaultBranch(repoDirOf(owner, name));
+    const rels = await listReleases(owner, name);
+    const base = `${prefix}/${owner}/${name}`;
+    const cards = rels.map((r) => `<div class="repocard">
+<h3>${ICON_TAG} <a href="${base}/tree/${esc(r.tag)}">${esc(r.tag)}</a>${r.annotated ? '' : ' <span class="badge">lightweight</span>'}</h3>
+${r.message ? `<div>${esc(r.message)}</div>` : ''}
+<div class="muted" style="font-size:12px;margin-top:4px"><a class="sha" href="${base}/commit/${esc(r.sha)}">${esc(r.sha.slice(0, 7))}</a> &middot; ${relTime(r.at)}</div>
+<div style="margin-top:8px"><a class="btn" href="${base}/archive/${esc(r.tag)}.tar.gz">tar.gz</a>
+<a class="btn" href="${base}/archive/${esc(r.tag)}.zip">zip</a></div>
+</div>`).join('\n');
+    const body = `${repoStrip(owner, name, 'tags', branch)}<main><div class="container">
+<h1 class="page">Releases <span class="muted" style="font-size:14px;font-weight:400">every tag, newest first</span></h1>
+${cards || '<div class="empty"><h3>No releases yet</h3><p class="muted">Push a tag and it appears here with tarball and zip downloads.</p></div>'}
+</div></main>`;
+    return sendHtml(reply, 200, page(`Releases · ${owner}/${name}`, body));
+  }
+
+  /**
+   * GET .../archive/<ref>.tar.gz|.zip — `git archive` STREAMED to the
+   * response (child stdout, no buffering), --prefix=<repo>-<flatref>/.
+   * The ref is validated and resolved BEFORE any header goes out, so a
+   * bogus ref is a clean 404.
+   */
+  async function archiveResp(reply, owner, name, tail) {
+    const spec = tail.join('/');
+    let format = null;
+    let ext = null;
+    if (spec.endsWith('.tar.gz')) { format = 'tar.gz'; ext = '.tar.gz'; }
+    else if (spec.endsWith('.zip')) { format = 'zip'; ext = '.zip'; }
+    if (!format) return notFound(reply);
+    const ref = spec.slice(0, -ext.length);
+    if (!okRef(ref) && !SHA_RE.test(ref)) return notFound(reply);
+    const dir = repoDirOf(owner, name);
+    if (!(await revParse(dir, `${ref}^{commit}`))) return notFound(reply);
+    const flat = ref.replace(/\//g, '-'); // feature/x -> feature-x (validated charset: header-safe)
+    const child = spawn('git', ['-C', dir, 'archive', `--format=${format}`, `--prefix=${name}-${flat}/`, ref],
+      { env: gitEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('close', (code) => {
+      if (code !== 0) api.log.warn(`forge: git archive ${owner}/${name} ${ref} exited ${code}${stderr ? `: ${stderr.trim()}` : ''}`);
+    });
+    reply.raw.on('close', () => {
+      if (child.exitCode === null && !reply.raw.writableFinished) child.kill();
+    });
+    return reply.code(200)
+      .header('content-type', format === 'zip' ? 'application/zip' : 'application/gzip')
+      .header('content-disposition', `attachment; filename="${name}-${flat}${ext}"`)
+      .header('x-content-type-options', 'nosniff')
+      .send(child.stdout);
   }
 
   function notFound(reply) {
@@ -2426,8 +2690,11 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
     const all = Object.values(idx.issues).sort((a, b) => b.number - a.number);
     const openCount = all.filter((i) => i.state === 'open').length;
     const state = query?.state === 'closed' ? 'closed' : 'open';
+    const label = typeof query?.label === 'string' && query.label ? query.label.slice(0, 50) : null;
+    const defs = Array.isArray(idx.labels) ? idx.labels : DEFAULT_LABELS;
     const pageNo = Math.max(1, Math.min(10000, parseInt(query?.page, 10) || 1));
-    const filtered = all.filter((i) => i.state === state);
+    const filtered = all.filter((i) => i.state === state
+      && (!label || (Array.isArray(i.labels) && i.labels.includes(label))));
     return sendJson(reply, 200, {
       state,
       page: pageNo,
@@ -2442,13 +2709,15 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
         author: i.author,
         authorInfo: authorMeta(i.author), // additive (2.5): {id, displayName, npub?, kind}
         createdAt: i.createdAt,
+        labels: resolveLabels(i.labels, defs), // additive (polish): [{name, color}]
         comments: i.thread.length - 1,
       })),
     });
   }
 
   async function apiIssueGet(reply, owner, name, number) {
-    const issue = loadIssueIndex(owner, name).issues[number];
+    const idx = loadIssueIndex(owner, name);
+    const issue = idx.issues[number];
     if (!issue) return apiErr(reply, 404, 'not found');
     const resolved = await resolveThread(issue.thread);
     const ctx = issueMdCtx(owner, name);
@@ -2459,6 +2728,7 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
       author: issue.author,
       authorInfo: authorMeta(issue.author), // additive (2.5)
       createdAt: issue.createdAt,
+      labels: resolveLabels(issue.labels, Array.isArray(idx.labels) ? idx.labels : DEFAULT_LABELS), // additive (polish)
       thread: resolved.map((e) => ({
         ...e, // includes hosted (2.5): true for forge-hosted podless content
         authorInfo: authorMeta(e.author),
@@ -2612,6 +2882,171 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
     return sendJson(reply, 200, { owner, name, description });
   }
 
+  // ---- polish: label CRUD (owner-only) + per-item assignment -------------
+
+  async function apiLabelCreate(request, reply, owner, name) {
+    const p = await readJsonBody(request); // body before auth (NIP-98 payload tag)
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    if (ownerFromAgent(agent) !== owner) return apiErr(reply, 403, 'only the repo owner may manage labels');
+    if (!p) return apiErr(reply, 400, 'invalid JSON body');
+    const lname = typeof p.name === 'string' ? p.name.trim() : '';
+    if (!LABEL_NAME_RE.test(lname)) return apiErr(reply, 422, 'label name required (1-50 printable chars)');
+    if (typeof p.color !== 'string' || !LABEL_COLOR_RE.test(p.color)) return apiErr(reply, 422, 'color must be 6 hex digits');
+    const color = p.color.toLowerCase();
+    return withIssueLock(owner, name, async () => {
+      const idx = loadIssueIndex(owner, name);
+      const defs = ensureLabels(idx); // first write materializes the defaults
+      if (defs.some((d) => d.name.toLowerCase() === lname.toLowerCase())) return apiErr(reply, 409, 'label exists');
+      defs.push({ name: lname, color });
+      saveIssueIndex(owner, name, idx);
+      return sendJson(reply, 201, { name: lname, color });
+    });
+  }
+
+  /** Rename cascades over items in BOTH indexes (items store names). */
+  async function apiLabelPatch(request, reply, owner, name, labelName) {
+    const p = await readJsonBody(request); // body before auth (NIP-98 payload tag)
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    if (ownerFromAgent(agent) !== owner) return apiErr(reply, 403, 'only the repo owner may manage labels');
+    if (!p) return apiErr(reply, 400, 'invalid JSON body');
+    return withIssueLock(owner, name, async () => {
+      const idx = loadIssueIndex(owner, name);
+      const defs = ensureLabels(idx);
+      const def = defs.find((d) => d.name === labelName);
+      if (!def) return apiErr(reply, 404, 'not found');
+      let newName = def.name;
+      if (p.name !== undefined) {
+        newName = typeof p.name === 'string' ? p.name.trim() : '';
+        if (!LABEL_NAME_RE.test(newName)) return apiErr(reply, 422, 'label name required (1-50 printable chars)');
+        if (newName !== def.name && defs.some((d) => d !== def && d.name.toLowerCase() === newName.toLowerCase())) {
+          return apiErr(reply, 409, 'label exists');
+        }
+      }
+      if (p.color !== undefined) {
+        if (typeof p.color !== 'string' || !LABEL_COLOR_RE.test(p.color)) return apiErr(reply, 422, 'color must be 6 hex digits');
+        def.color = p.color.toLowerCase();
+      }
+      const oldName = def.name;
+      def.name = newName;
+      if (newName !== oldName) {
+        for (const i of Object.values(idx.issues)) {
+          if (Array.isArray(i.labels)) i.labels = i.labels.map((n) => (n === oldName ? newName : n));
+        }
+      }
+      saveIssueIndex(owner, name, idx);
+      if (newName !== oldName) {
+        await withPullLock(owner, name, async () => {
+          const pidx = loadPullIndex(owner, name);
+          let touched = false;
+          for (const pr of Object.values(pidx.pulls)) {
+            if (Array.isArray(pr.labels) && pr.labels.includes(oldName)) {
+              pr.labels = pr.labels.map((n) => (n === oldName ? newName : n));
+              touched = true;
+            }
+          }
+          if (touched) savePullIndex(owner, name, pidx);
+        });
+      }
+      return sendJson(reply, 200, { name: def.name, color: def.color });
+    });
+  }
+
+  /** Delete cascades the label OFF every issue and pull that carries it. */
+  async function apiLabelDelete(request, reply, owner, name, labelName) {
+    await readJsonBody(request); // content unused; buffered for NIP-98 payload tags
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    if (ownerFromAgent(agent) !== owner) return apiErr(reply, 403, 'only the repo owner may manage labels');
+    return withIssueLock(owner, name, async () => {
+      const idx = loadIssueIndex(owner, name);
+      const defs = ensureLabels(idx);
+      const at = defs.findIndex((d) => d.name === labelName);
+      if (at === -1) return apiErr(reply, 404, 'not found');
+      defs.splice(at, 1);
+      for (const i of Object.values(idx.issues)) {
+        if (Array.isArray(i.labels)) i.labels = i.labels.filter((n) => n !== labelName);
+      }
+      saveIssueIndex(owner, name, idx);
+      await withPullLock(owner, name, async () => {
+        const pidx = loadPullIndex(owner, name);
+        let touched = false;
+        for (const pr of Object.values(pidx.pulls)) {
+          if (Array.isArray(pr.labels) && pr.labels.includes(labelName)) {
+            pr.labels = pr.labels.filter((n) => n !== labelName);
+            touched = true;
+          }
+        }
+        if (touched) savePullIndex(owner, name, pidx);
+      });
+      return sendJson(reply, 200, { name: labelName, deleted: true });
+    });
+  }
+
+  async function apiLabelsHandler(request, reply, owner, name, tail) {
+    const method = request.method;
+    if (tail.length === 0) {
+      if (method === 'GET' || method === 'HEAD') return sendJson(reply, 200, { labels: labelDefs(owner, name) });
+      if (method === 'POST') return apiLabelCreate(request, reply, owner, name);
+      return apiErr(reply, 405, 'method not allowed');
+    }
+    if (tail.length === 1) {
+      let labelName; // the segment arrives raw-encoded (the dispatcher does not decode)
+      try { labelName = decodeURIComponent(tail[0]); } catch { return apiErr(reply, 404, 'not found'); }
+      if (method === 'PATCH') return apiLabelPatch(request, reply, owner, name, labelName);
+      if (method === 'DELETE') return apiLabelDelete(request, reply, owner, name, labelName);
+      return apiErr(reply, 405, 'method not allowed');
+    }
+    return apiErr(reply, 404, 'not found');
+  }
+
+  /**
+   * PUT .../{issues,pulls}/<n>/labels {labels: [names]} — replaces the
+   * item's label set; repo owner or the item's author. Every name must
+   * exist in the repo's label set (names are validated, never invented).
+   */
+  async function apiItemLabels(request, reply, owner, name, number, kind) {
+    const p = await readJsonBody(request); // body before auth (NIP-98 payload tag)
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    if (!p || !Array.isArray(p.labels)) return apiErr(reply, 400, 'body must be { labels: [names] }');
+    if (p.labels.length > LABELS_PER_ITEM) return apiErr(reply, 422, `at most ${LABELS_PER_ITEM} labels per item`);
+    const defs = labelDefs(owner, name);
+    const names = [];
+    for (const n of p.labels) {
+      if (typeof n !== 'string' || !defs.some((d) => d.name === n)) {
+        return apiErr(reply, 422, `unknown label: ${String(n).slice(0, 60)}`);
+      }
+      if (!names.includes(n)) names.push(n);
+    }
+    const [withLock, load, save, itemsKey] = kind === 'issues'
+      ? [withIssueLock, loadIssueIndex, saveIssueIndex, 'issues']
+      : [withPullLock, loadPullIndex, savePullIndex, 'pulls'];
+    return withLock(owner, name, async () => {
+      const idx = load(owner, name);
+      const item = idx[itemsKey][number];
+      if (!item) return apiErr(reply, 404, 'not found');
+      if (!mayModerate(agent, owner, item)) return apiErr(reply, 403, 'only the repo owner or the item author may set labels');
+      item.labels = names;
+      save(owner, name, idx);
+      return sendJson(reply, 200, { number: item.number, labels: names });
+    });
+  }
+
+  // ---- polish: read-time search + releases -------------------------------
+
+  async function apiSearch(reply, owner, name, query) {
+    const q = typeof query?.q === 'string' ? query.q.trim() : '';
+    if (!q) return apiErr(reply, 422, 'q required');
+    if (q.length > SEARCH_QUERY_CAP) return apiErr(reply, 422, `q too long (max ${SEARCH_QUERY_CAP} chars)`);
+    return sendJson(reply, 200, await searchData(owner, name, q));
+  }
+
+  async function apiReleases(reply, owner, name) {
+    return sendJson(reply, 200, { releases: await listReleases(owner, name) });
+  }
+
   async function apiIssuesHandler(request, reply, owner, name, tail) {
     const method = request.method;
     if (tail.length === 0) {
@@ -2625,6 +3060,10 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
       if (method === 'GET' || method === 'HEAD') return apiIssueGet(reply, owner, name, number);
       if (method === 'PATCH') return apiIssueRetitle(request, reply, owner, name, number);
       return apiErr(reply, 405, 'method not allowed');
+    }
+    if (tail.length === 2 && tail[1] === 'labels') {
+      if (method !== 'PUT') return apiErr(reply, 405, 'method not allowed');
+      return apiItemLabels(request, reply, owner, name, number, 'issues');
     }
     if (tail.length === 2 && ['comments', 'close', 'reopen'].includes(tail[1])) {
       if (method !== 'POST') return apiErr(reply, 405, 'method not allowed');
@@ -2662,6 +3101,7 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
     await execFileP('git', ['clone', '--local', '--bare', '--quiet', repoDirOf(owner, name), dir],
       { env: gitEnv, maxBuffer: MAX_EXEC_BUFFER });
     await execFileP('git', ['-C', dir, 'config', 'http.receivepack', 'true'], { env: gitEnv });
+    await execFileP('git', ['-C', dir, 'config', 'uploadpack.hideRefs', 'refs/forge/'], { env: gitEnv });
     await execFileP('git', ['-C', dir, 'config', 'forge.parent', `${owner}/${name}`], { env: gitEnv });
     // the clone's origin remote is an internal filesystem path — drop it
     await execFileP('git', ['-C', dir, 'remote', 'remove', 'origin'], { env: gitEnv }).catch(() => {});
@@ -2700,8 +3140,11 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
     const all = Object.values(idx.pulls).sort((a, b) => b.number - a.number);
     const count = (s) => all.filter((p) => p.state === s).length;
     const state = ['merged', 'closed'].includes(query?.state) ? query.state : 'open';
+    const label = typeof query?.label === 'string' && query.label ? query.label.slice(0, 50) : null;
+    const defs = labelDefs(owner, name);
     const pageNo = Math.max(1, Math.min(10000, parseInt(query?.page, 10) || 1));
-    const filtered = all.filter((p) => p.state === state);
+    const filtered = all.filter((p) => p.state === state
+      && (!label || (Array.isArray(p.labels) && p.labels.includes(label))));
     return sendJson(reply, 200, {
       state,
       page: pageNo,
@@ -2720,6 +3163,7 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
         base: p.base,
         head: p.head,
         merged: p.merged ?? null,
+        labels: resolveLabels(p.labels, defs), // additive (polish)
         comments: p.thread.length - 1,
       })),
     });
@@ -2746,6 +3190,7 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
       merged: pr.merged ?? null,
       mergeable: info.mergeable,
       conflicts: info.conflicts,
+      labels: resolveLabels(pr.labels, labelDefs(owner, name)), // additive (polish)
       thread: resolved.map((e) => ({
         ...e,
         authorInfo: authorMeta(e.author),
@@ -2963,6 +3408,10 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
       if (method === 'GET' || method === 'HEAD') return apiPullGet(reply, owner, name, number);
       return apiErr(reply, 405, 'method not allowed');
     }
+    if (tail.length === 2 && tail[1] === 'labels') {
+      if (method !== 'PUT') return apiErr(reply, 405, 'method not allowed');
+      return apiItemLabels(request, reply, owner, name, number, 'pulls');
+    }
     if (tail.length === 2 && ['comments', 'close', 'reopen', 'merge'].includes(tail[1])) {
       if (method !== 'POST') return apiErr(reply, 405, 'method not allowed');
       if (tail[1] === 'comments') return apiPullComment(request, reply, owner, name, number);
@@ -3037,11 +3486,10 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
 
   /** Dispatch <prefix>/api/... (segs excludes the leading 'api'). */
   async function apiHandler(request, reply, segs) {
-    if (!['GET', 'HEAD', 'POST', 'PATCH', 'DELETE'].includes(request.method)) return apiErr(reply, 405, 'method not allowed');
+    if (!['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)) return apiErr(reply, 405, 'method not allowed');
     if (segs.length === 1 && segs[0] === 'token') return apiTokenMint(request, reply);
     if (segs[0] === 'hosted') return apiHosted(request, reply, segs.slice(1));
     if (segs[0] !== 'repos') return apiErr(reply, 404, 'not found');
-    if (request.method === 'DELETE') return apiErr(reply, 405, 'method not allowed');
     const rest = segs.slice(1);
 
     let agentOwner = null;
@@ -3077,11 +3525,14 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
 
     const action = rest[2];
     const tail = rest.slice(3);
-    if (!['issues', 'pulls', 'fork'].includes(action) && !isRead) return apiErr(reply, 405, 'method not allowed');
+    if (!['issues', 'pulls', 'fork', 'labels'].includes(action) && !isRead) return apiErr(reply, 405, 'method not allowed');
     try {
       switch (action) {
         case 'issues': return await apiIssuesHandler(request, reply, owner, name, tail);
         case 'pulls': return await apiPullsHandler(request, reply, owner, name, tail);
+        case 'labels': return await apiLabelsHandler(request, reply, owner, name, tail);
+        case 'search': return tail.length === 0 ? await apiSearch(reply, owner, name, request.query) : apiErr(reply, 404, 'not found');
+        case 'releases': return tail.length === 0 ? await apiReleases(reply, owner, name) : apiErr(reply, 404, 'not found');
         case 'fork':
           if (tail.length !== 0) return apiErr(reply, 404, 'not found');
           if (request.method !== 'POST') return apiErr(reply, 405, 'method not allowed');
@@ -3128,9 +3579,9 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
             return reply.code(401).send('authentication required\n');
           }
           if (!agentOwner) return reply.code(403).send('private forge\n');
-          return indexPage(reply, agentOwner);
+          return indexPage(reply, agentOwner, request.query);
         }
-        return indexPage(reply);
+        return indexPage(reply, null, request.query);
       }
 
       // <prefix>/api/... — the JSON surface. 'api' is a reserved owner
@@ -3223,6 +3674,9 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
           case 'commit': return tail.length === 1 ? await commitPage(reply, owner, name, tail[0]) : notFound(reply);
           case 'branches': return tail.length === 0 ? await refsPage(reply, owner, name, 'branches') : notFound(reply);
           case 'tags': return tail.length === 0 ? await refsPage(reply, owner, name, 'tags') : notFound(reply);
+          case 'search': return tail.length === 0 ? await searchPage(reply, owner, name, request.query) : notFound(reply);
+          case 'releases': return tail.length === 0 ? await releasesPage(reply, owner, name) : notFound(reply);
+          case 'archive': return tail.length ? await archiveResp(reply, owner, name, tail) : notFound(reply);
           case 'compare': return tail.length ? await comparePage(reply, owner, name, tail.join('/')) : notFound(reply);
           case 'pulls': {
             if (tail.length === 0) return await pullsListPage(reply, owner, name, request.query);
@@ -3248,8 +3702,8 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null
       }
     };
 
-    scope.route({ method: ['GET', 'POST', 'PATCH', 'DELETE'], url: prefix || '/', handler });
-    scope.route({ method: ['GET', 'POST', 'PATCH', 'DELETE'], url: `${prefix}/*`, handler });
+    scope.route({ method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], url: prefix || '/', handler });
+    scope.route({ method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], url: `${prefix}/*`, handler });
   });
 
   api.log.info(
