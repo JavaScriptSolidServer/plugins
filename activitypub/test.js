@@ -6,6 +6,9 @@
 //   read outbox   → GET  /ap/<user>/outbox        OrderedCollection contains it
 //   be followed   → POST /ap/<user>/inbox         a Follow activity
 //   list followers→ GET  /ap/<user>/followers     contains the follower
+//   read inbox    → GET  /ap/<user>/inbox         owner Bearer pages the log
+//                                                 (newest first, published
+//                                                 stamped); anon → 401
 //   auth boundary → POST /ap/<user>/outbox        no Bearer → 401
 //
 // Same probe-port-then-boot dance as mastodon/: the plugin needs its origin
@@ -197,6 +200,107 @@ describe('activitypub plugin', () => {
       }),
     });
     assert.strictEqual(res.status, 200);
+  });
+
+  // ---- THE INBOX LOG (owner-read surface for mastodon/ timelines) -----------
+
+  it('GET /ap/<user>/inbox anonymous is 401 (the log is the owner\'s private mail)', async () => {
+    const res = await fetch(`${base}/ap/${USER}/inbox`);
+    assert.strictEqual(res.status, 401);
+    const page = await fetch(`${base}/ap/${USER}/inbox?page=true`);
+    assert.strictEqual(page.status, 401);
+  });
+
+  it('GET /ap/<user>/inbox (owner Bearer) pages the log newest-first; the Follow carries published', async () => {
+    const res = await fetch(`${base}/ap/${USER}/inbox`, {
+      headers: { authorization: `Bearer ${token}`, accept: 'application/activity+json' },
+    });
+    assert.strictEqual(res.status, 200);
+    const coll = await res.json();
+    assert.strictEqual(coll.type, 'OrderedCollection');
+    assert.ok(coll.totalItems >= 2, `expected the Follow + Create in the log, got ${coll.totalItems}`);
+
+    const page = await (await fetch(`${base}/ap/${USER}/inbox?page=true`, {
+      headers: { authorization: `Bearer ${token}` },
+    })).json();
+    assert.strictEqual(page.type, 'OrderedCollectionPage');
+    assert.ok(Array.isArray(page.orderedItems), 'no orderedItems');
+    // The earlier Follow (POSTed with no published) is in the log, stamped at ingest.
+    const follow = page.orderedItems.find((a) => a.type === 'Follow' && a.actor === REMOTE_FOLLOWER);
+    assert.ok(follow, 'earlier Follow not in the inbox log');
+    assert.ok(follow.published, 'stored Follow carries no published stamp');
+    // Newest first: the Create was POSTed after the Follow.
+    const iCreate = page.orderedItems.findIndex((a) => a.type === 'Create');
+    const iFollow = page.orderedItems.findIndex((a) => a.type === 'Follow');
+    assert.ok(iCreate < iFollow, `log not newest-first (Create at ${iCreate}, Follow at ${iFollow})`);
+  });
+
+  it('a Like and an Announce POSTed to the inbox land in the log with type intact', async () => {
+    for (const activity of [
+      { type: 'Like', id: `${REMOTE_FOLLOWER}#likes/1`, actor: REMOTE_FOLLOWER, object: `${base}/${USER}/public/statuses/x.jsonld` },
+      { type: 'Announce', id: `${REMOTE_FOLLOWER}#boosts/1`, actor: REMOTE_FOLLOWER, object: `${base}/${USER}/public/statuses/x.jsonld` },
+    ]) {
+      const res = await fetch(`${base}/ap/${USER}/inbox`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/activity+json' },
+        body: JSON.stringify({ '@context': 'https://www.w3.org/ns/activitystreams', ...activity }),
+      });
+      assert.strictEqual(res.status, 200);
+    }
+    const page = await (await fetch(`${base}/ap/${USER}/inbox?page=true`, {
+      headers: { authorization: `Bearer ${token}` },
+    })).json();
+    const like = page.orderedItems.find((a) => a.id === `${REMOTE_FOLLOWER}#likes/1`);
+    const boost = page.orderedItems.find((a) => a.id === `${REMOTE_FOLLOWER}#boosts/1`);
+    assert.ok(like, 'Like not retained in the inbox log');
+    assert.strictEqual(like.type, 'Like');
+    assert.ok(like.published, 'Like carries no published stamp');
+    assert.ok(boost, 'Announce not retained in the inbox log');
+    assert.strictEqual(boost.type, 'Announce');
+    assert.ok(boost.published, 'Announce carries no published stamp');
+    // Newest first: the Announce was POSTed last, so it heads the page.
+    assert.strictEqual(page.orderedItems[0].id, `${REMOTE_FOLLOWER}#boosts/1`);
+  });
+
+  it('read-time backfill: a legacy inbox entry without published is stamped from receivedAt', async () => {
+    // Entries stored BEFORE ingest-time stamping existed have no published;
+    // inject one straight into the state file (the format the plugin persists)
+    // and assert the read path backfills it. statePath/readState are defined
+    // with the security regressions below — same describe scope.
+    const state = readState();
+    state.inbox.push({
+      receivedAt: '2020-01-01T00:00:00.000Z',
+      activity: { type: 'Like', id: 'urn:legacy:unstamped', actor: REMOTE_FOLLOWER },
+    });
+    fs.writeFileSync(statePath(), JSON.stringify(state, null, 2));
+    const page = await (await fetch(`${base}/ap/${USER}/inbox?page=true`, {
+      headers: { authorization: `Bearer ${token}` },
+    })).json();
+    const legacy = page.orderedItems.find((a) => a.id === 'urn:legacy:unstamped');
+    assert.ok(legacy, 'legacy entry not served');
+    assert.strictEqual(legacy.published, '2020-01-01T00:00:00.000Z');
+  });
+
+  it('inReplyTo survives outbox POST → pod resource → outbox collection (threading)', async () => {
+    const parent = 'https://remote.example/users/bob/statuses/12345';
+    const res = await fetch(`${base}/ap/${USER}/outbox`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/activity+json' },
+      body: JSON.stringify({ type: 'Note', content: 'a threaded reply', inReplyTo: parent }),
+    });
+    assert.ok([200, 201].includes(res.status), `outbox POST: ${res.status}`);
+    const create = await res.json();
+    assert.strictEqual(create.object.inReplyTo, parent, 'returned Create lost inReplyTo');
+
+    // The stored pod resource carries it…
+    const raw = await (await fetch(create.object.id, { headers: { authorization: `Bearer ${token}` } })).json();
+    assert.strictEqual(raw.inReplyTo, parent, 'pod Note lost inReplyTo');
+
+    // …and so does the outbox collection item.
+    const page = await (await fetch(`${base}/ap/${USER}/outbox?page=true`)).json();
+    const item = page.orderedItems.find((it) => it.object?.content === 'a threaded reply');
+    assert.ok(item, 'reply Note not in outbox');
+    assert.strictEqual(item.object.inReplyTo, parent, 'outbox item lost inReplyTo');
   });
 
   // ---- SECURITY REGRESSIONS -------------------------------------------------

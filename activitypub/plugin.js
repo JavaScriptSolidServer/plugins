@@ -10,8 +10,11 @@
 // actor (with a real RSA public key), post a Note to its outbox (stored in
 // the pod over loopback LDP, under real WAC), read the outbox back as an
 // OrderedCollection of Create{Note}, and receive Follow/Create/Like into the
-// inbox (persisted to pluginDir). Followers/following are OrderedCollections
-// from that persisted state. This is NOT a bundled-feature port: JSS core
+// inbox (persisted to pluginDir). The OWNER can read that inbox log back as
+// an OrderedCollection (newest first, owner-authed — it holds strangers'
+// activity, so it is private mail; mastodon/ builds timelines/notifications
+// on it). Followers/following are OrderedCollections from that persisted
+// state. This is NOT a bundled-feature port: JSS core
 // ships an ActivityPub feature under src/ap/ (which leans on the `microfed`
 // npm module and shares closures with server.js); this is a parallel
 // reimplementation on the PUBLIC plugin api only — src/ap/ was read for the
@@ -540,8 +543,13 @@ export async function activate(api) {
     if (!(put.ok || put.status === 204)) return err(reply, 500, `Pod storage rejected the Note (${put.status})`);
 
     // Index it (authoritative for federation GETs that carry no creds).
+    // inReplyTo rides along so threading survives even when the outbox is
+    // listed from the index alone (pod container unreadable to the caller).
     const state = loadState(user);
-    state.notes.push({ id: noteUri, url: noteUri, content, published, attributedTo: actorId(user) });
+    state.notes.push({
+      id: noteUri, url: noteUri, content, published, attributedTo: actorId(user),
+      ...(note.inReplyTo ? { inReplyTo: note.inReplyTo } : {}),
+    });
     saveState(user, state);
 
     // Deliver the Create to followers (signed, best-effort, non-blocking).
@@ -551,6 +559,47 @@ export async function activate(api) {
     }
 
     return ap(reply, 201, { '@context': AS_CONTEXT, ...create });
+  });
+
+  // ---- GET inbox (owner only): the persisted inbox log --------------------
+  // Unlike the other collections this one is NOT public AP surface: the log
+  // holds activity from strangers, i.e. the owner's private mail, so reading
+  // it is gated on the SAME owner check as the outbox POST. Items are the raw
+  // stored activities, newest first — mastodon/ builds home timeline,
+  // notifications and threads from this. No new reservation needed: the /ap
+  // subtree claim above already covers GET here.
+  api.fastify.get(`${apRoot}/:user/inbox`, async (request, reply) => {
+    const webid = await api.auth.getAgent(request);
+    if (!webid) return err(reply, 401, 'Authentication required to read the inbox');
+    const { username } = podFromWebid(webid);
+    const user = request.params.user;
+    if (username !== user) return err(reply, 403, 'Only the actor owner may read this inbox');
+
+    // Newest first (the log is append-ordered). Entries persisted before
+    // ingest-time `published` stamping are backfilled from receivedAt here.
+    const items = [...loadState(user).inbox].reverse().map(({ receivedAt, activity }) => (
+      activity.published ? activity : { ...activity, published: receivedAt }
+    ));
+    const inboxUrl = `${actorBase(user)}/inbox`;
+    // ?page=true → the collection PAGE form (orderedItems inline).
+    if (String(request.query?.page) === 'true') {
+      return ap(reply, 200, {
+        '@context': AS_CONTEXT,
+        id: `${inboxUrl}?page=true`,
+        type: 'OrderedCollectionPage',
+        partOf: inboxUrl,
+        totalItems: items.length,
+        orderedItems: items,
+      });
+    }
+    return ap(reply, 200, {
+      '@context': AS_CONTEXT,
+      id: inboxUrl,
+      type: 'OrderedCollection',
+      totalItems: items.length,
+      first: `${inboxUrl}?page=true`,
+      last: `${inboxUrl}?page=true`,
+    });
   });
 
   // ---- POST inbox: accept incoming activities ----------------------------
@@ -567,7 +616,13 @@ export async function activate(api) {
     // the mitigation for the abuse surface that opens. We persist every
     // activity to the inbox log, bounded to the most recent cfg.maxInbox.
     const state = loadState(user);
-    state.inbox.push({ receivedAt: new Date().toISOString(), activity });
+    // Stamp receipt time as `published` when the sender omitted it — done at
+    // INGEST so the timestamp persists with the stored activity (GET inbox
+    // additionally backfills at read time for entries stored before this
+    // stamping existed). Timeline consumers (mastodon/) sort on it.
+    const receivedAt = new Date().toISOString();
+    if (!activity.published) activity.published = receivedAt;
+    state.inbox.push({ receivedAt, activity });
     if (state.inbox.length > cfg.maxInbox) state.inbox = state.inbox.slice(-cfg.maxInbox);
 
     if (activity.type === 'Follow') {

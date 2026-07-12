@@ -37,8 +37,9 @@ longer passes `appPaths`. See **Findings**.
 |---|---|---|---|
 | `GET` | `/ap/<user>/actor` | ✅ done | AS2 `Person` + `publicKey.publicKeyPem` (RSA, per-actor, persisted) |
 | `GET` | `/ap/<user>/outbox` | ✅ done | `OrderedCollection`; `?page=true` → `OrderedCollectionPage` with `Create{Note}` items |
-| `POST` | `/ap/<user>/outbox` | ✅ done | owner-only (`api.auth.getAgent`); stores a Note in the pod via loopback PUT |
-| `POST` | `/ap/<user>/inbox` | ✅ done (store) | persists every activity (bounded `maxInbox`); `Follow` records the follower (deduped); **inbound signature verify: Phase 2** — unauthenticated-by-design, so outbound delivery is SSRF-gated |
+| `POST` | `/ap/<user>/outbox` | ✅ done | owner-only (`api.auth.getAgent`); stores a Note in the pod via loopback PUT; `inReplyTo` passes through onto the stored Note + returned `Create` (threading) |
+| `GET` | `/ap/<user>/inbox` | ✅ done | **owner-only** (same `getAgent` check as the outbox POST — the log holds strangers' activity, i.e. the owner's private mail; anonymous → 401). `OrderedCollection` summary; `?page=true` → `OrderedCollectionPage` of the raw stored activities, **newest first**, each carrying a `published` stamp (receipt time stamped at ingest when the sender omits it; backfilled at read for pre-stamping entries). The read surface mastodon/ builds timelines/notifications/threads on. Covered by the existing `/ap` reservation (GET was already in the reserved methods) |
+| `POST` | `/ap/<user>/inbox` | ✅ done (store) | persists every activity — `Like`/`Announce`/`Create` retained as-is, `Follow` records the follower (deduped), `Undo{Follow}` removes it — bounded `maxInbox`; **inbound signature verify: Phase 2** — unauthenticated-by-design, so outbound delivery is SSRF-gated |
 | `GET` | `/ap/<user>/followers` | ✅ done | `OrderedCollection` from persisted state |
 | `GET` | `/ap/<user>/following` | ✅ done | `OrderedCollection` (empty in Phase 1 — no outbound Follow yet) |
 | — | outbound delivery signing | ✅ done (stretch) | `signAndDeliver` signs POSTs with the actor RSA key (draft-cavage); `Accept` to a follower, `Create` to followers on post — best-effort, non-blocking |
@@ -53,10 +54,14 @@ POST /ap/fedialice/outbox  (owner Bearer)  Note "hello fediverse" → 201 Create
 GET  /ap/fedialice/outbox                      → OrderedCollection contains it
 POST /ap/fedialice/inbox   Follow(bob)         → 200, follower recorded
 GET  /ap/fedialice/followers                   → contains bob
+GET  /ap/fedialice/inbox   (owner Bearer)      → OrderedCollection; ?page=true
+                                                 pages the log newest-first,
+                                                 every item `published`-stamped
+GET  /ap/fedialice/inbox   (no Bearer)         → 401 (owner's private mail)
 POST /ap/fedialice/outbox  (no Bearer)         → 401
 ```
 
-**15 tests, all green:**
+**20 tests, all green:**
 
 ```bash
 cd .../plugins && node --test --test-concurrency=1 activitypub/test.js
@@ -79,7 +84,12 @@ cd .../plugins && node --test --test-concurrency=1 activitypub/test.js
   container isn't world-readable; the container read is still attempted first
   and merges in anything written out-of-band.
 - **Inbox / followers / following** are persisted per-actor in
-  `pluginDir/state/<user>.json` (`inbox` log, `followers`, `following`).
+  `pluginDir/state/<user>.json` (`inbox` log, `followers`, `following`). Each
+  inbox entry stores the raw activity plus a `receivedAt`; the activity gets a
+  `published` stamp at ingest when the sender omitted one (and pre-stamping
+  entries are backfilled from `receivedAt` at read time), so the owner-read
+  `GET inbox` always serves sortable items. Followers/following stay public
+  AP surface; the inbox **log** is owner-only.
 
 ## The HTTP-Signatures boundary
 
