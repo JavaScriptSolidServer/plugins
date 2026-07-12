@@ -20,7 +20,9 @@
 // these is a static (or param) route that outranks core's LDP `GET /*`
 // wildcard on Fastify's route-specificity ordering. That the whole
 // Mastodon surface lives OUTSIDE the one-prefix model is the headline
-// finding (README "Findings" — same reserved-path seam as nip05).
+// finding (README "Findings" — same reserved-path seam as nip05); as of
+// JSS 0.0.219 the plugin claims + WAC-exempts both roots itself via
+// api.reservePath (#602), so the operator no longer touches appPaths.
 //
 // --------------------------------------------------------- the token bridge
 //
@@ -214,6 +216,16 @@ export async function activate(api) {
   }
 
   // =================================================================== routes
+
+  // Claim + WAC-exempt the two fixed Mastodon roots (#602, JSS 0.0.219).
+  // Literal reservations exempt the whole subtree but are READ-ONLY by
+  // default, so widen to POST — the only write verb any route below
+  // implements (/api/v1/apps, /api/v1/statuses; /oauth/authorize,
+  // /oauth/token). PUT/DELETE/PATCH stay gated on purpose: exempting a
+  // verb no route implements would let it fall through to core's LDP
+  // write wildcards as an unauthenticated storage write.
+  api.reservePath('/api', { methods: ['GET', 'HEAD', 'OPTIONS', 'POST'] });
+  api.reservePath('/oauth', { methods: ['GET', 'HEAD', 'OPTIONS', 'POST'] });
 
   // Preflight for the whole shim surface.
   for (const p of ['/api/*', '/oauth/*']) {
@@ -455,11 +467,7 @@ export async function activate(api) {
   });
 
   api.log.info(`mastodon: shim at /api/v1|v2 + /oauth/* → pods via ${loopback} (issue #515 Phase 1)`);
-  // The load-bearing caveat (see README "Findings"): these absolute routes
-  // register fine, but they are only reachable if the operator has WAC-
-  // exempted them. A plugin gets ONE prefix pushed to appPaths; Mastodon
-  // needs TWO fixed roots. The plugin cannot self-exempt, so the operator
-  // must pass `appPaths: ['/api', '/oauth']` to createServer.
-  api.log.warn('mastodon: /api and /oauth must be in appPaths or WAC will 401 '
-    + 'every client request — the one-prefix plugin model cannot self-exempt them');
+  // The former load-bearing caveat is closed: /api and /oauth are
+  // self-reserved above via api.reservePath (#602), so no operator
+  // appPaths are needed since JSS 0.0.219 (see README "Findings").
 }

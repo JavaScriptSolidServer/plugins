@@ -18,16 +18,10 @@ plugins: [{
 }]
 ```
 
-…**and** — the load-bearing caveat — the operator must WAC-exempt the two
-fixed Mastodon roots, because a plugin cannot do it itself (see
-[Findings](#findings)):
-
-```
-createServer({
-  appPaths: ['/api', '/oauth'],   // REQUIRED: or WAC 401s every client call
-  plugins: [ … ],
-})
-```
+No `appPaths` needed: since JSS 0.0.219 the plugin claims and WAC-exempts
+its two fixed roots itself at activate time via `api.reservePath('/api')` /
+`api.reservePath('/oauth')` (#602) — see [Findings](#findings) for the gap
+this closed.
 
 ## Pointing a client at it
 
@@ -132,15 +126,31 @@ plugin `prefix`. Two things follow:
   surface**, and every unexempted client call is 401'd by WAC before the
   handler runs.
 
-The honest consequence: this shim is only usable if the **operator** widens
-`appPaths` by hand (`appPaths: ['/api', '/oauth']`). That's the finding —
-the one-prefix model can't express an app whose routes are dictated by an
-external protocol at more than one absolute root. A plugin api that let a
-plugin declare *several* exempt path roots (or an `api.reservePath()` /
-`api.appPaths.add()` surface) would close it; this is the same shape as
+The honest consequence *was*: this shim was only usable if the **operator**
+widened `appPaths` by hand (`appPaths: ['/api', '/oauth']`). That was the
+finding — the one-prefix model can't express an app whose routes are
+dictated by an external protocol at more than one absolute root. A plugin
+api that let a plugin declare *several* exempt path roots (an
+`api.reservePath()` surface) would close it; this is the same shape as
 nip05's reserved-path finding, but where nip05 got lucky (core already
-exempts `/.well-known/*`), Mastodon does not, so the gap is visible instead
+exempts `/.well-known/*`), Mastodon did not, so the gap was visible instead
 of accidental.
+
+**Closed — JSS 0.0.219 shipped `api.reservePath(path, opts)` (#602) and
+this plugin consumes it.** At activate time it reserves the literal roots
+`/api` and `/oauth`; a literal reservation WAC-exempts the whole subtree,
+and a second plugin claiming the same root fails the boot loudly instead of
+silently losing. Reservations are **read-only by default** (GET/HEAD/
+OPTIONS), so both roots are widened with
+`{ methods: ['GET', 'HEAD', 'OPTIONS', 'POST'] }` — POST is the only write
+verb the shim implements (`POST /api/v1/apps`, `POST /api/v1/statuses`,
+`POST /oauth/authorize`, `POST /oauth/token`). PUT/DELETE/PATCH are
+deliberately **not** exempted: no route implements them, and an exemption
+on an unimplemented verb would fall through to core's LDP write wildcards
+as an unauthenticated storage write. Registering the routes is still the
+plugin's job; the reservation only settles claim + WAC. The operator config
+shrinks to just `plugins:` — the test suite passing without any `appPaths`
+is the proof.
 
 ### 2. The loopback-to-`/idp/credentials` token bridge
 

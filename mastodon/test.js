@@ -46,11 +46,10 @@ describe('mastodon plugin', () => {
     jss = await startJss({
       port,
       idp: true,
-      // The finding in action: Mastodon's fixed API roots (/api, /oauth)
-      // are TWO absolute paths no single plugin `prefix` can own, so the
-      // plugin can't self-exempt them from WAC — the operator widens
-      // appPaths by hand. See README "Findings".
-      appPaths: ['/api', '/oauth'],
+      // The finding, closed: Mastodon's fixed API roots (/api, /oauth) are
+      // self-reserved via api.reservePath (#602), consumed as of JSS
+      // 0.0.219 — no appPaths here, and the suite passing without them is
+      // the proof. See README "Findings".
       plugins: [{ module: module_, config: { baseUrl: base, title: 'Test JSS' } }],
     });
     const reg = await fetch(`${base}/idp/register`, {
