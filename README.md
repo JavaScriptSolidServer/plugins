@@ -99,7 +99,7 @@ Plus one directory that is a scenario, not a plugin:
 over loopback (webfinger discovery, a cross-origin Follow, plugin-signed
 delivery); run `node federation-demo/demo.js` for the narrated version.
 
-**456 tests, all green** (`npm test`), including `compose.test.js` — all
+**471 tests, all green** (`npm test`), including `compose.test.js` — all
 thirty-five plugins on one server from pure config, pods + WAC intact
 beside them. Findings consolidated in [NOTES.md](./NOTES.md); the full
 plugin-tagged backlog triaged in [ISSUES.md](./ISSUES.md); the build guide
