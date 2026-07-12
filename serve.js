@@ -104,6 +104,7 @@ const fastify = createServer({
     // Zero config on purpose — gallery/ needs none (api.serverInfo origin,
     // container defaults to the caller's own pod).
     { module: at('gallery/plugin.js'), prefix: '/gallery' },
+    { module: at('forge/plugin.js'), prefix: '/forge' },
     // webfinger/ above owns /.well-known/webfinger — the witnessed collision
     // (remotestorage/README.md) — so remotestorage stands down here.
     { module: at('remotestorage/plugin.js'), prefix: '/remotestorage', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://localhost:${PORT}`, claimWellKnown: false } },
@@ -188,6 +189,7 @@ console.log(`  backup:         GET ${PUBLIC_URL}/backup/<pod>/  → .tar.gz of w
 console.log(`  shortlink:      POST ${PUBLIC_URL}/short  (auth; local targets only)`);
 console.log(`  oembed:         GET ${PUBLIC_URL}/oembed?url=<pod-resource-url>  (link unfurling)`);
 console.log(`  gallery:        ${PUBLIC_URL}/gallery  (photo/media gallery; streaming upload)`);
+console.log(`  forge:          ${PUBLIC_URL}/forge/  (git hosting; push http://.../forge/<you>/<repo>.git)`);
 console.log(`  jmap:           GET ${PUBLIC_URL}/jmap/session  (JMAP mail over the pod)`);
 console.log(`  remotestorage:  ${PUBLIC_URL}/remotestorage/<user>/<category>/…  (rS clients)`);
 console.log(`  metrics:        GET ${PUBLIC_URL}/metrics/healthz | /metrics/metrics  (Prometheus${process.env.METRICS_TOKEN ? ', token-guarded' : ''})`);

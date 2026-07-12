@@ -96,6 +96,7 @@ describe('composition: every plugin on one server', () => {
         // Zero config on purpose — gallery/ is the first plugin needing none
         // (origin via api.serverInfo, container defaults to the caller's pod).
         { module: at('gallery/plugin.js'), prefix: '/gallery' },
+        { module: at('forge/plugin.js'), prefix: '/forge' },
         {
           module: at('remotestorage/plugin.js'),
           prefix: '/remotestorage',
@@ -348,6 +349,17 @@ describe('composition: every plugin on one server', () => {
   it('oembed: missing url is 400 (endpoint alive, never fetches external)', async () => {
     const res = await fetch(`${base}/oembed`);
     assert.strictEqual(res.status, 400);
+  });
+
+  it('forge: the repo list answers; an anonymous push is refused', async () => {
+    const page = await fetch(`${base}/forge/`);
+    assert.strictEqual(page.status, 200);
+    assert.match(page.headers.get('content-type') || '', /text\/html/);
+    const api = await fetch(`${base}/forge/api/repos`);
+    assert.strictEqual(api.status, 200);
+    assert.ok(Array.isArray((await api.json()).repos));
+    const push = await fetch(`${base}/forge/nobody/x.git/info/refs?service=git-receive-pack`);
+    assert.strictEqual(push.status, 401);
   });
 
   it('gallery: the page answers anonymously; an anonymous upload is refused', async () => {

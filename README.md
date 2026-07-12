@@ -92,14 +92,15 @@ README and NOTES.md, ship the closest honest approximation.
 | `shortlink/` | — | link shortener for pod URLs (deliberately not an open redirector) |
 | `admin/` | — | **the capstone**: wp-admin-style operator home; each missing pillar names its seam |
 | `gallery/` | — | pod photo/media gallery — first `api.mountApp` (#583) consumer; zero required config |
+| `forge/` | #322-next | personal git forge — push-to-create hosting, GitHub-light UI, JSON API; zero deps, zero build |
 
 Plus one directory that is a scenario, not a plugin:
 [`federation-demo/`](./federation-demo/) — **two** JSS instances federating
 over loopback (webfinger discovery, a cross-origin Follow, plugin-signed
 delivery); run `node federation-demo/demo.js` for the narrated version.
 
-**407 tests, all green** (`npm test`), including `compose.test.js` — all
-thirty-four plugins on one server from pure config, pods + WAC intact
+**456 tests, all green** (`npm test`), including `compose.test.js` — all
+thirty-five plugins on one server from pure config, pods + WAC intact
 beside them. Findings consolidated in [NOTES.md](./NOTES.md); the full
 plugin-tagged backlog triaged in [ISSUES.md](./ISSUES.md); the build guide
 is [AGENT.md](./AGENT.md); the maintainer-facing summary — what to add

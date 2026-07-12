@@ -45,6 +45,7 @@ evidence. Legend:
 | — | `shortlink/` | link shortener for pod URLs (pluginDir persistence, 11th witness) |
 | #463/#464-adj | `admin/` | operator home — the wp-admin gap analysis; every missing pillar names a seam |
 | #583-adj | `gallery/` | pod photo/media gallery — first `api.mountApp` consumer; zero required config |
+| #322-next | `forge/` | personal git forge — persistent push-to-create hosting, GitHub-light UI, JSON API |
 
 Plus seven **ports of bundled features** proving the migration path for
 #564 / #164: `relay/` `webrtc/` `terminal/` `tunnel/` `notifications/`
@@ -118,7 +119,7 @@ shipped upstream** (the loader plus four seams and the id fix in JSS
 0.0.218/0.0.219, each consumed here), **2 more plugin-able with no
 blocker**, **4 clusters blocked on a named seam** (each with a
 proof-of-need consumer), the rest core-by-nature or product-scale.
-**34 plugins total, 407 tests** (plus the two-server `federation-demo/`
+**35 plugins total, 456 tests** (plus the two-server `federation-demo/`
 scenario). The plugin api reaches most of the backlog today; ranked by
 demand, the seams that would unlock the most next are `api.authorize`
 (4 consumers, 3 hard-blocked) and `api.events` (7 consumers — matrix

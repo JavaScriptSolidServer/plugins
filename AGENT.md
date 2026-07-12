@@ -161,6 +161,7 @@ Full ranking in `NOTES.md`. The ones you'll hit:
 | an object-storage / S3-style gateway | `s3/` | loopback LDP + hand-rolled XML + SigV4 |
 | a DID / identity document | `didweb/` | podsRoot scan + key derivation |
 | a dev/tooling subsystem | `gitscratch/` | shell a system binary via CGI |
+| a hosted-content web app (forge, wiki, …) | `forge/` | CGI plumbing + server-rendered GitHub-light UI + JSON API, zero deps/build |
 | a posting protocol (IndieWeb-style, client-discovered endpoint) | `micropub/` | pod bearer as the protocol token + loopback writes |
 | a data-export / archive download | `backup/` | loopback container walk streamed into a hand-rolled format |
 | an ops/observability endpoint | `metrics/` | node builtins + an `api.fastify` hook (scope: all plugins, never core) |
@@ -195,8 +196,8 @@ Full ranking in `NOTES.md`. The ones you'll hit:
 
 ## Current state
 
-34 plugins (7 ports + 27 features) + the two-server `federation-demo/`,
-407 tests, all green (`npm test`).
+35 plugins (7 ports + 28 features) + the two-server `federation-demo/`,
+456 tests, all green (`npm test`).
 A four-axis security review ([SECURITY.md](./SECURITY.md)) hardened the
 inbound-federation and query surfaces; the WAC-deferral pattern held.
 `compose.test.js` runs every plugin on a single server from pure config.

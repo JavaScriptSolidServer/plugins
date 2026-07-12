@@ -8,7 +8,7 @@ plugin), `NOTES.md` (the findings/seams — the real deliverable), and
 
 ## Where things stand
 
-- **34 plugins, 407 tests, all green** (`npm test`; the three
+- **35 plugins, 456 tests, all green** (`npm test`; the three
   `notifications/` fs.watch tests need a free inotify instance — see
   Footguns), all pushed to
   `github.com/JavaScriptSolidServer/plugins` (branch `gh-pages`).
@@ -180,6 +180,12 @@ Still genuinely plugin-shaped and distinct:
   (capability + shortlink composition), a music/podcast pod (gallery's
   Range finding makes byte-range playback free), a turn-based game over
   relay + pod state. Demos compose existing plugins; loopback only.
+- **forge/ tier 2** (tier 1 SHIPPED 2026-07-12: push-to-create hosting,
+  GitHub-light UI, JSON API — see forge/README Findings). Tier 2 =
+  issues + comments **as pod resources** (WAC-governed, portable — the
+  thing Gitea structurally can't offer), repo settings, profile pages.
+  Tier 3 = PRs/forks (git CLI can merge; the UI is the work). Wants:
+  api.authorize for collaborators, api.events for webhooks.
 - **Phanpy Wave B — real federation** (Wave A is DONE, 2026-07-12: the
   mastodon/ shim is Phanpy-grade for local use — timelines, threads,
   media, notifications from the AP inbox, PKCE; serve a Phanpy dist at
