@@ -136,7 +136,16 @@ construction.
 
 **Cost:** small — the event stream exists; scope it and pass it through.
 
-### 3. `api.reservePath(pattern)` — what every API shim structurally needs (#602)
+### 3. `api.reservePath(pattern)` — what every API shim structurally needs (#602) — ✅ SHIPPED (0.0.218/219) & CONSUMED
+
+*(mastodon/bluesky/activitypub/matrix self-reserve their literal roots;
+didweb consumes the parameterized `/:user/did.json`. Two follow-ups
+surfaced in consumption: shared discovery documents still need a
+link/JRD registry — a reservation can't split one document between two
+plugins — and the parameterized matcher is length-unbounded while
+`:param` routes cap at `maxParamLength` 100, so an over-long name falls
+through to LDP `GET /*` with the read-only exemption applied. The
+original case for the seam, kept for the record:)*
 
 **The most-hit finding: seven+ consumers.** A plugin can *register* routes
 outside its prefix, but only its one `prefix` is WAC-exempt:
@@ -174,7 +183,11 @@ reporting collisions at boot.
 **Cost:** small-medium — generalizes the `appPaths` mechanism that already
 exists, moving it from operator config to plugin declaration.
 
-### 4. `api.serverInfo` — the broadest, and the cheapest (#601)
+### 4. `api.serverInfo` — the broadest, and the cheapest (#601) — ✅ SHIPPED (0.0.218) & CONSUMED
+
+*(consumed at request time by webfinger/didweb/dashboard/admin/gallery;
+`config.baseUrl` survives as an optional reverse-proxy override; ~18
+mechanical retrofits remain. The original case, kept for the record:)*
 
 **23 consumers** — every plugin that mints absolute URLs or loopbacks
 (the DAV family, the four shims, rss, sparql, webfinger, notifications,
@@ -335,19 +348,20 @@ hooks capability.
 
 ## Suggested order of work
 
-If effort is scarce, this order maximizes unblocked value per unit cost:
+If effort is scarce, this order maximizes unblocked value per unit cost
+(items 1–2 are ✅ DONE — shipped in 0.0.218/0.0.219 and consumed here,
+along with `api.mountApp` #583 and `api.plugins` #610):
 
-1. `api.serverInfo` (trivial; tidies ~23 plugins' config and every test
-   harness),
-2. `api.reservePath` (small-medium; makes four existing shims
-   self-contained and didweb *possible* — pair it with a webfinger link
-   registry for the shared-document case),
+1. ~~`api.serverInfo`~~ ✅ shipped & consumed (retrofit tail in progress),
+2. ~~`api.reservePath`~~ ✅ shipped & consumed by all five provers — the
+   webfinger link registry for the shared-document case is still worth it,
 3. `api.events.onResourceChange` (small; unlocks webhooks/WebSub/indexing
-   and makes search/sparql/matrix/jmap faithful),
+   and makes search/sparql/matrix/jmap faithful) — **now the top ask**,
 4. `api.authorize` (medium; the blocking seam for proxy ACLs, capability
    semantics, and scheduling delivery),
 5. the five bug fixes (anytime; small — the non-atomic conditional write
-   is the one with real data-loss consequences).
+   is the one with real data-loss consequences; #596 generic-basename id
+   is ✅ fixed in 0.0.219).
 
 Everything else can wait until a real consumer shows up — this repo is the
 mechanism for finding those.

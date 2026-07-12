@@ -64,12 +64,9 @@ const fastify = createServer({
   root: PODS,
   idp: true,
   idpIssuer: PUBLIC_URL,
-  // The protocol shims own fixed roots outside their prefix — mastodon
-  // (/api,/oauth), bluesky (/xrpc), activitypub (/ap), matrix (/_matrix) —
-  // which a plugin can't self-exempt from WAC, so the operator widens
-  // appPaths.
-  appPaths: ['/api', '/oauth', '/xrpc', '/ap', '/_matrix'],
-  // Explicit ids — the <name>/plugin.js convention collides on basename.
+  // No appPaths and no explicit ids: as of JSS 0.0.219 the protocol shims
+  // self-reserve their fixed roots (api.reservePath, #602) and the loader
+  // derives each id from the parent dir (#596 fix).
   plugins: [
     { module: at('relay/plugin.js'), prefix: '/relay' },
     { module: at('webrtc/plugin.js'), prefix: '/webrtc' },
@@ -104,6 +101,9 @@ const fastify = createServer({
     { module: at('shortlink/plugin.js'), prefix: '/short', config: { baseUrl: PUBLIC_URL } },
     { module: at('oembed/plugin.js'), prefix: '/oembed', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
     { module: at('jmap/plugin.js'), prefix: '/jmap', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}` } },
+    // Zero config on purpose — gallery/ needs none (api.serverInfo origin,
+    // container defaults to the caller's own pod).
+    { module: at('gallery/plugin.js'), prefix: '/gallery' },
     // webfinger/ above owns /.well-known/webfinger — the witnessed collision
     // (remotestorage/README.md) — so remotestorage stands down here.
     { module: at('remotestorage/plugin.js'), prefix: '/remotestorage', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://127.0.0.1:${PORT}`, claimWellKnown: false } },
@@ -187,6 +187,7 @@ console.log(`  micropub:       POST ${PUBLIC_URL}/micropub  (IndieWeb clients; p
 console.log(`  backup:         GET ${PUBLIC_URL}/backup/<pod>/  → .tar.gz of what you can read`);
 console.log(`  shortlink:      POST ${PUBLIC_URL}/short  (auth; local targets only)`);
 console.log(`  oembed:         GET ${PUBLIC_URL}/oembed?url=<pod-resource-url>  (link unfurling)`);
+console.log(`  gallery:        ${PUBLIC_URL}/gallery  (photo/media gallery; streaming upload)`);
 console.log(`  jmap:           GET ${PUBLIC_URL}/jmap/session  (JMAP mail over the pod)`);
 console.log(`  remotestorage:  ${PUBLIC_URL}/remotestorage/<user>/<category>/…  (rS clients)`);
 console.log(`  metrics:        GET ${PUBLIC_URL}/metrics/healthz | /metrics/metrics  (Prometheus${process.env.METRICS_TOKEN ? ', token-guarded' : ''})`);

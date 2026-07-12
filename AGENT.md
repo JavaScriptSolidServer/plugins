@@ -80,19 +80,31 @@ Full ranking in `NOTES.md`. The ones you'll hit:
   Workaround: loopback with the requester's own creds covers the common
   case; the issuer-authority case has no workaround — document it. (4
   consumers; the top blocking seam.)
-- **No `api.reservePath()`** — you can register routes outside your one
-  `prefix`, but only `prefix` is WAC-exempt. `/.well-known/*` works by luck
-  (core blanket-exempts it). Fixed roots like `/api`, `/xrpc`, `/ap` do
-  **not** work until the operator passes `appPaths: ['/api',...]` to
-  `createServer`. **If you build an API shim, your `test.js` must pass those
-  `appPaths`, and your README must say the operator does too.** (4 shim
-  consumers.)
+- **`api.reservePath()` — LANDED (JSS 0.0.219, #602) and consumed.** A
+  plugin now claims + WAC-exempts its protocol-pinned paths itself:
+  literal roots (`api.reservePath('/xrpc', { methods: [...] })` — see
+  mastodon/bluesky/activitypub/matrix) and parameterized shapes
+  (`api.reservePath('/:user/did.json')` — see didweb/). Reservations are
+  READ-ONLY by default; widen `methods` to exactly the verbs your routes
+  implement, never wider (an exempted verb with no route falls through to
+  LDP's write wildcards unauthenticated). No more operator `appPaths`.
+  `/.well-known/*` still also rides core's blanket exemption; reserving a
+  well-known doc makes the claim deliberate and collision-guarded.
 - **No `api.events.onResourceChange`** — you can't react to pod writes, so a
   write-time index / cached feed is impossible; do read-time work (walk the
   container per request) and note the O(N) cost. See `sparql/`, `rss/`.
-- **No `api.serverInfo`** — a plugin can't learn its own origin at
-  `activate` time. Take `config.baseUrl` (and `loopbackUrl`), and `throw` if
-  missing. ~23 plugins do this.
+- **`api.serverInfo` — LANDED (JSS 0.0.218, #601), retrofit in progress.**
+  Resolve the origin at REQUEST time (`api.serverInfo().baseUrl`; with an
+  ephemeral port it only exists once listening), keep `config.baseUrl` as
+  an optional reverse-proxy override. Consumed by webfinger/, didweb/,
+  dashboard/, admin/, gallery/; ~18 plugins still carry the old
+  config-pair pattern and retrofit the same way.
+- **`api.mountApp` — LANDED (JSS 0.0.219, #583).** A raw `(req,res)`
+  handler with the UN-drained request stream — the streaming-upload lane
+  Fastify's parsers can't give you. See gallery/ (the first consumer) for
+  the contract's edges: the mounted lane sidesteps the host `bodyLimit`
+  (cap your own if you don't forward to core), the two lanes can't share
+  a prefix, and `getAgent` needs a shim for raw reqs.
 - **No `api.mcp.registerTool`** — MCP tools can't be added by a plugin
   (that's why #495/#496/#500/#501 aren't here).
 - **Can't set Fastify server options** — e.g. `maxParamLength` (100) 404s
@@ -140,7 +152,7 @@ Full ranking in `NOTES.md`. The ones you'll hit:
 |---|---|---|
 | a realtime/WebSocket service | `relay/` or `webrtc/` | `ws.route` + `pluginDir` |
 | a DAV-family protocol (CalDAV done, e.g. a filesystem/WebDAV variant) | `webdav/`→`carddav/`→`caldav/` | loopback + multistatus XML + ETag + Basic→Bearer, proven 3× |
-| an API shim (a new social/chat/proto) | `mastodon/` or `bluesky/` | token bridge + fixed-root `appPaths` |
+| an API shim (a new social/chat/proto) | `mastodon/` or `bluesky/` | token bridge + self-reserved fixed roots (#602) |
 | a `.well-known` discovery doc | `nip05/` or `webfinger/` | podsRoot scan + guarded absolute route |
 | a scoped-token / auth service | `capability/` or `otp/` | HMAC macaroon-lite + `pluginDir` |
 | a query/read/search over pod data | `sparql/`, `rss/`, `search/` | loopback container walk + forwarded auth |
@@ -158,6 +170,8 @@ Full ranking in `NOTES.md`. The ones you'll hit:
 | a storage protocol with conditional writes | `remotestorage/` | If-Match/If-None-Match pass through loopback intact |
 | a redirect / metadata micro-service | `shortlink/` | pluginDir JSON table + wildcard slug routes |
 | an operator/admin surface | `admin/` | compose probes + podsRoot scan behind an agent allowlist |
+| a streaming-body app (upload, media) | `gallery/` | `api.mountApp` raw handler → loopback PUT, auth forwarded |
+| a multi-server scenario (not a plugin) | `federation-demo/` | child-process instances (DATA_ROOT is process-global) |
 
 ## Footguns (every multi-boot suite rediscovered these)
 
@@ -167,9 +181,11 @@ Full ranking in `NOTES.md`. The ones you'll hit:
 - **Ambient `~/.gitconfig`** (git-shelling plugins): spawn git with
   `GIT_CONFIG_NOSYSTEM=1` and no `HOME`, or the operator's `init.defaultBranch`
   leaks into created repos.
-- **Generic basename id**: the loader derives the id from the module
-  basename; `<name>/plugin.js` all reduce to `plugin` and collide — always
-  pass an explicit `id` in `compose.test.js`/`serve.js`.
+- **Generic basename id — FIXED in JSS 0.0.219 (#596)**: the loader now
+  derives `<name>/plugin.js` → id `<name>` from the parent dir; explicit
+  `id` fields are gone from `compose.test.js`/`serve.js`. Don't reintroduce
+  them — but if a test hardcodes a pluginDir path, it's `.plugins/<name>/`
+  now, not `.plugins/plugin/`.
 - **Dotted prefixes** (`/.foo`) fail the WS upgrade — core reserves dotted
   paths. Use a plain prefix for anything with a socket.
 - **`logger: false` kills plugin `onResponse` hooks**: core's access-log
@@ -179,10 +195,14 @@ Full ranking in `NOTES.md`. The ones you'll hit:
 
 ## Current state
 
-33 plugins (7 ports + 26 features), 386 tests, all green (`npm test`).
+34 plugins (7 ports + 27 features) + the two-server `federation-demo/`,
+407 tests, all green (`npm test`).
 A four-axis security review ([SECURITY.md](./SECURITY.md)) hardened the
 inbound-federation and query surfaces; the WAC-deferral pattern held.
-`compose.test.js` runs every one on a single server from pure config. Two
-core PRs (#590 `api.mountApp`, #591 `/idp/refresh`) sit upstream, unmerged,
-for the maintainer's call. Everything else lives here, by design.
-[REPORT.md](./REPORT.md) is the maintainer-facing summary of it all.
+`compose.test.js` runs every plugin on a single server from pure config.
+Four seams have now LANDED upstream and are consumed here: `api.serverInfo`
+(#601), `api.reservePath` (#602), `api.mountApp` (#583), `api.plugins`
+(#610) — all in JSS 0.0.218/0.0.219, which this repo pins. Still open:
+`api.events` (#603) and `api.authorize` (#604). Everything else lives
+here, by design. [REPORT.md](./REPORT.md) is the maintainer-facing
+summary of it all.

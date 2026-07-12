@@ -8,24 +8,36 @@ plugin), `NOTES.md` (the findings/seams — the real deliverable), and
 
 ## Where things stand
 
-- **33 plugins, 386 tests, all green** (`npm test`; the three
+- **34 plugins, 407 tests, all green** (`npm test`; the three
   `notifications/` fs.watch tests need a free inotify instance — see
   Footguns), all pushed to
   `github.com/JavaScriptSolidServer/plugins` (branch `gh-pages`).
-- `compose.test.js` boots all 33 on **one** JSS from pure config; `serve.js`
-  is the runnable demo — its front door is now `admin/` (`/admin/`), the
-  capstone wp-admin-style operator home fed by a shared `INVENTORY` array.
-  All three must be updated when you add a plugin.
+- **Four seams are LANDED and CONSUMED (2026-07-12).** JSS 0.0.219 is
+  published and pinned; `api.serverInfo` (#601), `api.reservePath` (#602 —
+  including the parameterized form), `api.mountApp` (#583) and
+  `api.plugins` (#610) all shipped. Consumed so far: webfinger+didweb
+  (serverInfo), the four shims mastodon/bluesky/activitypub/matrix
+  (reservePath — no more operator appPaths anywhere), didweb
+  (`/:user/did.json`, the previously-impossible parameterized case),
+  gallery (mountApp), dashboard+admin (api.plugins + serverInfo). The
+  explicit-id footgun is gone too (0.0.219 derives ids from parent dirs).
+  Still open upstream: `api.events` (#603), `api.authorize` (#604).
+- `compose.test.js` boots all 34 on **one** JSS from pure config; `serve.js`
+  is the runnable demo — its front door is `admin/` (`/admin/`), the
+  capstone wp-admin-style operator home (both consoles auto-discover via
+  api.plugins). All three must be updated when you add a plugin.
 - Built so far: 7 ports (relay, webrtc, terminal, tunnel, notifications,
-  remotestorage, pay) + 26 features (nip05, corsproxy, capability, webdav,
+  remotestorage, pay) + 27 features (nip05, corsproxy, capability, webdav,
   sparql — now with UPDATE, gitscratch, otp, carddav, mastodon, bluesky,
   caldav — now with free-busy, webfinger,
   activitypub, rss, matrix, search, didweb, s3, micropub, backup,
-  metrics, dashboard, oembed, jmap, shortlink, admin).
+  metrics, dashboard, oembed, jmap, shortlink, admin, gallery) — plus
+  `federation-demo/`, a two-server loopback federation scenario (not a
+  plugin; `node federation-demo/demo.js` narrates it).
 - Capability classes covered: realtime, WebDAV family, fediverse/social/chat
   (5 shims), IndieWeb publishing, identity, data/query/search, object
   storage, proxy, dev, pay, data portability, ops/observability, mail,
-  link-embeds, remoteStorage.
+  link-embeds, remoteStorage, media/streaming-upload.
 - **REPORT.md exists** — the maintainer-facing summary (ranked seams, each
   fileable nearly verbatim). Keep its consumer counts current as plugins
   land.
@@ -46,17 +58,23 @@ plugin), `NOTES.md` (the findings/seams — the real deliverable), and
    are honest approximations; keep them that way until a seam actually
    lands and is *published*.)
 3. Core is at `~/remote/github.com/JavaScriptSolidServer/JavaScriptSolidServer`,
-   at 0.0.217 on `gh-pages` (serverInfo merged on top, unversioned as of
-   writing). This repo still consumes the **published npm** JSS, pinned
-   `^0.0.215` — see the Stage-3 plan below for why that pin blocks
-   consuming merged-but-unpublished seams.
+   at 0.0.219 on `gh-pages`, published to npm, and this repo pins
+   `^0.0.219`. REMEMBER the trap for the next bump: caret on a `0.0.x`
+   version locks to the exact patch (`^0.0.219` = only 0.0.219), so
+   consuming a future release means editing the dependency string itself,
+   then `npm install`.
 
 ## Stage 3: consuming the merged seams (the upstream loop)
 
 The point of filing the seams was never the issues — it's closing the
 loop: **seam lands in core → plugins get simpler/faithful, proven**.
-`api.serverInfo` (#601) is merged (#605); this is how to consume it. The
-same shape applies to each seam as it lands.
+**STATUS 2026-07-12: the loop is CLOSED for four seams.** 0.0.219 is
+published + pinned; webfinger/didweb consume serverInfo, the four shims
+self-reserve their roots, didweb reserves the parameterized
+`/:user/did.json`, gallery consumes mountApp, dashboard/admin consume
+api.plugins. What follows is the how-to, kept because ~18 plugins still
+carry the old baseUrl/loopbackUrl config pair and retrofit the same way
+(mechanical now; the strongest-story pairs are done).
 
 ### What `serverInfo` gives you
 
@@ -68,22 +86,6 @@ public `baseUrl`. One call collapses **both** config values most plugins
 carry: `.baseUrl` replaces the public-origin config, and
 `http://${host}:${port}` replaces `loopbackUrl` (the callable bind).
 
-### Two blockers before a retrofit can go green
-
-1. **Not published.** #605 merged but didn't bump the version — core is
-   still 0.0.217 and npm has 0.0.215. serverInfo exists only on the branch.
-   Core must bump → `npm publish` (say 0.0.218) first.
-2. **The pin is a trap.** This repo pins `^0.0.215`, and **caret on a
-   `0.0.x` version locks to the exact patch** (`^0.0.215` = `>=0.0.215
-   <0.0.216`, i.e. *only* 0.0.215 — which is why we're still on 215 despite
-   216/217 shipping). Publishing 0.0.218 is **not** enough; the dependency
-   string itself must change to `^0.0.218`/`0.0.218`, then `npm install`.
-   Miss this and it looks like "the seam isn't there" when it's the range.
-
-To validate *before* a publish: `npm link` (or a `file:` dep) against the
-local core tree on a throwaway branch, then flip to the real version once
-it's out.
-
 ### The retrofit is NOT a find-replace
 
 Plugins that capture `baseUrl`/`loopbackUrl` at activate and `throw` if
@@ -93,19 +95,20 @@ request time** — at activate the port may be unresolved. Keep
 a public origin different from the server's (reverse-proxy edge cases),
 rather than deleting it everywhere.
 
-### Recommended first move
+### What's done, what remains
 
-Don't retrofit all ~23 at once. Do **`webfinger/` + `didweb/`** first — the
-two where a wrong origin fails *silently* (webfinger mints WebIDs/JRD links
-on the wrong origin; didweb serves a `did.json` whose `id` doesn't match
-the URL it's fetched from), so the before/after story is strongest. (An
-earlier draft named nip05/ here — wrongly: its own README finding says
-NIP-05 documents contain no absolute self-URLs, so it needs no `baseUrl`;
-its silent-empty-map failure is the *data-root* repetition class,
-`config.podsRoot`, which `serverInfo` does not cover.) One plugins-repo PR against
-a locally-linked core, proving the loop closes; once core publishes, flip
-the pin and merge. The rest follow the same shape. Then the next seam:
-`reservePath` (#602) → `events` (#603) → `authorize` (#604).
+**DONE**: `webfinger/` + `didweb/` (the silent-failure pair — webfinger
+minted WebIDs/JRD links on the wrong origin; didweb's `did.json` `id`
+wouldn't match its URL), plus dashboard/, admin/, gallery/. (nip05/ was
+once slated here — wrongly: its own README finding says NIP-05 documents
+contain no absolute self-URLs; its silent-empty-map failure is the
+*data-root* class, `config.podsRoot`, which serverInfo does not cover.)
+**REMAINING (~18, mechanical)**: the DAV family, the four shims, rss,
+sparql, notifications, micropub, backup, metrics, oembed, jmap,
+remotestorage, s3, search, shortlink — same shape each time: resolve at
+request time, keep `config.baseUrl` as the reverse-proxy override, drop
+the throw-on-missing. Then the next seams upstream:
+`events` (#603) → `authorize` (#604).
 
 ## Phase 1: a blessed read-only status console (`dashboard/`)
 
@@ -116,10 +119,12 @@ gated on exactly **one** seam: `api.plugins` (**filed core #610**), so its
 inventory stops being a hand-copied `config.plugins` list that silently
 drifts.
 
-Steps: (1) land core #610 → (2) bump+publish core → (3) flip this repo's
-pin → (4) retrofit `dashboard/` to read `api.plugins` (drop the hand-fed
-list) + `serverInfo` (drop `loopbackUrl`) → (5) finalize README/screenshot
-→ (6) bless via core docs + the `--plugin` CLI opt-in (#595) → (7) announce.
+Steps: (1) land core #610 ✅ → (2) bump+publish core ✅ (0.0.219) → (3)
+flip this repo's pin ✅ → (4) retrofit `dashboard/` ✅ (api.plugins +
+serverInfo, committed) → (5) finalize README/screenshot → (6) bless via
+core docs + the `--plugin` CLI opt-in (#595 — note 0.0.219's parent-dir
+id fix was exactly what made multi-`--plugin` work) → (7) announce.
+**Next actionable step: (5)–(7), the blessing itself.**
 
 The richer `admin/` console (pod stats + an operator gate) is **phase 2** —
 it additionally needs an operator-identity seam (`api.isOperator`; three
@@ -151,8 +156,9 @@ Verify each with `node --test --test-concurrency=1 <name>/test.js`, then:
    does + its headline finding; **no AI-generated footer/trailer** — the
    maintainer's global rule).
 4. After a wave lands, integrate: add entries to `compose.test.js` and
-   `serve.js` (give each an explicit `id`; add any fixed roots to their
-   `appPaths`), add a liveness probe to `compose.test.js`, run `npm test`,
+   `serve.js` (no explicit `id` and no `appPaths` needed since JSS
+   0.0.219 — ids derive from the parent dir, fixed roots self-reserve),
+   add a liveness probe to `compose.test.js`, run `npm test`,
    update `README.md` (table + count), `ISSUES.md` (tally), `NOTES.md`
    (fold in new findings, re-rank seams by consumer count), and `AGENT.md`
    (copy-map + count). Commit + push the integration.
@@ -168,8 +174,12 @@ Still genuinely plugin-shaped and distinct:
   (api.authorize's issuer-authority case, or a deliver-to-inbox
   primitive); free-busy is done.
 - **Bluesky/Mastodon/Matrix Phase-2** (federation, `/sync` live push) —
-  these are blocked on `api.events` + `api.reservePath`; good once those
-  seams exist, otherwise document the wall.
+  the `api.reservePath` half is now consumed; still blocked on
+  `api.events` for live push. Good once that seam exists.
+- **More fun demos in the federation-demo/ vein** — a QR share page
+  (capability + shortlink composition), a music/podcast pod (gallery's
+  Range finding makes byte-range playback free), a turn-based game over
+  relay + pod state. Demos compose existing plugins; loopback only.
 
 Prefer plugins that open a **new capability class** or add a **new
 independent consumer of an already-named seam** (that strengthens the
@@ -189,15 +199,21 @@ each. Current top four (keep this current as you add consumers):
    live push, and sparql/'s UPDATE proved owning a write endpoint does
    not buy a write-time index. Every "react to writes" plugin (webhooks,
    WebSub, indexing) will want it.
-3. **`api.reservePath`** — every API-shim owns fixed roots outside its one
-   prefix and can't self-exempt; didweb needs a *parameterized* form.
-   (micropub/ is the counter-witness: client-discovered endpoints need no
-   reservation — the seam is about protocol-fixed paths.)
-4. **`api.serverInfo`** — broadest (~23 plugins hand-roll their origin).
-   **FILED #601, MERGED as core #605** — see the Stage-3 plan above for
-   consuming it. reservePath #602, events #603, authorize #604 still open.
+3. **`api.reservePath`** — **LANDED (#602, JSS 0.0.219) and consumed**:
+   the four shims self-reserve their literal roots; didweb consumes the
+   parameterized form (`/:user/did.json`). Remaining asks recorded in
+   NOTES: a JRD/link registry for shared discovery docs (the webfinger↔
+   remotestorage collision), and the matcher-vs-maxParamLength edge
+   didweb documented. (micropub/ stays the counter-witness:
+   client-discovered endpoints need no reservation.)
+4. **`api.serverInfo`** — broadest (~23 plugins hand-rolled their origin).
+   **LANDED (#601, JSS 0.0.218) and consumed** by webfinger, didweb,
+   dashboard, admin, gallery; ~18 mechanical retrofits remain (see
+   Stage 3).
 
-Plus: the unconsumed-body-**stream** primitive (#583), `api.mcp.registerTool`
+Plus: the body-**stream** primitive **(#583 — LANDED as api.mountApp,
+JSS 0.0.219; gallery/ is the first consumer**; micropub's multipart media
+endpoint is now parser-work, not seam-work), `api.mcp.registerTool`
 (blocks the MCP-tool issues #495/#496/#500/#501), can't-set-server-options,
 and response-header hooks. `#564` (the core/plugin line) is answered
 empirically in NOTES: **route-owning → plugin, pipeline-modifying → core**.

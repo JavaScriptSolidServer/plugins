@@ -55,14 +55,10 @@ describe('composition: every plugin on one server', () => {
       port,
       root,
       idp: true,
-      // The protocol shims own fixed roots outside their prefix — mastodon
-      // (/api,/oauth), bluesky (/xrpc), activitypub (/ap), matrix (/_matrix)
-      // — which a plugin can't self-exempt (finding), so the operator
-      // widens appPaths.
-      appPaths: ['/api', '/oauth', '/xrpc', '/ap', '/_matrix'],
-      // Explicit ids: the <name>/plugin.js convention makes every basename
-      // reduce to 'plugin' — the loader's duplicate-id guard requires ids
-      // here (finding: derive from the parent dir for generic basenames).
+      // No appPaths and no explicit ids: as of JSS 0.0.219 the protocol
+      // shims self-reserve their fixed roots (api.reservePath, #602) and
+      // the loader derives each id from the parent dir (#596 fix) — both
+      // operator workarounds this file used to carry, consumed.
       plugins: [
         { module: at('relay/plugin.js'), prefix: '/relay' },
         { module: at('webrtc/plugin.js'), prefix: '/webrtc' },
@@ -97,6 +93,9 @@ describe('composition: every plugin on one server', () => {
         { module: at('shortlink/plugin.js'), prefix: '/short', config: { baseUrl: base } },
         { module: at('oembed/plugin.js'), prefix: '/oembed', config: { baseUrl: base, loopbackUrl: base } },
         { module: at('jmap/plugin.js'), prefix: '/jmap', config: { baseUrl: base, loopbackUrl: base } },
+        // Zero config on purpose — gallery/ is the first plugin needing none
+        // (origin via api.serverInfo, container defaults to the caller's pod).
+        { module: at('gallery/plugin.js'), prefix: '/gallery' },
         {
           module: at('remotestorage/plugin.js'),
           prefix: '/remotestorage',
@@ -264,7 +263,7 @@ describe('composition: every plugin on one server', () => {
     assert.match(res.headers.get('dav') || '', /addressbook/);
   });
 
-  it('mastodon: the instance endpoint answers (fixed /api root, appPaths-widened)', async () => {
+  it('mastodon: the instance endpoint answers (fixed /api root, self-reserved)', async () => {
     const res = await fetch(`${base}/api/v1/instance`);
     assert.strictEqual(res.status, 200);
     assert.ok('title' in (await res.json()));
@@ -349,6 +348,14 @@ describe('composition: every plugin on one server', () => {
   it('oembed: missing url is 400 (endpoint alive, never fetches external)', async () => {
     const res = await fetch(`${base}/oembed`);
     assert.strictEqual(res.status, 400);
+  });
+
+  it('gallery: the page answers anonymously; an anonymous upload is refused', async () => {
+    const page = await fetch(`${base}/gallery`);
+    assert.strictEqual(page.status, 200);
+    assert.match(page.headers.get('content-type') || '', /text\/html/);
+    const up = await fetch(`${base}/gallery/upload/x.png`, { method: 'POST', body: 'nope' });
+    assert.ok([401, 403].includes(up.status), `anon upload: ${up.status}`);
   });
 
   it('jmap: anonymous session is 401; /.well-known/jmap redirects to it', async () => {

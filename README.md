@@ -73,7 +73,7 @@ README and NOTES.md, ship the closest honest approximation.
 | `gitscratch/` | #322 | ephemeral Solid-authed git remotes via the `git-http-backend` CGI |
 | `otp/` | #505 | one-time-password session flow; account recovery needs core auth |
 | `carddav/` | #157 | contact sync (iOS/macOS/Thunderbird/DAVx5); the DAV bridge, generalized |
-| `mastodon/` | #515/#516 | Mastodon-API shim — a client logs into its own pod; needs `appPaths` widened |
+| `mastodon/` | #515/#516 | Mastodon-API shim — a client logs into its own pod; self-reserves `/api`+`/oauth` (#602) |
 | `bluesky/` | #211 | AT-Protocol XRPC shim — same shape, `/xrpc` root; token bridge generalizes |
 | `caldav/` | #157-sib | calendar sync + free-busy — completes the DAV family (webdav+carddav+caldav) |
 | `webfinger/` | #164 | `/.well-known/webfinger` — fediverse `acct:` resolution for the shims |
@@ -91,9 +91,15 @@ README and NOTES.md, ship the closest honest approximation.
 | `jmap/` | — | JMAP mail over pod messages — the stateless/push line, sharpened |
 | `shortlink/` | — | link shortener for pod URLs (deliberately not an open redirector) |
 | `admin/` | — | **the capstone**: wp-admin-style operator home; each missing pillar names its seam |
+| `gallery/` | — | pod photo/media gallery — first `api.mountApp` (#583) consumer; zero required config |
 
-**386 tests, all green** (`npm test`), including `compose.test.js` — all
-thirty-three plugins on one server from pure config, pods + WAC intact
+Plus one directory that is a scenario, not a plugin:
+[`federation-demo/`](./federation-demo/) — **two** JSS instances federating
+over loopback (webfinger discovery, a cross-origin Follow, plugin-signed
+delivery); run `node federation-demo/demo.js` for the narrated version.
+
+**407 tests, all green** (`npm test`), including `compose.test.js` — all
+thirty-four plugins on one server from pure config, pods + WAC intact
 beside them. Findings consolidated in [NOTES.md](./NOTES.md); the full
 plugin-tagged backlog triaged in [ISSUES.md](./ISSUES.md); the build guide
 is [AGENT.md](./AGENT.md); the maintainer-facing summary — what to add

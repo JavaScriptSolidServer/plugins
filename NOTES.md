@@ -90,7 +90,11 @@ ports reached for it without coordinating.
    whose `id` doesn't match its URL). (nip05/ was once listed here —
    wrongly: its README finding is that NIP-05 documents carry no absolute
    self-URLs; its config repetition is the *data-root* class, `podsRoot`,
-   which serverInfo doesn't cover.) The single most *broadly* needed seam
+   which serverInfo doesn't cover.) **LANDED — #601, JSS 0.0.218 —**
+   **and consumed** by webfinger/, didweb/, dashboard/, admin/, gallery/
+   (resolve at request time; `config.baseUrl` stays as the reverse-proxy
+   override); ~18 mechanical retrofits remain. Was the single most
+   *broadly* needed seam
    (vs. api.authorize being the most *blocking*); trivially cheap to provide.
 4. **The unconsumed-body-**stream** primitive (#583)** — consumers:
    gitscratch/ sharpened it; micropub/ adds a blocked one. tunnel/ needed
@@ -99,12 +103,33 @@ ports reached for it without coordinating.
    simply not implemented until a plugin can pipe an un-drained body;
    jmap/ likewise omits blobs/attachments (`uploadUrl` absent,
    `maxSizeUpload: 0` advertised honestly).
+   **LANDED — as `api.mountApp`, JSS 0.0.219 — and consumed** by
+   gallery/ (streaming upload → loopback PUT, O(1) plugin memory).
+   gallery/'s measurements sharpen what remains: the mounted lane
+   sidesteps the host `bodyLimit` (a mounted app that does NOT forward
+   to core has no cap unless it adds one); streaming still ends at
+   core's front door (the loopback PUT buffers — the missing half is a
+   streaming LDP write path); core's LDP GET honors Range natively, so
+   playback needed nothing; and `getAgent` wants a raw-req form (Bearer
+   works via a shim, DPoP/NIP-98 can't verify in the raw lane).
    Whatever `api.mountApp` / raw-body mode ships must hand back the
    un-drained stream, not just a buffered body. (This is exactly what the
    merged loader's scoped pass-through parser does — the finding is to
    keep it that way.)
 5. **Routes/WAC-exemption outside the single prefix** — **the most-hit
-   finding: seven+ consumers.** A plugin can *register* absolute/exact
+   finding: seven+ consumers. LANDED — as `api.reservePath` (#602),
+   JSS 0.0.219 — and consumed**: mastodon/bluesky/activitypub/matrix
+   self-reserve their literal roots (widened to exactly the verbs their
+   routes implement — the read-only default is the right trap-guard),
+   didweb/ consumes the parameterized form (`/:user/did.json`, the
+   previously-inexpressible case). Still open from this cluster: the
+   shared-discovery-document case (webfinger↔remotestorage both own
+   parts of one JRD — a reservation can't split a document; the ask is
+   a link registry), and didweb/'s new edge: the reservation matcher is
+   length-unbounded while `:user` routes cap at `maxParamLength` 100,
+   so an over-long name falls through to LDP `GET /*` with the
+   exemption applied (harmless read-only, but a real mismatch). The
+   history, kept because the sharpenings still teach: A plugin can *register* absolute/exact
    routes outside its prefix (the loader doesn't confine `api.fastify`), but
    the loader WAC-exempts only its **one** `prefix`. Consequences, in
    increasing severity:
