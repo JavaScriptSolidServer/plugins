@@ -18,7 +18,7 @@ The port, if present, is percent-encoded into the host: `localhost:3000` →
 plugins: [{ module: 'didweb/plugin.js', prefix: '/didweb',
             config: {
               podsRoot: './data',                 // pod dirs to scan (finding 3)
-              baseUrl: 'https://pod.example',      // host for the did:web id (required)
+              baseUrl: 'https://pod.example',      // optional override; api.serverInfo() default (finding 3)
               actorPathTemplate: '/ap/<user>/actor', // optional → ActivityPubActor service
               serviceEndpoints: [ /* extra service entries, appended verbatim */ ],
             } }]
@@ -69,7 +69,8 @@ pod card at `podsRoot` if present, else from a minted server key.
 
 - Served at **both** `/.well-known/did.json` (attempted; finding 1) and the
   contract-safe `<prefix>/did.json`; pathed DIDs at **both** `/<user>/did.json`
-  (attempted, WAC-governed; finding 2) and `<prefix>/<user>/did.json`.
+  (reserved via `api.reservePath('/:user/did.json')`, anonymous GET; finding 2
+  — closed) and `<prefix>/<user>/did.json`.
 - `Access-Control-Allow-Origin: *` so any resolver/browser can fetch. Content
   type `application/did+json`. Pods scanned fresh per request. Unknown user →
   404 (on the WAC-exempt prefix mount).
@@ -87,33 +88,46 @@ pod card at `podsRoot` if present, else from a minted server key.
    hands over the real scoped Fastify instance and doesn't confine routes to
    `prefix`; an exact path outranks core's LDP `GET /*` wildcard; and core's
    auth preHandler blanket-exempts `/.well-known/*`. The registration is
-   wrapped in try/catch and degrades to the prefix mount. Same candidate seam
-   the other two name: a declared `wellKnown: [...]` / reserved-path api so the
-   loader reserves the route, reports conflicts, and extends the WAC exemption
-   deliberately instead of by coincidence.
+   wrapped in try/catch and degrades to the prefix mount. **Partially closed
+   by `api.reservePath` (#602, JSS 0.0.219):** the plugin now reserves
+   `/.well-known/did.json`, so the *claim* is deliberate and cross-plugin —
+   two plugins pinning the same document fail the boot naming each other
+   instead of one silently losing (the webfinger-vs-remotestorage outcome).
+   The WAC exemption the reservation carries is redundant here (the blanket
+   `/.well-known/*` skip already covers it), and route registration is still
+   the plugin's job via `api.fastify` per the seam's own contract — so the
+   exact-path-outranks-wildcard footing remains loader behavior, now at least
+   sanctioned by that contract rather than pure coincidence.
 
-2. **The pathed DID re-hits activitypub's namespace-interleaving wall.**
-   did:web's pathed form `GET /<user>/did.json` lands *inside* the pod's own
-   `/<user>/` LDP namespace — the exact collision `activitypub/` hit putting
-   `/<user>/inbox` and `/<user>/outbox` on top of the pod. Unlike the
-   well-known root, this path is **WAC-governed**: core's auth preHandler skips
-   only `/.well-known/*`, `appPaths` prefixes, and the plugin's own `prefix`
-   (`server.js`), so an anonymous `GET /alice/did.json` is denied by default.
-   The root `/.acl` JSS seeds is public-read on the container **with no
-   `acl:default`**, so a child `did.json` is not inherited-public either — the
-   test must write an explicit public-read `/alice/did.json.acl` for the
-   absolute did:web location to resolve. **Consequence:** did:web pathed
-   resolution works only where the pod owner grants public Read at that path;
-   the operator cannot fix it globally the way an API shim does with
-   `appPaths`, because the path is *parameterized* (`/:user/did.json`) and
-   `appPaths` matches only fixed prefixes. This strengthens the case for
-   `api.reservePath()` (#582) to cover *parameterized* public routes that
-   interleave with pod namespaces, not just fixed app roots — a requirement
-   `activitypub/`, `mastodon/`, and `bluesky/` only approximated by inventing a
-   single fake root (`/ap`, `/api`, `/xrpc`). did:web has no such escape: its
-   URLs are fixed by the method spec. The plugin therefore also serves every
-   DID under the always-safe `<prefix>/<user>/did.json`, and the test asserts
-   that mount is byte-identical.
+2. **The pathed DID's namespace-interleaving wall — CLOSED by parameterized
+   `api.reservePath` (#602, JSS 0.0.219).** did:web's pathed form
+   `GET /<user>/did.json` lands *inside* the pod's own `/<user>/` LDP
+   namespace — the exact collision `activitypub/` hit putting `/<user>/inbox`
+   on top of the pod. This used to be **impossible**, not just inconvenient:
+   the path is *parameterized* and `appPaths` matches only fixed prefixes, so
+   no operator config could carve the exemption; `activitypub/`, `mastodon/`,
+   and `bluesky/` escaped by inventing a single fake root (`/ap`, `/api`,
+   `/xrpc`), but did:web's URLs are fixed by the method spec — no escape. The
+   test had to write an explicit public-read `/alice/did.json.acl` to make
+   resolution work at all. **Now:** `api.reservePath('/:user/did.json')`
+   compiles an *exact-shape* matcher core's WAC hook consults per request, so
+   the anonymous GET answers with no ACL grant, no `appPaths`, no pod-owner
+   action — and every other `/<user>/` path stays WAC-governed. The test
+   proves both halves: the DID document resolves anonymously with nothing but
+   the reservation, while a sibling resource, a deeper `…/sub/did.json`, and
+   an anonymous PUT to `did.json` itself all stay denied (reservations are
+   read-only by default — exactly did.json's GET-only surface, so the default
+   needed no widening). A second plugin reserving the same shape fails the
+   boot naming both claimants. **What remains:** route registration is still
+   the plugin's job via `api.fastify` (by the seam's contract); and fastify's
+   default `maxParamLength` (100) caps the `:user` route while the
+   reservation's matcher is length-unbounded, so a >100-char pod name would
+   miss the route and fall through to LDP's `GET /*` with the read-only
+   exemption applied — the wildcard escape `capability/` used is unavailable
+   (`GET /*` is core's), harmless for `LOCAL_PART` pod names in practice but
+   a real shape/route mismatch at the margin. The always-safe
+   `<prefix>/<user>/did.json` mount stays, and the test still asserts it is
+   byte-identical.
 
 3. **`config.baseUrl` repetition — RESOLVED by `api.serverInfo()` (#601,
    merged JSS 0.0.218).** The did:web `id` (`did:web:<host>`) and every

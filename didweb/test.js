@@ -6,13 +6,14 @@
 //     nip05/ and webfinger/ lean on). Default server is NOT public-read, so
 //     the anonymous 200 demonstrates the exemption, not a permissive default.
 //   * The pathed per-pod DID at `/<user>/did.json` — which lands INSIDE the
-//     pod's WAC-governed /<user>/ namespace. The root /.acl JSS seeds is
-//     public-read on the container ONLY (no acl:default), so a child did.json
-//     is NOT inherited-public: the test writes an explicit public-read
-//     /<user>/did.json.acl to make did:web pathed resolution work, proving the
-//     finding that the pod owner must grant public Read there. The
-//     contract-safe `<prefix>/<user>/did.json` mount is asserted to be
-//     identical and needs no such grant.
+//     pod's WAC-governed /<user>/ namespace. Since JSS 0.0.219 the plugin
+//     reserves the parameterized shape via api.reservePath('/:user/did.json')
+//     (#602), so the anonymous GET answers with NO ACL grant and NO appPaths
+//     in the config (this config passes neither). The exact-shape guarantee
+//     is asserted from both sides: the DID document resolves anonymously,
+//     while a sibling pod resource, a deeper same-basename path, and a write
+//     to did.json itself all stay WAC-denied. The contract-safe
+//     `<prefix>/<user>/did.json` mount is asserted to be identical.
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
@@ -25,8 +26,6 @@ import { probePort, startJss } from '../helpers.js';
 
 const __dirname = path.dirname(fileURLToPath(new URL(import.meta.url)));
 const PLUGIN = path.join(__dirname, 'plugin.js');
-
-const ACL_CTX = { acl: 'http://www.w3.org/ns/auth/acl#', foaf: 'http://xmlns.com/foaf/0.1/' };
 
 /** Write a pod WebID card, optionally carrying a secp256k1 verificationMethod. */
 function writeCard(podDir, webId, secpMultibase) {
@@ -41,20 +40,6 @@ function writeCard(podDir, webId, secpMultibase) {
     }];
   }
   fs.writeFileSync(path.join(podDir, 'profile', 'card.jsonld'), JSON.stringify(card, null, 2));
-}
-
-/** Grant anonymous (foaf:Agent) Read on a single resource URL via its .acl. */
-function writePublicReadAcl(aclFilePath, resourceUrl) {
-  fs.writeFileSync(aclFilePath, JSON.stringify({
-    '@context': ACL_CTX,
-    '@graph': [{
-      '@id': '#public',
-      '@type': 'acl:Authorization',
-      'acl:agentClass': { '@id': 'foaf:Agent' },
-      'acl:accessTo': { '@id': resourceUrl },
-      'acl:mode': [{ '@id': 'acl:Read' }],
-    }],
-  }, null, 2));
 }
 
 /** A fresh, valid, on-curve secp256k1 pubkey as an f-form Multikey. */
@@ -76,10 +61,10 @@ describe('didweb plugin', () => {
     encHost = new URL(base).host.replace(/:/g, '%3A'); // 127.0.0.1%3A<port>
 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jss-didweb-'));
-    // alice: pod with a provisioned secp256k1 key + a public-read did.json ACL
-    // so the ABSOLUTE pathed did:web location resolves anonymously.
+    // alice: pod with a provisioned secp256k1 key. NO did.json ACL: the
+    // ABSOLUTE pathed did:web location must resolve anonymously on the
+    // strength of the parameterized reservation alone (#602).
     writeCard(path.join(root, 'alice'), `${base}/alice/profile/card#me`, freshSecpFForm());
-    writePublicReadAcl(path.join(root, 'alice', 'did.json.acl'), `${base}/alice/did.json`);
     // carol: pod with NO key → the plugin mints + persists an Ed25519 VM.
     writeCard(path.join(root, 'carol'), `${base}/carol/profile/card#me`);
     // a dot-guarded tree that must never be treated as a pod.
@@ -94,6 +79,8 @@ describe('didweb plugin', () => {
         // No baseUrl: the did:web host + service URLs now come from
         // api.serverInfo() (#601). The encHost assertions below (derived from
         // the real probed origin) must still hold — that's the retrofit proof.
+        // No appPaths either (there is nowhere to pass one): the absolute
+        // pathed mount is WAC-exempted by api.reservePath alone (#602).
         config: { podsRoot: root, actorPathTemplate: '/ap/<user>/actor' },
       }],
     });
@@ -142,14 +129,39 @@ describe('didweb plugin', () => {
     assert.strictEqual(ap.serviceEndpoint, `${base}/ap/alice/actor`, 'AP actor service from actorPathTemplate');
   });
 
-  it('resolves the ABSOLUTE pathed did:web location once the pod grants public Read', async () => {
+  it('resolves the ABSOLUTE pathed did:web location anonymously via the parameterized reservation', async () => {
+    // No ACL grant, no appPaths: api.reservePath('/:user/did.json') (#602)
+    // alone makes the spec-pinned URL answer inside the WAC-governed pod
+    // namespace — the wall README finding 2 documented, closed in JSS 0.0.219.
     const res = await fetch(`${base}/alice/did.json`);
-    assert.strictEqual(res.status, 200, 'anonymous GET works because /alice/did.json.acl grants public Read');
+    assert.strictEqual(res.status, 200, 'anonymous GET answers with no ACL and no appPaths');
+    assert.match(res.headers.get('content-type') || '', /application\/did\+json/);
     const doc = await res.json();
     assert.strictEqual(doc.id, `did:web:${encHost}:alice`);
     // Identical to the contract-safe prefix mount.
     const viaPrefix = await (await fetch(`${base}/didweb/alice/did.json`)).json();
     assert.deepStrictEqual(doc, viaPrefix, 'absolute and prefix mounts serve the identical DID document');
+  });
+
+  it('does not leak the exemption beyond the exact /<user>/did.json shape', async () => {
+    // Sibling resource in the same pod namespace: still WAC-denied anonymously.
+    const sibling = await fetch(`${base}/alice/profile/card.jsonld`);
+    assert.ok([401, 403].includes(sibling.status),
+      `sibling pod resource stays WAC-governed (got ${sibling.status})`);
+    // Deeper path with the same basename: /:user/did.json is an EXACT-shape
+    // match (two segments), not a subtree claim.
+    const deeper = await fetch(`${base}/alice/sub/did.json`);
+    assert.ok([401, 403].includes(deeper.status),
+      `deeper did.json path stays WAC-governed (got ${deeper.status})`);
+    // Reservations are read-only by default: a write to the reserved shape
+    // itself must still hit WAC, not fall through as an anonymous LDP PUT.
+    const put = await fetch(`${base}/alice/did.json`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: '{"id":"spoofed"}',
+    });
+    assert.ok([401, 403].includes(put.status),
+      `anonymous PUT on the reserved path is WAC-denied (got ${put.status})`);
   });
 
   it('mints + persists an Ed25519 VM for a pod with no key in its card', async () => {

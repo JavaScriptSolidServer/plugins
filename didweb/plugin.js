@@ -41,12 +41,14 @@
 //     wildcard, and core's auth preHandler blanket-exempts `/.well-known/*`.
 //     Guarded (try/catch) and mirrored at the contract-safe `<prefix>/did.json`.
 //   * `/<user>/did.json` — the pathed per-pod DID. This is NOT a well-known
-//     path: it lands INSIDE the pod's own `/<user>/` LDP namespace and is
-//     therefore WAC-governed (server.js only skips auth for `/.well-known/*`,
-//     `appPaths`, and the plugin's own prefix). did:web pathed resolution thus
-//     works ONLY if the pod owner grants public Read at that path — the exact
-//     namespace-interleaving wall activitypub/ hit with `/<user>/inbox`. Also
-//     mirrored at the always-safe `<prefix>/<user>/did.json`.
+//     path: it lands INSIDE the pod's own `/<user>/` LDP namespace, where
+//     literal `appPaths` prefixes structurally could not carve an exemption —
+//     the namespace-interleaving wall activitypub/ hit with `/<user>/inbox`.
+//     CLOSED since JSS 0.0.219: `api.reservePath('/:user/did.json')` (#602)
+//     compiles an exact-shape matcher that WAC-exempts GET/HEAD/OPTIONS on
+//     precisely that shape, so the DID document answers anonymously while
+//     every OTHER `/<user>/` path stays WAC-governed. Also mirrored at the
+//     always-safe `<prefix>/<user>/did.json`.
 //
 // Nostr pubkey extraction is vendored (adapted from core's internal
 // src/auth/nostr-keys.js, AGPL-3.0-only) — the same wall nip05/ and
@@ -353,11 +355,18 @@ export async function activate(api) {
   api.fastify.get(`${prefix}/did.json`, rootHandler);
   api.fastify.get(`${prefix}/:user/did.json`, userHandler);
 
-  // Real did:web root location. Works today for the reasons nip05/webfinger
-  // document (loader doesn't confine routes to the prefix; an exact path
-  // outranks core's LDP wildcard; core blanket-exempts /.well-known/* from
-  // auth) — nothing in the plugin CONTRACT promises it, so a conflict (core
-  // someday claiming this GET) degrades to prefix-only, not a boot failure.
+  // Real did:web root location. The GET itself works for the reasons
+  // nip05/webfinger document (loader doesn't confine routes to the prefix;
+  // an exact path outranks core's LDP wildcard; core blanket-exempts
+  // /.well-known/* from auth) — but the CLAIM on the path is now deliberate:
+  // api.reservePath (#602) records it in the loader's cross-plugin registry,
+  // so a second plugin pinning /.well-known/did.json fails the boot naming
+  // both claimants instead of one silently losing. The WAC exemption the
+  // reservation carries is redundant here (the blanket /.well-known/* skip
+  // already covers it); the registry entry is the point. A conflict with
+  // CORE's own routes (core someday claiming this GET) still degrades to
+  // prefix-only, not a boot failure.
+  api.reservePath('/.well-known/did.json');
   let wellKnown = false;
   try {
     api.fastify.get('/.well-known/did.json', rootHandler);
@@ -367,29 +376,30 @@ export async function activate(api) {
       + `serving the root DID under ${prefix}/did.json only`);
   }
 
-  // Real did:web PATHED location. Unlike the well-known root this lands inside
-  // the pod's own /<user>/ LDP namespace and is WAC-governed (NOT exempt), so
-  // it resolves anonymously only where the pod grants public Read — the
-  // namespace-interleaving wall activitypub hit. Register it anyway (guarded);
-  // the prefix mount is the always-safe fallback.
-  let pathed = false;
-  try {
-    api.fastify.get('/:user/did.json', userHandler);
-    pathed = true;
-  } catch (err) {
-    api.log.warn(`didweb: could not claim /:user/did.json (${err.message}); `
-      + `serving pathed DIDs under ${prefix}/<user>/did.json only`);
-  }
+  // Real did:web PATHED location — inside the pod's own /<user>/ LDP
+  // namespace, where literal appPaths prefixes structurally could not carve
+  // an exemption (the wall README finding 2 documented). api.reservePath
+  // (#602, JSS 0.0.219) compiles the parameterized shape into an EXACT-shape
+  // WAC exemption: anonymous GET /<user>/did.json answers, every other
+  // /<user>/ path stays WAC-governed. Reservations are read-only by default
+  // (GET/HEAD/OPTIONS) — exactly did.json's method surface, so no { methods }
+  // widening: exempting a write verb with no route would fall through to
+  // LDP's write wildcards as an unauthenticated storage write. No try/catch
+  // either: a collision means two plugins pinning the same spec-fixed URL,
+  // and degrading would leave a WAC exemption in place with no route — loud
+  // boot failure is the seam's designed outcome. (fastify's default
+  // maxParamLength (100) caps :user; a longer pod name misses this route and
+  // falls through to LDP's GET /* with the read-only exemption applied. The
+  // wildcard escape capability/ used is unavailable — GET /* is core's — but
+  // LOCAL_PART pod names never approach 100 chars in practice.)
+  api.reservePath('/:user/did.json');
+  api.fastify.get('/:user/did.json', userHandler);
 
   // Host isn't logged here: the did:web host comes from api.serverInfo() at
   // request time, and at activate the ephemeral port may not be resolved yet.
   api.log.info('didweb: root DID at '
     + `${wellKnown ? '/.well-known/did.json and ' : ''}${prefix}/did.json; `
-    + `pathed DIDs at ${pathed ? '/<user>/did.json and ' : ''}${prefix}/<user>/did.json`
+    + `pathed DIDs at /<user>/did.json (reserved via api.reservePath, anonymous GET) `
+    + `and ${prefix}/<user>/did.json`
     + (podsRoot ? ` from ${podsRoot}` : ' (no podsRoot: pathed DIDs 404)'));
-  if (pathed) {
-    api.log.warn('didweb: /<user>/did.json is WAC-governed (inside the pod LDP '
-      + 'namespace), so did:web pathed resolution needs the pod to grant public '
-      + 'Read there — same reserved-path/namespace seam as activitypub (see README).');
-  }
 }
