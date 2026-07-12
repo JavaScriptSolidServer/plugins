@@ -12,12 +12,15 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { execFile } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { schnorr } from '@noble/curves/secp256k1';
 import { startJss } from '../helpers.js';
+import { npubEncode } from './plugin.js';
 
 const execFileP = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(new URL(import.meta.url)));
@@ -52,6 +55,33 @@ function git(args, opts = {}) {
 }
 
 const authFlag = (token) => ['-c', `http.extraHeader=Authorization: Bearer ${token}`];
+
+// --- tier 2.5: craft REAL NIP-98 auth server-side (kind 27235, schnorr) ---
+const bytesToHex = (b) => Buffer.from(b).toString('hex');
+
+/**
+ * A signed NIP-98 Authorization header for one url+method, matching the
+ * host verifier exactly: kind 27235, created_at now (±60 s window),
+ * tags [[u,url],[method,METHOD]] plus a payload tag (sha256 of the wire
+ * body) when a body is sent, base64 JSON, `Nostr <b64>`.
+ */
+function nip98Header(skHex, url, method, body) {
+  const event = {
+    pubkey: bytesToHex(schnorr.getPublicKey(skHex)),
+    created_at: Math.floor(Date.now() / 1000),
+    kind: 27235,
+    tags: [['u', url], ['method', method]],
+    content: '',
+  };
+  if (body !== undefined) {
+    event.tags.push(['payload', crypto.createHash('sha256').update(body).digest('hex')]);
+  }
+  event.id = crypto.createHash('sha256')
+    .update(JSON.stringify([0, event.pubkey, event.created_at, event.kind, event.tags, event.content]), 'utf8')
+    .digest('hex');
+  event.sig = bytesToHex(schnorr.sign(event.id, skHex));
+  return `Nostr ${Buffer.from(JSON.stringify(event)).toString('base64')}`;
+}
 
 async function registerAndMint(base, username) {
   const reg = await fetch(`${base}/idp/register`, {
@@ -654,6 +684,218 @@ describe('forge plugin', () => {
       assert.ok(html.includes('/idp/credentials'), 'login client targets the credentials endpoint');
       assert.match(res.headers.get('content-security-policy') ?? '', /connect-src 'self'/,
         'CSP admits same-origin fetch for the client');
+    });
+  });
+
+  // ------------------------------------------ tier 2.5: did:nostr agents
+  // Canonical identity is did:nostr:<64-hex> — the hex pubkey IS the forge
+  // namespace; npub is display-only. git cannot sign per-request NIP-98
+  // from a static header, so pushes ride the <prefix>/api/token exchange;
+  // podless agents' issue words are forge-hosted, author-deletable.
+
+  describe('nostr agents (tier 2.5: hex namespaces, push tokens, hosted content)', () => {
+    const skA = bytesToHex(schnorr.utils.randomPrivateKey());
+    const pkA = bytesToHex(schnorr.getPublicKey(skA));
+    const didA = `did:nostr:${pkA}`;
+    const skB = bytesToHex(schnorr.utils.randomPrivateKey());
+    const pkB = bytesToHex(schnorr.getPublicKey(skB));
+    const npubShortOf = (hex) => {
+      const npub = npubEncode(hex);
+      return `${npub.slice(0, 9)}…${npub.slice(-4)}`;
+    };
+    let tokenA;
+    let tokenB;
+    let hostedIssueUrl;   // key A's issue body, hosted by the forge
+    let hostedCommentUrl; // key B's comment, hosted by the forge
+
+    it('bech32: the canonical NIP-19 npub vector (BIP-173, full checksum)', () => {
+      assert.strictEqual(
+        npubEncode('3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d'),
+        'npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6',
+      );
+    });
+
+    it('NIP-98 -> push-token exchange: getAgent verifies, forge mints a bearer', async () => {
+      const url = `${base}/forge/api/token`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { authorization: nip98Header(skA, url, 'POST') },
+      });
+      assert.strictEqual(res.status, 201);
+      const j = await res.json();
+      assert.strictEqual(j.agent, didA, 'the DID from the signature, hex canonical');
+      assert.ok(j.token.startsWith('f1.'), 'macaroon-lite forge token');
+      assert.ok(j.exp > Math.floor(Date.now() / 1000), 'future expiry');
+      tokenA = j.token;
+      const res2 = await fetch(url, {
+        method: 'POST',
+        headers: { authorization: nip98Header(skB, url, 'POST') },
+      });
+      tokenB = (await res2.json()).token;
+      assert.ok(tokenB, 'second key mints too');
+    });
+
+    it('anonymous token mint is 401; garbage f1 token never authenticates', async () => {
+      const anon = await fetch(`${base}/forge/api/token`, { method: 'POST' });
+      assert.strictEqual(anon.status, 401);
+      const forged = `f1.${Buffer.from(JSON.stringify({ v: 1, agent: didA, exp: 9999999999 })).toString('base64url')}.AAAA`;
+      const res = await fetch(`${base}/forge/api/token`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${forged}` },
+      });
+      assert.strictEqual(res.status, 401, 'bad HMAC is anonymous, and tokens cannot mint tokens');
+    });
+
+    it('git push into the 64-hex namespace succeeds with the forge token (real git)', async () => {
+      const remoteHex = `${base}/forge/${pkA}/nrepo.git`;
+      await git([...authFlag(tokenA), 'push', remoteHex, 'main'], { cwd: work });
+      assert.ok(fs.existsSync(repoDir(pkA, 'nrepo')), 'bare repo under repos/<hex>');
+      const meta = JSON.parse(fs.readFileSync(path.join(repoDir(pkA, 'nrepo'), 'jss-forge.json'), 'utf8'));
+      assert.strictEqual(meta.creator, didA, 'creator recorded as the did:nostr agent');
+    });
+
+    it("a DIFFERENT key's token cannot push into that namespace (403)", async () => {
+      await assert.rejects(
+        git([...authFlag(tokenB), 'push', `${base}/forge/${pkA}/nrepo.git`, 'main:intruder'], { cwd: work }),
+        (err) => {
+          assert.match(String(err.stderr), /403|forbidden|belongs to/i,
+            `key B's push should be forbidden: ${err.stderr}`);
+          return true;
+        },
+      );
+    });
+
+    it('an expired push token (minted with ttl 0) is 401', async () => {
+      const url = `${base}/forge/api/token?ttl=0`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { authorization: nip98Header(skA, url, 'POST') },
+      });
+      assert.strictEqual(res.status, 201);
+      const j = await res.json();
+      assert.ok(j.exp <= Math.floor(Date.now() / 1000), 'already expired');
+      await assert.rejects(
+        git([...authFlag(j.token), 'push', `${base}/forge/${pkA}/nrepo.git`, 'main:expired'], { cwd: work }),
+        (err) => /authentication|401|could not read Username|terminal prompts disabled/i.test(String(err.stderr)),
+      );
+    });
+
+    it('repo list, owner page and repo home display npub-short, hex stays in paths', async () => {
+      const short = npubShortOf(pkA);
+      const idx = await (await fetch(`${base}/forge/`)).text();
+      assert.ok(idx.includes(short), 'index shows the shortened npub');
+      assert.ok(idx.includes(`/forge/${pkA}/nrepo`), 'links keep the canonical hex path');
+      const ownerHtml = await (await fetch(`${base}/forge/${pkA}`)).text();
+      assert.ok(ownerHtml.includes(short), 'owner page heading is npub-short');
+      const home = await (await fetch(`${base}/forge/${pkA}/nrepo`)).text();
+      assert.ok(home.includes(short), 'repo crumb is npub-short');
+      assert.ok(home.includes(`/forge/${pkA}/nrepo.git`), 'clone URL is hex');
+    });
+
+    it('a nostr agent opens an issue: body hosted by the forge (podless)', async () => {
+      const url = `${base}/forge/api/repos/${pkA}/nrepo/issues`;
+      const body = JSON.stringify({ title: 'Nostr-born issue', body: 'signed with **schnorr**' });
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: nip98Header(skA, url, 'POST', body) },
+        body,
+      });
+      assert.strictEqual(res.status, 201, 'NIP-98 with a payload tag verifies on the API');
+      const j = await res.json();
+      assert.strictEqual(j.number, 1);
+      assert.strictEqual(j.hosted, true);
+      hostedIssueUrl = j.resourceUrl;
+      assert.ok(hostedIssueUrl.includes(`/forge/api/hosted/${pkA}/`),
+        `hosted under the agent's hex: ${hostedIssueUrl}`);
+      const direct = await fetch(hostedIssueUrl);
+      assert.strictEqual(direct.status, 200, 'hosted doc publicly fetchable, like a pod resource');
+      const doc = await direct.json();
+      assert.strictEqual(doc.author, didA);
+      assert.strictEqual(doc.hosted, true);
+      assert.ok(doc.body.includes('**schnorr**'), 'raw markdown stored');
+    });
+
+    it("a second nostr key comments; thread JSON carries hosted + nostr author fields", async () => {
+      const url = `${base}/forge/api/repos/${pkA}/nrepo/issues/1/comments`;
+      const body = JSON.stringify({ body: 'confirmed from another key' });
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: nip98Header(skB, url, 'POST', body) },
+        body,
+      });
+      assert.strictEqual(res.status, 201);
+      hostedCommentUrl = (await res.json()).resourceUrl;
+      assert.ok(hostedCommentUrl.includes(`/forge/api/hosted/${pkB}/`), "hosted under the COMMENTER's hex");
+
+      const t = await (await fetch(`${base}/forge/api/repos/${pkA}/nrepo/issues/1`)).json();
+      assert.strictEqual(t.author, didA, 'author string stays the canonical DID');
+      assert.deepStrictEqual(t.authorInfo, {
+        id: didA, displayName: npubShortOf(pkA), npub: npubEncode(pkA), kind: 'nostr',
+      }, 'additive author metadata');
+      const [head, c1] = t.thread;
+      assert.strictEqual(head.hosted, true);
+      assert.strictEqual(head.authorInfo.kind, 'nostr');
+      assert.ok(head.html.includes('<strong>schnorr</strong>'), 'markdown rendered from the hosted doc');
+      assert.strictEqual(c1.hosted, true);
+      assert.strictEqual(c1.authorInfo.npub, npubEncode(pkB));
+    });
+
+    it('thread HTML: "hosted by the forge" tag, npub-short author, no raw-hex name', async () => {
+      const html = await (await fetch(`${base}/forge/${pkA}/nrepo/issues/1`)).text();
+      assert.ok(html.includes('hosted by the forge'), 'hosted tag rendered');
+      assert.ok(html.includes(`<b>${npubShortOf(pkA)}</b>`), 'author renders as npub-short');
+      assert.ok(!html.includes(`>${pkA}<`), 'raw hex never rendered as a display name');
+      assert.ok(html.includes(`/.well-known/did/nostr/${pkA}`), "author links to core's DID-document route");
+      assert.ok(html.includes('>owner</span>'), 'hex-namespace owner badge still works');
+    });
+
+    it("another agent cannot delete someone else's hosted content (403)", async () => {
+      const res = await fetch(hostedIssueUrl, {
+        method: 'DELETE',
+        headers: { authorization: nip98Header(skB, hostedIssueUrl, 'DELETE') },
+      });
+      assert.strictEqual(res.status, 403);
+      assert.strictEqual((await fetch(hostedIssueUrl)).status, 200, 'still there');
+    });
+
+    it('the author deletes their hosted content -> removed placeholder (the pod-delete beat)', async () => {
+      const del = await fetch(hostedCommentUrl, {
+        method: 'DELETE',
+        headers: { authorization: nip98Header(skB, hostedCommentUrl, 'DELETE') },
+      });
+      assert.strictEqual(del.status, 200);
+      assert.strictEqual((await fetch(hostedCommentUrl)).status, 404, 'the words are gone');
+
+      const t = await (await fetch(`${base}/forge/api/repos/${pkA}/nrepo/issues/1`)).json();
+      assert.strictEqual(t.thread[1].removed, true);
+      assert.strictEqual(t.thread[1].body, null);
+      assert.strictEqual(t.thread[1].author, `did:nostr:${pkB}`, 'the pointer (who/when) remains');
+      const html = await (await fetch(`${base}/forge/${pkA}/nrepo/issues/1`)).text();
+      assert.ok(html.includes('content removed by its author'), 'placeholder rendered');
+      assert.ok(!html.includes('confirmed from another key'), 'deleted words gone from the forge');
+    });
+
+    it('xlogin.js is served byte-identical to the vendored file', async () => {
+      const res = await fetch(`${base}/forge/xlogin.js`);
+      assert.strictEqual(res.status, 200);
+      assert.match(res.headers.get('content-type'), /^application\/javascript/);
+      assert.match(res.headers.get('cache-control') ?? '', /immutable/);
+      const served = Buffer.from(await res.arrayBuffer());
+      const vendored = fs.readFileSync(path.join(__dirname, 'xlogin.js'));
+      assert.ok(served.equals(vendored), 'byte-identical to forge/xlogin.js');
+      assert.ok(served.toString('utf8').includes('version 0.0.15'), 'vendoring header present');
+    });
+
+    it("issues pages load the widget; CSP admits it and keeps connect-src 'self'", async () => {
+      const res = await fetch(`${base}/forge/${pkA}/nrepo/issues/1`);
+      const html = await res.text();
+      assert.ok(html.includes('src="/forge/xlogin.js"'), 'script tag on the thread page');
+      const cspHeader = res.headers.get('content-security-policy') ?? '';
+      assert.match(cspHeader, /script-src 'unsafe-inline' 'self' https:\/\/esm\.sh/,
+        "script-src admits the vendored widget and xlogin's esm.sh imports");
+      assert.match(cspHeader, /connect-src 'self'(;|$)/,
+        'connect-src stays self — external Solid IdPs blocked by default');
+      assert.ok(html.includes('window.xlogin'), 'client integrates the widget when present');
     });
   });
 

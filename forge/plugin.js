@@ -1,5 +1,6 @@
 // forge — a personal git forge (tier 1: hosting + browsing; tier 2: issues
-// + comments) as a #206 loader plugin. The useful slice of Gogs/Gitea: push
+// + comments; tier 2.5: first-class did:nostr agents + the xlogin widget)
+// as a #206 loader plugin. The useful slice of Gogs/Gitea: push
 // a repo, get a GitHub-style web UI for it — with the constraints that
 // killed the last attempt made absolute: zero npm dependencies, zero build
 // step, every page server-rendered HTML with inline CSS, all git work done
@@ -22,6 +23,9 @@
 //   commit        <prefix>/<owner>/<name>/commit/<sha>
 //   refs          <prefix>/<owner>/<name>/{branches,tags}
 //   issues        <prefix>/<owner>/<name>/issues[?state=|/new|/<n>]
+//   push tokens   <prefix>/api/token                 (POST, any getAgent credential)
+//   hosted words  <prefix>/api/hosted/<hex>/<uuid>   (GET public, DELETE author-only)
+//   xlogin        <prefix>/xlogin.js                 (vendored widget, byte-identical)
 //
 // TIER 2 — issues and comments, pod-native (see README Findings):
 // the WORDS live in the author's pod (loopback PUT of a JSON-LD resource
@@ -33,8 +37,25 @@
 // re-fetched from the pods at read time; a deleted resource renders as
 // "content removed by its author".
 //
+// TIER 2.5 — did:nostr agents are first-class (see README "Nostr agents"):
+// the canonical nostr identity is `did:nostr:<64-hex-pubkey>` (exactly what
+// getAgent returns for a NIP-98 signature with no WebID mapping); the hex
+// pubkey IS the agent's forge namespace (`<prefix>/<hex>/<repo>.git`).
+// npub (bech32) is DISPLAY-ONLY — storage paths, index keys and API ids
+// stay hex everywhere. Because git's static http.extraHeader cannot sign
+// per-request NIP-98 (a push is several requests with different URLs and
+// methods), `POST <prefix>/api/token` exchanges ANY getAgent-accepted
+// credential for a short-lived macaroon-lite HMAC bearer (capability/'s
+// pattern) that the git lane accepts in addition to getAgent. did:nostr
+// agents have no pod, so their issue/comment bodies are stored under
+// pluginDir/hosted/<hex>/ ("hosted by the forge" — the podless-agent
+// asymmetry is a named Finding), deletable by their author over the API.
+// The issues pages also serve/load the vendored xlogin widget (NIP-98 /
+// DPoP client-side auth) beside the local username/password fallback.
+//
 // Ownership: owner = the pod username derived from the pusher's WebID
-// (mastodon/'s podFromWebid rule). Push-to-create: an authenticated agent
+// (mastodon/'s podFromWebid rule), or the 64-hex pubkey for did:nostr
+// agents. Push-to-create: an authenticated agent
 // pushing into its OWN namespace materializes the bare repo under
 // pluginDir/repos/<owner>/<name>.git — persistent, no TTL (this is a
 // forge, not a scratchpad). Pushing into someone else's namespace is 403;
@@ -68,6 +89,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 const execFileP = promisify(execFile);
@@ -86,6 +108,14 @@ const SHA_RE = /^[0-9a-f]{4,64}$/;
 // Path segments: reject empties, traversal, backslash, control chars and
 // percent-encoded dot/slash/backslash (belt and braces if decoding varies).
 const BAD_SEG = /^\.|\.\.|[\\\x00-\x1f]|%2e|%2f|%5c/i;
+
+// Tier-2.5: nostr identity. A did:nostr agent's namespace is its 64-hex
+// pubkey — unambiguous in practice (pod names are human-chosen; a pod
+// literally named as 64 lowercase hex chars is theoretically possible under
+// OWNER_NAME, in which case hex-as-nostr-namespace wins — see README).
+const NOSTR_HEX = /^[0-9a-f]{64}$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const FORGE_TOKEN_MAX_TTL = 30 * 24 * 3600;
 
 const RENDER_CAP = 512 * 1024; // blobs/READMEs above this: "view raw"
 const PER_PAGE = 30;
@@ -176,12 +206,64 @@ const ICON_TAG = '<svg class="icon" width="16" height="16" viewBox="0 0 16 16" f
 const ICON_ISSUE_OPEN = '<svg class="icon" width="16" height="16" viewBox="0 0 16 16" fill="#1a7f37" aria-hidden="true"><path d="M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"/><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Z"/></svg>';
 const ICON_ISSUE_CLOSED = '<svg class="icon" width="16" height="16" viewBox="0 0 16 16" fill="#8250df" aria-hidden="true"><path d="M11.28 6.78a.75.75 0 0 0-1.06-1.06L7.25 8.69 5.78 7.22a.75.75 0 0 0-1.06 1.06l2 2a.75.75 0 0 0 1.06 0l3.5-3.5Z"/><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0Zm-1.5 0a6.5 6.5 0 1 0-13 0 6.5 6.5 0 0 0 13 0Z"/></svg>';
 
-/** WebID -> pod username (mastodon/'s podFromWebid rule), or null. */
+// ------------------------------------------------- nostr identity (2.5)
+// Canonical form everywhere: did:nostr:<64-hex> (did-nostr.com — exactly
+// what getAgent returns for an unmapped NIP-98 key). npub is DISPLAY-ONLY.
+
+/** did:nostr:<hex> -> the 64-char lowercase hex pubkey, else null. */
+function nostrHexOf(agent) {
+  const m = /^did:nostr:([0-9a-f]{64})$/.exec(String(agent ?? ''));
+  return m ? m[1] : null;
+}
+
+// bech32 (BIP-173, full checksum — no shortcuts) npub encoder, pure node.
+// Unit-tested against the canonical NIP-19 vector in test.js.
+const BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+
+function bech32Polymod(values) {
+  const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  let chk = 1;
+  for (const v of values) {
+    const top = chk >>> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (let i = 0; i < 5; i++) if ((top >>> i) & 1) chk ^= GEN[i];
+  }
+  return chk;
+}
+
+/** 64-hex pubkey -> npub1... (NIP-19). Exported for the vector test. */
+export function npubEncode(hex) {
+  const data = []; // 8-bit bytes regrouped big-endian into 5-bit words
+  let acc = 0;
+  let bits = 0;
+  for (let i = 0; i < hex.length; i += 2) {
+    acc = (acc << 8) | parseInt(hex.slice(i, i + 2), 16);
+    bits += 8;
+    while (bits >= 5) { bits -= 5; data.push((acc >>> bits) & 31); }
+  }
+  if (bits) data.push((acc << (5 - bits)) & 31);
+  const hrp = 'npub';
+  const expanded = [...hrp].map((c) => c.charCodeAt(0) >>> 5)
+    .concat([0], [...hrp].map((c) => c.charCodeAt(0) & 31));
+  const poly = bech32Polymod([...expanded, ...data, 0, 0, 0, 0, 0, 0]) ^ 1;
+  const checksum = Array.from({ length: 6 }, (_, i) => (poly >>> (5 * (5 - i))) & 31);
+  return `${hrp}1${[...data, ...checksum].map((d) => BECH32_CHARSET[d]).join('')}`;
+}
+
+/** Shortened npub for UI rendering: npub1abcd…wxyz. */
+function npubShort(hex) {
+  const npub = npubEncode(hex);
+  return `${npub.slice(0, 9)}…${npub.slice(-4)}`;
+}
+
+/** Agent -> pod username OR 64-hex nostr namespace (2.5), or null. */
 function ownerFromAgent(agent) {
   if (!agent) return null;
+  const hex = nostrHexOf(agent);
+  if (hex) return hex; // the pubkey IS the namespace
   let u;
   try { u = new URL(agent); } catch { return null; }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null; // did:nostr etc: no pod namespace
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null; // other DID methods: no namespace
   const segs = u.pathname.split('/').filter(Boolean);
   const name = (segs.length >= 2 && segs[0] !== 'profile') ? segs[0] : (u.hostname.split('.')[0] || null);
   return name && OWNER_NAME.test(name) && !name.includes('..') ? name : null;
@@ -204,6 +286,14 @@ function podPathFromAgent(agent) {
  * Collect a streamed JSON body (the forge scope's wildcard parser hands the
  * raw stream through for the git CGI lane, so API writes read it here).
  * Returns the parsed object, or null when missing/oversized/unparseable.
+ *
+ * Tier-2.5 wrinkle: this MUST run before getAgent on any authed write.
+ * NIP-98's optional `payload` tag is sha256 over the wire bytes, and the
+ * host verifier hashes `request.rawBody` (or a Buffer body) — in this
+ * scope `request.body` is the raw stream, which the verifier would
+ * JSON.stringify into garbage. So the buffered wire string is stashed on
+ * `request.rawBody` (and the parsed object on `request.body`) here, which
+ * makes body-carrying NIP-98 requests verify exactly as on core routes.
  */
 async function readJsonBody(request, cap = ISSUE_BODY_CAP + 8192) {
   let body = request.body;
@@ -228,9 +318,15 @@ async function readJsonBody(request, cap = ISSUE_BODY_CAP + 8192) {
     buf = Buffer.concat(chunks);
   }
   if (buf.length > cap) return null;
+  const text = buf.toString('utf8');
+  request.rawBody = text; // NIP-98 payload-tag verification hashes this
   try {
-    const parsed = JSON.parse(buf.toString('utf8'));
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      request.body = parsed;
+      return parsed;
+    }
+    return null;
   } catch { return null; }
 }
 
@@ -516,7 +612,23 @@ h1.page{font-size:24px;margin:0 0 16px}
 // connect-src 'self' is load-bearing for tier 2: the issues client drives
 // the JSON API and /idp/credentials with fetch(), which CSP counts as
 // connect-src — under `default-src 'none'` alone every fetch is blocked.
-const CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' https: data:; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'";
+//
+// Tier 2.5: script-src gains 'self' (the vendored xlogin widget loads via
+// <script src="<prefix>/xlogin.js">) and https://esm.sh — a measured,
+// documented concession: xlogin 0.0.15 hard-codes dynamic import()s of its
+// crypto (@noble), nip98 and solid-oidc from esm.sh, and dynamic import is
+// governed by script-src, NOT connect-src (a Finding — see README).
+// connect-src stays 'self' by default, so xlogin's NOSTR flows work
+// (client-side signing + same-origin fetch) while EXTERNAL Solid-IdP login
+// stays blocked unless the operator opts origins in via config.cspConnect.
+function buildCsp(cspConnect) {
+  const extra = (Array.isArray(cspConnect) ? cspConnect : [])
+    .filter((o) => typeof o === 'string' && /^https?:\/\/[^\s;'"]+$/.test(o));
+  const connect = ["'self'", ...extra].join(' ');
+  return "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' https: data:; "
+    + `script-src 'unsafe-inline' 'self' https://esm.sh; connect-src ${connect}; `
+    + "base-uri 'none'; form-action 'none'";
+}
 
 // ---------------------------------------------------------------- activate
 
@@ -534,9 +646,63 @@ export async function activate(api) {
   const prefix = api.prefix || '/forge';
   const privateRepos = api.config.privateRepos ?? false;
   const backend = await findBackend(api.config);
+  const csp = buildCsp(api.config.cspConnect);
 
   const reposDir = path.join(api.storage.pluginDir(), 'repos');
   fs.mkdirSync(reposDir, { recursive: true });
+
+  // The vendored xlogin widget (forge/xlogin.js), served byte-identical at
+  // <prefix>/xlogin.js. Read once — it is immutable for a running server.
+  const xloginSrc = fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), 'xlogin.js'),
+  );
+
+  // ------------------------------------------- push-token exchange (2.5)
+  // git's static `http.extraHeader` cannot sign per-request NIP-98 (each
+  // 27235 event binds one url+method; a push is info/refs GET + receive-
+  // pack POST at least), so `POST <prefix>/api/token` exchanges any
+  // getAgent-accepted credential for a macaroon-lite HMAC bearer
+  // (capability/'s token pattern): f1.<b64url payload>.<b64url hmac>,
+  // payload { v:1, agent, iat, exp }. Accepted wherever this plugin
+  // authenticates, IN ADDITION to getAgent — WebID users don't need it
+  // (the pod bearer already works) but may use it.
+  const tokenSecretFile = path.join(api.storage.pluginDir(), 'token-secret');
+  if (!fs.existsSync(tokenSecretFile)) {
+    fs.writeFileSync(tokenSecretFile, crypto.randomBytes(32), { mode: 0o600 });
+  }
+  const tokenSecret = fs.readFileSync(tokenSecretFile);
+  const pushTokenTtl = api.config.pushTokenTtl ?? 3600;
+
+  function mintForgeToken(agent, ttl) {
+    const iat = Math.floor(Date.now() / 1000);
+    const payload = { v: 1, agent, iat, exp: iat + Math.floor(ttl) };
+    const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const sig = crypto.createHmac('sha256', tokenSecret).update(`f1.${body}`).digest('base64url');
+    return { token: `f1.${body}.${sig}`, iat, exp: payload.exp };
+  }
+
+  /** `Authorization: Bearer f1.*` -> agent, or null (bad sig / expired). */
+  function forgeTokenAgent(request) {
+    const header = request.headers.authorization;
+    if (typeof header !== 'string' || !/^Bearer f1\./.test(header)) return null;
+    const token = header.slice(7).trim();
+    if (token.length > 4096) return null;
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const expected = crypto.createHmac('sha256', tokenSecret).update(`f1.${parts[1]}`).digest();
+    const given = Buffer.from(parts[2], 'base64url');
+    if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
+    let payload;
+    try { payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')); } catch { return null; }
+    if (!payload || payload.v !== 1 || typeof payload.agent !== 'string'
+      || typeof payload.exp !== 'number' || payload.exp <= Math.floor(Date.now() / 1000)) return null;
+    return payload.agent;
+  }
+
+  /** Forge push token first (cheap prefix check), then every core scheme. */
+  async function requestAgent(request) {
+    return forgeTokenAgent(request) ?? api.auth.getAgent(request);
+  }
 
   // Clone URLs are absolute: origin from api.serverInfo (#601), resolved at
   // REQUEST time (with port 0 it only exists once listening); config.baseUrl
@@ -742,6 +908,40 @@ export async function activate(api) {
   fs.mkdirSync(issuesDir, { recursive: true });
   const indexPathOf = (owner, name) => path.join(issuesDir, owner, `${name}.json`);
 
+  // ------------------------------------------- podless content (2.5)
+  // A did:nostr agent can authenticate and own a namespace but has no pod
+  // to loopback-PUT its words into (the api.podOf ask — README Findings).
+  // Its issue/comment bodies live under pluginDir/hosted/<hex>/<uuid>.json,
+  // thread pointers carry {hosted: true}, the UI renders a muted "hosted
+  // by the forge" tag, and the author (same did:nostr identity) can DELETE
+  // the document over the API — the same beat as deleting a pod resource.
+  const hostedDir = path.join(api.storage.pluginDir(), 'hosted');
+  fs.mkdirSync(hostedDir, { recursive: true });
+  const hostedPathOf = (hex, id) => path.join(hostedDir, hex, `${id}.json`);
+
+  function storeHosted(hex, doc) {
+    const id = crypto.randomUUID();
+    fs.mkdirSync(path.join(hostedDir, hex), { recursive: true });
+    fs.writeFileSync(hostedPathOf(hex, id), JSON.stringify(doc));
+    return { url: `${publicOrigin()}${prefix}/api/hosted/${hex}/${id}` };
+  }
+
+  /** Hosted resource URL -> { hex, id } (validated), or null. */
+  function hostedRefOf(resourceUrl) {
+    const p = resourcePathOf(resourceUrl);
+    if (!p || !p.startsWith(`${prefix}/api/hosted/`)) return null;
+    const segs = p.slice(`${prefix}/api/hosted/`.length).split('/');
+    if (segs.length !== 2 || !NOSTR_HEX.test(segs[0]) || !UUID_RE.test(segs[1])) return null;
+    return { hex: segs[0], id: segs[1] };
+  }
+
+  function readHosted(hex, id) {
+    try {
+      const doc = JSON.parse(fs.readFileSync(hostedPathOf(hex, id), 'utf8'));
+      return doc && typeof doc === 'object' && !Array.isArray(doc) ? doc : null;
+    } catch { return null; }
+  }
+
   function loadIssueIndex(owner, name) {
     try {
       const idx = JSON.parse(fs.readFileSync(indexPathOf(owner, name), 'utf8'));
@@ -804,9 +1004,19 @@ export async function activate(api) {
     try { return new URL(resourceUrl).pathname; } catch { return null; }
   }
 
-  /** One thread slot, re-fetched from its author's pod. Deleted => removed. */
+  /**
+   * One thread slot, re-fetched from its author's pod — or, for hosted
+   * (podless did:nostr) entries, read straight from pluginDir/hosted.
+   * Deleted => removed, identically for both storage homes.
+   */
   async function resolveEntry(e) {
-    const slot = { author: e.author, at: e.at, resourceUrl: e.resourceUrl };
+    const slot = { author: e.author, at: e.at, resourceUrl: e.resourceUrl, hosted: e.hosted === true };
+    if (e.hosted === true) {
+      const ref = hostedRefOf(e.resourceUrl);
+      const doc = ref ? readHosted(ref.hex, ref.id) : null;
+      if (!doc || typeof doc.body !== 'string') return { ...slot, body: null, removed: true };
+      return { ...slot, body: doc.body.slice(0, ISSUE_BODY_CAP), removed: false };
+    }
     const p = resourcePathOf(e.resourceUrl);
     if (!p) return { ...slot, body: null, removed: true };
     try {
@@ -843,7 +1053,27 @@ export async function activate(api) {
     return out;
   }
 
-  const displayName = (webid) => ownerFromAgent(webid) ?? String(webid);
+  // Rendering identity (2.5): nostr agents display as shortened npub —
+  // NEVER as raw hex — and link to core's did:nostr DID-document route
+  // (/.well-known/did/nostr/<hex>, src/idp/well-known-did-nostr.js, real
+  // in the published server). Hex stays canonical in every path/id.
+  const displayName = (agent) => {
+    const hex = nostrHexOf(agent);
+    if (hex) return npubShort(hex);
+    return ownerFromAgent(agent) ?? String(agent);
+  };
+  const authorHref = (agent) => {
+    const hex = nostrHexOf(agent);
+    return hex ? `/.well-known/did/nostr/${hex}` : String(agent);
+  };
+  /** Owner path segment -> display form (npub-short for hex namespaces). */
+  const dispOwner = (owner) => (NOSTR_HEX.test(owner) ? npubShort(owner) : owner);
+  /** Additive author metadata for the JSON API (list + thread). */
+  function authorMeta(agent) {
+    const hex = nostrHexOf(agent);
+    if (hex) return { id: agent, displayName: npubShort(hex), npub: npubEncode(hex), kind: 'nostr' };
+    return { id: String(agent), displayName: displayName(agent), kind: 'webid' };
+  }
   const issueMdCtx = (owner, name) => ({
     rawBase: `${prefix}/${owner}/${name}/raw/HEAD`,
     blobBase: `${prefix}/${owner}/${name}/blob/HEAD`,
@@ -969,7 +1199,7 @@ export async function activate(api) {
     return reply.code(status)
       .header('content-type', 'text/html; charset=utf-8')
       .header('x-content-type-options', 'nosniff')
-      .header('content-security-policy', CSP)
+      .header('content-security-policy', csp)
       .send(html);
   }
 
@@ -996,7 +1226,7 @@ ${body}
       ['tags', 'Tags', `${base}/tags`],
     ].map(([id, label, href]) => `<a class="tab${tab === id ? ' active' : ''}" href="${href}">${label}</a>`).join('');
     return `<div class="repo-strip"><div class="container">
-<div class="crumb">${ICON_REPO} <a href="${prefix}/${owner}">${esc(owner)}</a><span class="muted">/</span><a href="${base}"><b>${esc(name)}</b></a>
+<div class="crumb">${ICON_REPO} <a href="${prefix}/${owner}">${esc(dispOwner(owner))}</a><span class="muted">/</span><a href="${base}"><b>${esc(name)}</b></a>
 <span class="badge">${privateRepos ? 'Private' : 'Public'}</span></div>
 <nav class="tabs">${tabs}</nav>
 </div></div>`;
@@ -1039,7 +1269,7 @@ ${body}
     }
     cards.sort((a, b) => (b.lastPush ?? 0) - (a.lastPush ?? 0));
     const body = cards.length ? cards.map((r) => `<div class="repocard">
-<h3>${ICON_REPO} <a href="${prefix}/${r.owner}">${esc(r.owner)}</a><span class="muted">/</span><a href="${prefix}/${r.owner}/${r.name}"><b>${esc(r.name)}</b></a> <span class="badge">${privateRepos ? 'Private' : 'Public'}</span></h3>
+<h3>${ICON_REPO} <a href="${prefix}/${r.owner}">${esc(dispOwner(r.owner))}</a><span class="muted">/</span><a href="${prefix}/${r.owner}/${r.name}"><b>${esc(r.name)}</b></a> <span class="badge">${privateRepos ? 'Private' : 'Public'}</span></h3>
 ${r.description ? `<div class="muted">${esc(r.description)}</div>` : ''}
 ${r.lastPush ? `<div class="muted" style="font-size:12px;margin-top:4px">Updated ${relTime(r.lastPush)}</div>` : '<div class="muted" style="font-size:12px;margin-top:4px">Empty repository</div>'}
 </div>`).join('\n')
@@ -1062,7 +1292,7 @@ git push forge main</pre></div>`;
 ${r.description ? `<div class="muted">${esc(r.description)}</div>` : ''}
 ${r.lastPush ? `<div class="muted" style="font-size:12px;margin-top:4px">Updated ${relTime(r.lastPush)}</div>` : '<div class="muted" style="font-size:12px;margin-top:4px">Empty repository</div>'}
 </div>`).join('\n') || '<p class="muted">No repositories.</p>';
-    return sendHtml(reply, 200, page(`${owner} · Forge`, `<main><div class="container"><h1 class="page">${identicon(owner, 28)} ${esc(owner)}</h1>${body}</div></main>`));
+    return sendHtml(reply, 200, page(`${dispOwner(owner)} · Forge`, `<main><div class="container"><h1 class="page">${identicon(owner, 28)} ${esc(dispOwner(owner))}</h1>${body}</div></main>`));
   }
 
   /** File table for a tree, with per-entry last-commit info (capped). */
@@ -1315,47 +1545,70 @@ ${kind === 'branches' && r.name === branch ? '<span class="badge">default</span>
   function issuesScript(cfg) {
     // cfg values are validated owner/repo names and numbers — JSON.stringify
     // of them cannot contain quotes, angle brackets, or a </script> breaker.
-    return `<script type="module">
+    // The vendored xlogin widget loads first (script-src 'self'); when it is
+    // present the auth area offers its button beside the local
+    // username/password fallback, and writes go through
+    // window.xlogin.authFetch (NIP-98 or DPoP — both verified server-side
+    // by getAgent). All DOM writes stay textContent/createElement.
+    return `<script src="${prefix}/xlogin.js"></script>
+<script type="module">
 const CFG=${JSON.stringify(cfg)};
 const T=()=>localStorage.getItem('forgeToken');
 const U=()=>localStorage.getItem('forgeUser');
+const X=()=>(window.xlogin&&window.xlogin.type&&window.xlogin.id)?window.xlogin:null;
 function el(tag,props){const e=document.createElement(tag);Object.assign(e,props||{});
   for(let i=2;i<arguments.length;i++)e.append(arguments[i]);return e}
 function setMsg(text){const m=document.getElementById('form-msg');if(m)m.textContent=text}
+function shortId(id){return id.length>28?id.slice(0,16)+'…'+id.slice(-6):id}
 function wireForms(){for(const id of ['submit-issue','submit-comment','toggle-state']){
-  const b=document.getElementById(id);if(b)b.disabled=!T()}}
+  const b=document.getElementById(id);if(b)b.disabled=!(T()||X())}}
 function renderAuth(){
   const box=document.getElementById('forge-auth');if(!box)return;
   box.textContent='';
+  const x=X();
+  if(x){
+    box.append('Signed in via xlogin ('+x.type+') as ',el('b',{},shortId(String(x.id))),' ',
+      el('button',{className:'btn',type:'button',onclick:function(){window.xlogin.logout()}},'Sign out'));
+    return;
+  }
   if(T()){
     box.append('Signed in as ',el('b',{},U()||'?'),' ',
       el('button',{className:'btn',type:'button',onclick:function(){
         localStorage.removeItem('forgeToken');localStorage.removeItem('forgeUser');
         renderAuth();wireForms();}},'Sign out'));
-  }else{
-    const u=el('input',{placeholder:'username',autocomplete:'username'});
-    const p=el('input',{type:'password',placeholder:'password',autocomplete:'current-password'});
-    const msg=el('span',{className:'formmsg'});
-    box.append('Sign in to participate: ',u,p,
-      el('button',{className:'btn',type:'button',onclick:async function(){
-        msg.textContent='';
-        try{
-          const res=await fetch('/idp/credentials',{method:'POST',
-            headers:{'content-type':'application/json'},
-            body:JSON.stringify({username:u.value,password:p.value})});
-          const j=await res.json();
-          if(!j.access_token)throw new Error(j.error||'sign-in failed');
-          localStorage.setItem('forgeToken',j.access_token);
-          localStorage.setItem('forgeUser',u.value);
-          renderAuth();wireForms();
-        }catch(e){msg.textContent=String(e&&e.message||e)}
-      }},'Sign in'),msg);
+    return;
   }
+  if(window.xlogin){
+    box.append(el('button',{className:'btn',type:'button',
+      onclick:function(){window.xlogin.login()}},'Sign in with xlogin'),
+      el('span',{className:'muted'},' (Nostr / Solid) or local account: '));
+  }else{
+    box.append('Sign in to participate: ');
+  }
+  const u=el('input',{placeholder:'username',autocomplete:'username'});
+  const p=el('input',{type:'password',placeholder:'password',autocomplete:'current-password'});
+  const msg=el('span',{className:'formmsg'});
+  box.append(u,p,
+    el('button',{className:'btn',type:'button',onclick:async function(){
+      msg.textContent='';
+      try{
+        const res=await fetch('/idp/credentials',{method:'POST',
+          headers:{'content-type':'application/json'},
+          body:JSON.stringify({username:u.value,password:p.value})});
+        const j=await res.json();
+        if(!j.access_token)throw new Error(j.error||'sign-in failed');
+        localStorage.setItem('forgeToken',j.access_token);
+        localStorage.setItem('forgeUser',u.value);
+        renderAuth();wireForms();
+      }catch(e){msg.textContent=String(e&&e.message||e)}
+    }},'Sign in'),msg);
 }
 async function call(path,body,method){
-  const res=await fetch(CFG.api+path,{method:method||'POST',
-    headers:{'content-type':'application/json',authorization:'Bearer '+T()},
-    body:JSON.stringify(body||{})});
+  const opts={method:method||'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify(body||{})};
+  let res;
+  if(X()){res=await window.xlogin.authFetch(CFG.api+path,opts)}
+  else{opts.headers.authorization='Bearer '+T();res=await fetch(CFG.api+path,opts)}
   let j=null;try{j=await res.json()}catch(e){}
   if(!res.ok)throw new Error((j&&j.error)||('HTTP '+res.status));
   return j||{};
@@ -1385,6 +1638,9 @@ if(ts)ts.onclick=async function(){
     location.reload();
   }catch(e){setMsg(String(e.message||e))}
 };
+document.addEventListener('xlogin',function(){renderAuth();wireForms()});
+document.addEventListener('xlogout',function(){renderAuth();wireForms()});
+if(window.xlogin&&window.xlogin.ready)window.xlogin.ready.then(function(){renderAuth();wireForms()});
 renderAuth();wireForms();
 </script>`;
   }
@@ -1407,7 +1663,7 @@ renderAuth();wireForms();
       const n = i.thread.length - 1;
       return `<div class="row">${i.state === 'open' ? ICON_ISSUE_OPEN : ICON_ISSUE_CLOSED}
 <div class="grow"><a class="ititle" href="${base}/issues/${i.number}">${esc(i.title)}</a>
-<div class="muted" style="font-size:12px">#${i.number} opened ${relTime(i.createdAt)} by <a href="${esc(i.author)}">${esc(displayName(i.author))}</a></div></div>
+<div class="muted" style="font-size:12px">#${i.number} opened ${relTime(i.createdAt)} by <a href="${esc(authorHref(i.author))}">${esc(displayName(i.author))}</a></div></div>
 ${n ? `<span class="muted" style="font-size:12px">${n} comment${n === 1 ? '' : 's'}</span>` : ''}</div>`;
     }).join('\n');
     const filterTabs = `<div class="fstate">
@@ -1440,7 +1696,9 @@ ${pager}
     const boxes = entries.map((e, i) => {
       const who = displayName(e.author);
       const ownerBadge = ownerFromAgent(e.author) === owner ? ' <span class="badge">owner</span>' : '';
-      const head = `${identicon(who)} <a href="${esc(e.author)}"><b>${esc(who)}</b></a>${ownerBadge}
+      // Podless authors: their words live in pluginDir, not a pod — say so.
+      const hostedTag = e.hosted ? ' <span class="badge">hosted by the forge</span>' : '';
+      const head = `${identicon(who)} <a href="${esc(authorHref(e.author))}"><b>${esc(who)}</b></a>${ownerBadge}${hostedTag}
 <span class="muted">${i === 0 ? 'opened this issue' : 'commented'} ${relTime(e.at)}</span>`;
       const slot = e.removed
         ? '<div class="removed">content removed by its author</div>'
@@ -1620,9 +1878,14 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
 
   // ---- tier 2: issue endpoints (writes are Bearer-authed via getAgent) ----
 
-  /** getAgent or a JSON 401 (with WWW-Authenticate). Returns null after replying. */
+  /**
+   * requestAgent (forge push token OR any getAgent scheme) or a JSON 401.
+   * Returns null after replying. Callers that may receive a body MUST
+   * buffer it (readJsonBody) BEFORE calling this — see readJsonBody's
+   * NIP-98 payload-tag note.
+   */
   async function apiAgent(request, reply) {
-    const agent = await api.auth.getAgent(request);
+    const agent = await requestAgent(request);
     if (!agent) {
       reply.header('WWW-Authenticate', 'Bearer realm="jss-forge"');
       await apiErr(reply, 401, 'authentication required');
@@ -1650,6 +1913,7 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
         title: i.title,
         state: i.state,
         author: i.author,
+        authorInfo: authorMeta(i.author), // additive (2.5): {id, displayName, npub?, kind}
         createdAt: i.createdAt,
         comments: i.thread.length - 1,
       })),
@@ -1666,17 +1930,25 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
       title: issue.title,
       state: issue.state,
       author: issue.author,
+      authorInfo: authorMeta(issue.author), // additive (2.5)
       createdAt: issue.createdAt,
-      thread: resolved.map((e) => ({ ...e, html: e.removed ? null : renderMarkdown(e.body, ctx) })),
+      thread: resolved.map((e) => ({
+        ...e, // includes hosted (2.5): true for forge-hosted podless content
+        authorInfo: authorMeta(e.author),
+        html: e.removed ? null : renderMarkdown(e.body, ctx),
+      })),
     });
   }
 
   async function apiIssueCreate(request, reply, owner, name) {
+    // Body BEFORE auth: NIP-98 payload-tag verification needs the buffered
+    // wire bytes on request.rawBody (see readJsonBody).
+    const p = await readJsonBody(request);
     const agent = await apiAgent(request, reply);
     if (!agent) return reply;
     const podPath = podPathFromAgent(agent);
-    if (!podPath) return apiErr(reply, 403, 'no pod namespace for this agent');
-    const p = await readJsonBody(request);
+    const nostrHex = nostrHexOf(agent);
+    if (!podPath && !nostrHex) return apiErr(reply, 403, 'no pod namespace for this agent');
     if (!p) return apiErr(reply, 400, 'invalid JSON body');
     const title = typeof p.title === 'string' ? p.title.trim() : '';
     const bodyText = typeof p.body === 'string' ? p.body : '';
@@ -1685,7 +1957,7 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
     return withIssueLock(owner, name, async () => {
       const idx = loadIssueIndex(owner, name);
       const number = idx.next;
-      const stored = await storeAuthored(request, podPath, owner, name, {
+      const doc = {
         type: 'ForgeIssue',
         repo: `${owner}/${name}`,
         issue: number,
@@ -1693,7 +1965,11 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
         body: bodyText,
         published: new Date().toISOString(),
         author: agent,
-      }, `issue-${crypto.randomUUID()}.jsonld`);
+      };
+      // did:nostr agents have no pod: the forge hosts their words (2.5).
+      const stored = nostrHex
+        ? storeHosted(nostrHex, { ...doc, hosted: true })
+        : await storeAuthored(request, podPath, owner, name, doc, `issue-${crypto.randomUUID()}.jsonld`);
       if (stored.error) return apiErr(reply, stored.status, stored.error);
       const at = Math.floor(Date.now() / 1000);
       idx.next = number + 1;
@@ -1703,23 +1979,25 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
         state: 'open',
         author: agent,
         createdAt: at,
-        thread: [{ author: agent, resourceUrl: stored.url, at }],
+        thread: [{ author: agent, resourceUrl: stored.url, at, ...(nostrHex ? { hosted: true } : {}) }],
       };
       saveIssueIndex(owner, name, idx);
       return sendJson(reply, 201, {
         number,
         url: `${prefix}/${owner}/${name}/issues/${number}`,
         resourceUrl: stored.url,
+        ...(nostrHex ? { hosted: true } : {}),
       });
     });
   }
 
   async function apiIssueComment(request, reply, owner, name, number) {
+    const p = await readJsonBody(request); // body before auth (NIP-98 payload tag)
     const agent = await apiAgent(request, reply);
     if (!agent) return reply;
     const podPath = podPathFromAgent(agent);
-    if (!podPath) return apiErr(reply, 403, 'no pod namespace for this agent');
-    const p = await readJsonBody(request);
+    const nostrHex = nostrHexOf(agent);
+    if (!podPath && !nostrHex) return apiErr(reply, 403, 'no pod namespace for this agent');
     if (!p) return apiErr(reply, 400, 'invalid JSON body');
     const bodyText = typeof p.body === 'string' ? p.body : '';
     if (!bodyText.trim()) return apiErr(reply, 422, 'body required');
@@ -1729,18 +2007,31 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
       const issue = idx.issues[number];
       if (!issue) return apiErr(reply, 404, 'not found');
       if (issue.thread.length >= THREAD_CAP) return apiErr(reply, 422, 'thread is full');
-      const stored = await storeAuthored(request, podPath, owner, name, {
+      const doc = {
         type: 'ForgeComment',
         repo: `${owner}/${name}`,
         issue: number,
         body: bodyText,
         published: new Date().toISOString(),
         author: agent,
-      }, `comment-${crypto.randomUUID()}.jsonld`);
+      };
+      const stored = nostrHex
+        ? storeHosted(nostrHex, { ...doc, hosted: true })
+        : await storeAuthored(request, podPath, owner, name, doc, `comment-${crypto.randomUUID()}.jsonld`);
       if (stored.error) return apiErr(reply, stored.status, stored.error);
-      issue.thread.push({ author: agent, resourceUrl: stored.url, at: Math.floor(Date.now() / 1000) });
+      issue.thread.push({
+        author: agent,
+        resourceUrl: stored.url,
+        at: Math.floor(Date.now() / 1000),
+        ...(nostrHex ? { hosted: true } : {}),
+      });
       saveIssueIndex(owner, name, idx);
-      return sendJson(reply, 201, { number, comments: issue.thread.length - 1, resourceUrl: stored.url });
+      return sendJson(reply, 201, {
+        number,
+        comments: issue.thread.length - 1,
+        resourceUrl: stored.url,
+        ...(nostrHex ? { hosted: true } : {}),
+      });
     });
   }
 
@@ -1748,6 +2039,7 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
   const mayModerate = (agent, owner, issue) => ownerFromAgent(agent) === owner || agent === issue.author;
 
   async function apiIssueState(request, reply, owner, name, number, state) {
+    await readJsonBody(request); // content unused; buffered for NIP-98 payload tags
     const agent = await apiAgent(request, reply);
     if (!agent) return reply;
     return withIssueLock(owner, name, async () => {
@@ -1762,9 +2054,9 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
   }
 
   async function apiIssueRetitle(request, reply, owner, name, number) {
+    const p = await readJsonBody(request); // body before auth (NIP-98 payload tag)
     const agent = await apiAgent(request, reply);
     if (!agent) return reply;
-    const p = await readJsonBody(request);
     if (!p) return apiErr(reply, 400, 'invalid JSON body');
     const title = typeof p.title === 'string' ? p.title.trim() : '';
     if (!title || title.length > ISSUE_TITLE_CAP) return apiErr(reply, 422, `title required (1-${ISSUE_TITLE_CAP} chars)`);
@@ -1780,10 +2072,10 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
   }
 
   async function apiRepoPatch(request, reply, owner, name) {
+    const p = await readJsonBody(request); // body before auth (NIP-98 payload tag)
     const agent = await apiAgent(request, reply);
     if (!agent) return reply;
     if (ownerFromAgent(agent) !== owner) return apiErr(reply, 403, 'only the repo owner may edit the repo');
-    const p = await readJsonBody(request);
     if (!p) return apiErr(reply, 400, 'invalid JSON body');
     const description = typeof p.description === 'string' ? p.description.trim() : null;
     if (description === null || description.length > DESCRIPTION_CAP) {
@@ -1815,15 +2107,81 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
     return apiErr(reply, 404, 'not found');
   }
 
+  // ---- tier 2.5: NIP-98 -> push-token exchange + hosted-content routes ----
+
+  /**
+   * POST <prefix>/api/token[?ttl=seconds] — exchange ANY credential
+   * getAgent accepts (NIP-98 included) for a forge bearer the git lane
+   * takes in a static http.extraHeader. Deliberately getAgent-only: a
+   * forge token cannot mint another forge token (no self-refresh — the
+   * TTL is real). ttl is uncapped downward (ttl<=0 mints an already-
+   * expired token, handy for testing) and capped upward at 30 days.
+   * The exchange request itself needs no body, so a NIP-98 event with
+   * just [["u",...],["method","POST"]] verifies.
+   */
+  async function apiTokenMint(request, reply) {
+    if (request.method !== 'POST') return apiErr(reply, 405, 'method not allowed');
+    await readJsonBody(request); // tolerate an (unused) JSON body under NIP-98 payload tags
+    const agent = await api.auth.getAgent(request);
+    if (!agent) {
+      reply.header('WWW-Authenticate', 'Bearer realm="jss-forge"');
+      return apiErr(reply, 401, 'authentication required');
+    }
+    let ttl = pushTokenTtl;
+    if (request.query?.ttl !== undefined) {
+      const n = Number(request.query.ttl);
+      if (!Number.isFinite(n) || n > FORGE_TOKEN_MAX_TTL) {
+        return apiErr(reply, 422, `ttl must be a number of seconds <= ${FORGE_TOKEN_MAX_TTL}`);
+      }
+      ttl = n;
+    }
+    const { token, iat, exp } = mintForgeToken(agent, ttl);
+    api.log.info(`forge: minted push token for ${agent} (ttl ${ttl}s)`);
+    return sendJson(reply, 201, { token, tokenType: 'Bearer', agent, iat, exp });
+  }
+
+  /**
+   * <prefix>/api/hosted/<hex>/<uuid> — a podless agent's words, hosted by
+   * the forge. GET is public (like a public pod resource); DELETE is the
+   * author-only removal beat (same did:nostr identity that wrote it).
+   */
+  async function apiHosted(request, reply, segs) {
+    if (segs.length !== 2 || !NOSTR_HEX.test(segs[0]) || !UUID_RE.test(segs[1])) {
+      return apiErr(reply, 404, 'not found');
+    }
+    const [hex, id] = segs;
+    if (request.method === 'GET' || request.method === 'HEAD') {
+      if (privateRepos && !(await requestAgent(request))) {
+        reply.header('WWW-Authenticate', 'Bearer realm="jss-forge"');
+        return apiErr(reply, 401, 'authentication required');
+      }
+      const doc = readHosted(hex, id);
+      return doc ? sendJson(reply, 200, doc) : apiErr(reply, 404, 'not found');
+    }
+    if (request.method === 'DELETE') {
+      const agent = await apiAgent(request, reply);
+      if (!agent) return reply;
+      if (agent !== `did:nostr:${hex}`) return apiErr(reply, 403, 'only the author may delete hosted content');
+      if (!fs.existsSync(hostedPathOf(hex, id))) return apiErr(reply, 404, 'not found');
+      fs.rmSync(hostedPathOf(hex, id));
+      api.log.info(`forge: hosted content ${hex}/${id} deleted by its author`);
+      return sendJson(reply, 200, { deleted: true });
+    }
+    return apiErr(reply, 405, 'method not allowed');
+  }
+
   /** Dispatch <prefix>/api/... (segs excludes the leading 'api'). */
   async function apiHandler(request, reply, segs) {
-    if (!['GET', 'HEAD', 'POST', 'PATCH'].includes(request.method)) return apiErr(reply, 405, 'method not allowed');
+    if (!['GET', 'HEAD', 'POST', 'PATCH', 'DELETE'].includes(request.method)) return apiErr(reply, 405, 'method not allowed');
+    if (segs.length === 1 && segs[0] === 'token') return apiTokenMint(request, reply);
+    if (segs[0] === 'hosted') return apiHosted(request, reply, segs.slice(1));
     if (segs[0] !== 'repos') return apiErr(reply, 404, 'not found');
+    if (request.method === 'DELETE') return apiErr(reply, 405, 'method not allowed');
     const rest = segs.slice(1);
 
     let agentOwner = null;
     if (privateRepos) {
-      const agent = await api.auth.getAgent(request);
+      const agent = await requestAgent(request);
       if (!agent) {
         reply.header('WWW-Authenticate', 'Basic realm="jss-forge", charset="UTF-8"');
         return apiErr(reply, 401, 'authentication required');
@@ -1892,7 +2250,7 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
       if (segs.length === 0) {
         if (request.method !== 'GET' && request.method !== 'HEAD') return reply.code(405).send();
         if (privateRepos) {
-          const agent = await api.auth.getAgent(request);
+          const agent = await requestAgent(request);
           const agentOwner = ownerFromAgent(agent);
           if (!agent) {
             reply.header('WWW-Authenticate', 'Basic realm="jss-forge", charset="UTF-8"');
@@ -1907,6 +2265,19 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
       // <prefix>/api/... — the JSON surface. 'api' is a reserved owner
       // name: a pod user literally named "api" cannot have a namespace.
       if (segs[0] === 'api') return apiHandler(request, reply, segs.slice(1));
+
+      // <prefix>/xlogin.js — the vendored widget, byte-identical, cached
+      // hard (it only changes by re-vendoring + restart). 'xlogin.js' is
+      // a reserved owner name like 'api'. Served without auth even under
+      // privateRepos: it is static widget code, not forge data.
+      if (segs.length === 1 && segs[0] === 'xlogin.js') {
+        if (request.method !== 'GET' && request.method !== 'HEAD') return reply.code(405).send();
+        return reply.code(200)
+          .header('content-type', 'application/javascript; charset=utf-8')
+          .header('cache-control', 'public, max-age=31536000, immutable')
+          .header('x-content-type-options', 'nosniff')
+          .send(xloginSrc);
+      }
 
       const owner = segs[0];
       if (!OWNER_NAME.test(owner) || owner.includes('..')) return notFound(reply);
@@ -1929,7 +2300,10 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
         }
 
         const isWrite = service === 'git-receive-pack';
-        const agent = await api.auth.getAgent(request);
+        // Forge push tokens (the NIP-98 exchange) are accepted here in
+        // addition to every core scheme — a static extraHeader cannot
+        // sign per-request NIP-98, a pod bearer works as before.
+        const agent = await requestAgent(request);
         const agentOwner = ownerFromAgent(agent);
 
         if ((isWrite || privateRepos) && !agent) {
@@ -1951,7 +2325,7 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
       if (request.method !== 'GET' && request.method !== 'HEAD') return reply.code(405).send();
 
       if (privateRepos) {
-        const agent = await api.auth.getAgent(request);
+        const agent = await requestAgent(request);
         if (!agent) {
           reply.header('WWW-Authenticate', 'Basic realm="jss-forge", charset="UTF-8"');
           return reply.code(401).send('authentication required\n');
@@ -1992,12 +2366,13 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
       }
     };
 
-    scope.route({ method: ['GET', 'POST', 'PATCH'], url: prefix || '/', handler });
-    scope.route({ method: ['GET', 'POST', 'PATCH'], url: `${prefix}/*`, handler });
+    scope.route({ method: ['GET', 'POST', 'PATCH', 'DELETE'], url: prefix || '/', handler });
+    scope.route({ method: ['GET', 'POST', 'PATCH', 'DELETE'], url: `${prefix}/*`, handler });
   });
 
   api.log.info(
-    `forge: repos at ${prefix}/<owner>/<name>.git, UI at ${prefix}/, issues at ${prefix}/<owner>/<name>/issues `
+    `forge: repos at ${prefix}/<owner>/<name>.git, UI at ${prefix}/, issues at ${prefix}/<owner>/<name>/issues, `
+    + `push tokens at ${prefix}/api/token, xlogin at ${prefix}/xlogin.js `
     + `(backend ${backend}, reads ${privateRepos ? 'owner-only' : 'public'})`,
   );
 

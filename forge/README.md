@@ -1,4 +1,4 @@
-# forge — a personal git forge (tier 1: hosting + browsing; tier 2: issues)
+# forge — a personal git forge (tier 1: hosting + browsing; tier 2: issues; tier 2.5: nostr agents + xlogin)
 
 The useful slice of Gogs/Gitea as a JSS plugin: push a repo over smart
 HTTP, get a GitHub-style (light theme) web UI for it — repo list, file
@@ -6,7 +6,10 @@ table, rendered README, tree/blob/raw views, commit log with pagination,
 green/red unified diffs, branches and tags — plus a clean JSON API over
 the same model. Tier 2 adds **issues and comments whose bodies live in
 the author's pod** (the forge keeps only a pointer index — see the
-architecture below). Zero npm dependencies, zero build step, no
+architecture below). Tier 2.5 makes **did:nostr agents first-class**
+(hex-pubkey namespaces, a NIP-98 → push-token exchange, forge-hosted
+issue bodies for podless agents) and puts the vendored **xlogin** widget
+on the issues pages. Zero npm dependencies, zero build step, no
 framework: every page is server-rendered HTML with inline CSS, all git
 work is done by the system `git` binary, and the wire protocol is
 delegated to the stock `git-http-backend` CGI (gitscratch's proven
@@ -17,6 +20,8 @@ plugins: [{ id: 'forge', module: 'forge/plugin.js', prefix: '/forge',
             config: {
               privateRepos: false,      // true: ALL reads become owner-only
               gitHttpBackend: '/usr/lib/git-core/git-http-backend', // optional
+              pushTokenTtl: 3600,       // default lifetime of exchanged push tokens (s)
+              cspConnect: [],           // extra connect-src origins (e.g. external Solid IdPs)
             } }]
 ```
 
@@ -31,15 +36,23 @@ git -c http.extraHeader="Authorization: Bearer <token>" push forge main
 ```
 
 - **Ownership**: owner = pod username derived from the pusher's WebID
-  (first path segment, mastodon/'s `podFromWebid` rule). Pushing into
+  (first path segment, mastodon/'s `podFromWebid` rule), **or the 64-hex
+  pubkey for `did:nostr:` agents** (see "Nostr agents"). Pushing into
   your own namespace materializes the bare repo under
   `pluginDir/repos/<owner>/<name>.git` — persistent, no TTL. Pushing into
   someone else's namespace is 403; anonymous push is 401 +
   `WWW-Authenticate`. Clone/fetch and the UI are public by default;
   `privateRepos: true` flips every read (git, HTML, JSON) to owner-only.
-- **`api` is a reserved owner name** (the JSON surface lives at
-  `<prefix>/api`); a pod user literally named `api` cannot have a forge
-  namespace.
+- **`api` and `xlogin.js` are reserved owner names** (the JSON surface
+  lives at `<prefix>/api`, the vendored widget at `<prefix>/xlogin.js`);
+  pod users literally named that cannot have a forge namespace.
+- **Hex-name collision, decided**: a pod username that is exactly 64
+  lowercase hex characters is theoretically registrable and would collide
+  with a nostr namespace. Hex-as-nostr wins for display and semantics
+  (the UI shows npub-short); the push check is a string comparison, so
+  such a pod user and the matching keyholder would share the namespace —
+  noted rather than papered over, because pod names are human-chosen and
+  a 64-hex username is not an accident.
 
 ## Routes
 
@@ -58,6 +71,9 @@ git -c http.extraHeader="Authorization: Bearer <token>" push forge main
 | `.../issues/<n>` | thread: issue body then comments in comment boxes (identicon, author → WebID link, relative time, `owner` badge), markdown bodies |
 | `.../issues/new` | new-issue form (vanilla-JS client, see below) |
 | `<prefix>/<owner>/<name>.git/...` | git smart HTTP (`info/refs`, `git-upload-pack`, `git-receive-pack`) |
+| `<prefix>/api/token` | POST: exchange any `getAgent` credential for a push token (see "Nostr agents") |
+| `<prefix>/api/hosted/<hex>/<uuid>` | GET (public) / DELETE (author-only): a podless agent's hosted issue words |
+| `<prefix>/xlogin.js` | the vendored xlogin widget, byte-identical, `application/javascript`, immutable cache |
 
 Refs may contain `/` (`feature/x`): the tree/blob/raw/commits routes
 resolve the ref greedily against the real ref list (longest match wins),
@@ -128,15 +144,21 @@ the reverse-proxy override.
 
 - `GET api/repos/<o>/<n>/issues?state=open|closed&page=N` →
   `{ state, page, perPage: 25, hasMore, openCount, closedCount,
-     issues: [{ number, title, state, author, createdAt, comments }] }`
+     issues: [{ number, title, state, author, authorInfo, createdAt, comments }] }`
 - `GET api/repos/<o>/<n>/issues/<num>` →
-  `{ number, title, state, author, createdAt, thread: [{ author, at,
-     resourceUrl, body|null, removed, html|null }] }` — `html` is the
-  server-side markdown renderer's already-escaped output; `body` is the
-  raw markdown straight from the pod (JSON is the escape); `removed` is
-  true when the author has deleted the pod resource.
+  `{ number, title, state, author, authorInfo, createdAt, thread: [{ author,
+     authorInfo, at, resourceUrl, hosted, body|null, removed, html|null }] }`
+  — `html` is the server-side markdown renderer's already-escaped output;
+  `body` is the raw markdown straight from the pod (JSON is the escape);
+  `removed` is true when the author has deleted the pod (or hosted)
+  resource. **Additive since 2.5**: `authorInfo` is
+  `{ id, displayName, npub?, kind: 'webid'|'nostr' }` (`id` is the
+  canonical agent string — a WebID or `did:nostr:<hex>`; `npub` only for
+  nostr authors, display-only), and `hosted` is true when the entry's
+  words are forge-hosted rather than pod-stored. `author` strings are
+  unchanged, so pre-2.5 consumers keep working.
 - `POST api/repos/<o>/<n>/issues` `{title, body}` → 201
-  `{ number, url, resourceUrl }` (Bearer required)
+  `{ number, url, resourceUrl, hosted? }` (auth required)
 - `POST .../issues/<num>/comments` `{body}` → 201
   `{ number, comments, resourceUrl }`
 - `POST .../issues/<num>/close` / `.../reopen` → `{ number, state }`
@@ -159,6 +181,116 @@ Every issues page embeds one dependency-free inline
 
 With JS off the pages stay fully readable and a `<noscript>` note says
 interactive actions need JavaScript and sign-in.
+
+## Nostr agents (tier 2.5)
+
+### Identity model — hex canonical, npub display-only
+
+Per [did-nostr.com](https://did-nostr.com), the canonical nostr identity
+is `did:nostr:<64-char-lowercase-hex-pubkey>` — **exactly the string
+`getAgent` returns** when a NIP-98 signature verifies and no WebID
+mapping exists. The forge keys everything on it:
+
+- **namespace / storage paths / index keys / API `id` fields: hex.**
+  A nostr agent's repos live at `<prefix>/<hex>/<name>.git`; hosted
+  content under `pluginDir/hosted/<hex>/`.
+- **UI rendering: shortened npub** (`npub1abcd…wxyz`), produced by a
+  ~30-line pure-node bech32 (BIP-173, full checksum) encoder, unit-tested
+  against the canonical NIP-19 vector
+  (`3bf0c63f…459d` → `npub180cvv07…jh6w6`). Raw hex is never rendered as
+  a display name.
+- **Author links** point at core's did:nostr DID-document route,
+  `/.well-known/did/nostr/<hex>` (`src/idp/well-known-did-nostr.js` —
+  real in the published server; it 404s for keys with no local account
+  linkage, which is honest: there is no doc to show).
+
+### NIP-98 → push-token exchange
+
+git's static `http.extraHeader` cannot carry NIP-98 for a push: each
+kind-27235 event signs one `u` (url) + `method` pair, and a push is at
+least `GET …/info/refs` + `POST …/git-receive-pack` (Finding 9). So the
+flow is one exchange:
+
+```
+POST <prefix>/api/token[?ttl=seconds]
+  Authorization: <anything getAgent accepts — NIP-98 included>
+→ 201 { token: "f1.…", tokenType: "Bearer", agent, iat, exp }
+```
+
+The token is macaroon-lite (capability/'s pattern): `f1.<base64url
+payload>.<base64url HMAC-SHA256>`, payload `{ v:1, agent, iat, exp }`,
+secret in `pluginDir/token-secret`. Scope is `{agent, ttl}` with
+`ttl = config.pushTokenTtl ?? 3600` (a `?ttl=` override is capped at 30
+days; non-positive values mint an already-expired token — used by the
+tests). The forge accepts it wherever it authenticates — the git lane
+first, then every core scheme via `getAgent`. A forge token cannot mint
+another forge token (no self-refresh). WebID users don't need it (the
+pod bearer works in `extraHeader` as before) but may use it.
+
+Copy-paste client flow using the [`nip98`](https://www.npmjs.com/package/nip98)
+npm lib's `getToken` for the exchange request (docs only — the forge
+itself has no npm dependencies):
+
+```js
+import { getToken } from 'nip98';
+
+const url = 'http://localhost:3000/forge/api/token';
+const auth = await getToken(url, 'POST', (e) => window.nostr.signEvent(e), true);
+const { token } = await (await fetch(url, { method: 'POST', headers: { authorization: auth } })).json();
+// pubkey-hex namespace: your pubkey IS your owner segment
+```
+
+```sh
+git -c http.extraHeader="Authorization: Bearer $TOKEN" \
+    push http://localhost:3000/forge/<pubkey-hex>/myrepo.git main
+```
+
+### Hosted content — the podless-agent asymmetry
+
+A did:nostr agent can authenticate and own a namespace, **but has no pod
+of its own to keep its words in** — the tier-2 loopback-PUT beat has
+nowhere to land. So nostr-authored issue/comment bodies are stored under
+`pluginDir/hosted/<hex>/<uuid>.json`, thread pointers carry
+`{hosted: true}`, the JSON API says so, and the UI renders a muted
+*"hosted by the forge"* tag on those entries (pod-stored ones stay
+pure). The author keeps the deletion beat: `DELETE
+<prefix>/api/hosted/<hex>/<uuid>` (same did:nostr identity, verified by
+NIP-98 or a forge token) removes the words and the thread renders the
+same *"content removed by its author"* placeholder as a pod delete.
+Anyone else gets 403. This asymmetry **is** the `api.podOf(agent)` /
+pods-for-keys ask — see Finding 10.
+
+## xlogin (the vendored login widget)
+
+`forge/xlogin.js` is [xlogin](https://github.com/melvincarvalho/xlogin)
+0.0.15, vendored **verbatim** (AGPL, attribution header only — AGENT.md's
+pattern) and served byte-identical at `<prefix>/xlogin.js` with an
+immutable cache header. Issues pages load it via `<script src>`; if
+`window.xlogin` initialises, the auth area shows a **Sign in with
+xlogin** button beside the local username/password box (the fallback
+tab), and all API writes go through `window.xlogin.authFetch` — NIP-98
+for nostr sessions, DPoP for Solid sessions, both verified server-side
+by the same `getAgent` the rest of the forge uses.
+
+What works locally vs. what CSP blocks (deliberately):
+
+- **Works**: the widget itself (`script-src 'self'`), its crypto — with
+  the caveat below — client-side NIP-98 signing, and every same-origin
+  `authFetch` (`connect-src 'self'`). Logging in with a same-origin
+  Solid IdP (the widget's first provider button is
+  `window.location.origin`) also works.
+- **Caveat, eyes open**: xlogin 0.0.15 dynamically `import()`s
+  `@noble/secp256k1`, `nip98` and `solid-oidc` from `https://esm.sh` —
+  and dynamic `import()` is governed by **script-src**, not connect-src.
+  The page CSP therefore admits `script-src https://esm.sh`, the one
+  external origin, or the widget would render a button that can do
+  nothing (Finding 11).
+- **Blocked and NOTED, not opened**: login against an **external**
+  Solid IdP needs `connect-src` to that IdP (OIDC discovery + token
+  fetches). The default CSP keeps `connect-src 'self'`, so external-IdP
+  login fails in the browser console rather than the forge opening
+  connect-src wide. Operators who want it opt in explicitly:
+  `config.cspConnect: ['https://solidcommunity.net', …]`.
 
 ## The markdown subset (hand-rolled, bounded)
 
@@ -251,8 +383,11 @@ bodies through Fastify — `api.mountApp` (#583) was not needed here.
   fallback remains for repos that never set one.
 - **Identity mapping is convention, not contract** — owner = first
   WebID path segment (podFromWebid) works for this host's pods but is a
-  heuristic; did:nostr agents have no pod namespace at all and therefore
-  cannot push. An `api.podOf(agent)` seam would make ownership honest.
+  heuristic. Tier 2.5 gave did:nostr agents a namespace (their hex
+  pubkey) so they *can* push now, but the mapping is still forge
+  convention; an `api.podOf(agent)` seam would make ownership honest —
+  and Finding 10 shows the same seam is what hosted content is standing
+  in for.
 
 ### 4. The JSON API doubles as the Gitea-parity surface
 
@@ -321,3 +456,83 @@ delete, keeping the removal semantics exact. One more real discovery:
 once a page carries a JSON-driven client, CSP needs `connect-src 'self'`
 — tier 1's `default-src 'none'` silently blocks every `fetch()`, which
 is invisible until the first interactive page exists.
+
+### 9. git cannot sign per-request NIP-98 — and core's leniencies show it knows
+
+A NIP-98 event binds ONE `u` (url) + `method`; a push is at least an
+`info/refs` GET and a `git-receive-pack` POST with different URLs and
+methods, and `http.extraHeader` is static for the whole operation — so
+"just put a NIP-98 header on git" is structurally impossible. Reading
+`src/auth/nostr.js` shows core already fights this with git-mode
+leniencies: it accepts NIP-98 smuggled inside `Basic base64("nostr:" +
+token)` (git credential helpers), allows `method: "*"`, and allows the
+event's `u` to be a PREFIX of the request URL — which means a
+pre-signed base-URL event could ride a whole push, but only inside the
+±60 s `created_at` window, and only by weakening exactly the bindings
+NIP-98 exists to make. The forge's answer is the honest one: a single
+`POST api/token` exchange (NIP-98-authenticated, per-request-correct)
+for a bearer whose TTL is a real, chosen number instead of 60 seconds
+of accidental slack. The exchange endpoint deliberately refuses to
+accept its own tokens as the minting credential.
+
+### 10. The podless-agent asymmetry IS the api.podOf ask
+
+Tier 2's proudest property — words live in the author's pod under the
+author's WAC — simply has no home for a did:nostr agent: the key can
+authenticate (getAgent says so), can own a namespace, but owns no
+storage on this host. The forge hosts those bodies itself
+(`pluginDir/hosted/<hex>/`), marks them `hosted: true`, renders the tag,
+and gives the author the same delete beat — but the asymmetry is now
+visible in every thread: pod users' words are their property under
+their ACLs; key users' words are the forge's tenant data. The seam this
+begs for is `api.podOf(agent)` / pods-for-keys: if core could answer
+"where does this agent keep things?" (or provision key-addressed
+storage), hosted content would collapse back into the tier-2 path and
+the `hosted` flag would disappear. Until then the forge is honest about
+being a landlord for the podless.
+
+### 11. Dynamic import() is script-src, not connect-src — the widget's CDN coupling is CSP-visible
+
+The plan said "extend connect-src for whatever xlogin's NOSTR flows
+need locally" — measuring showed the flows need no connect-src at all
+(signing is client-side; the fetches are same-origin) but DO need
+`script-src https://esm.sh`, because xlogin 0.0.15 hard-codes dynamic
+`import()`s of its crypto from esm.sh and CSP governs module loads with
+script-src. That's the whole CSP delta: one external script origin,
+taken knowingly; connect-src stays `'self'` so external Solid-IdP login
+is blocked-and-documented rather than silently allowed
+(`config.cspConnect` is the operator's opt-in). The plugin-shaped fix
+is upstream: a self-contained xlogin build would let script-src drop to
+`'self'` — worth filing against xlogin rather than working around here.
+
+### 12. NIP-98 verification gotchas, measured against auth.js
+
+What the host verifier (`src/auth/nostr.js`) actually demands, found by
+signing real events in the tests:
+
+- **URL exactness is Host exactness.** `u` must equal
+  `<proto>://<Host header><request.url>` (x-forwarded-* honored,
+  trailing-slash normalized, query droppable). Sign for `localhost` and
+  push to `127.0.0.1` and you 401 — the same Host-sensitivity already
+  written down in NOTES.md for loopback WebID checks now applies to
+  every NIP-98 client. The tests only pass because helpers.js uses
+  `127.0.0.1` on both sides.
+- **`created_at` window is ±60 s** — clock skew between a signing
+  device and the server is a real 401 source; the push-token exchange
+  also conveniently narrows NIP-98 to one instant per session.
+- **`payload` tags need the wire bytes.** The verifier hashes
+  `request.rawBody` (captured by core's JSON parser) — but this
+  plugin's scope replaces the content parser with a raw pass-through
+  stream for the git CGI lane, so at getAgent time the body was an
+  unread stream and any body-carrying NIP-98 request (e.g. xlogin's
+  authFetch POSTing an issue) would fail its payload check. The fix:
+  API writes buffer the body FIRST, stash the exact wire string on
+  `request.rawBody`, and only then authenticate. Order of operations
+  as a correctness bug — invisible until the first signed-body client.
+- **Unmapped keys cost an outbound fetch.** For a pubkey with no local
+  WebID linkage, verification falls through profile → local index →
+  an EXTERNAL did:nostr resolver (`nostr.social`, 5 s timeout, 60 s
+  failure cache) before returning `did:nostr:<hex>` — a network
+  round-trip on the auth hot path that the agent cannot opt out of.
+  One more reason the token exchange is the right shape: it pays that
+  cost once per TTL, not per request.
