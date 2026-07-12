@@ -100,6 +100,18 @@ async function registerAndMint(base, username) {
   return body; // { access_token, webid }
 }
 
+/** Mint a fresh token for an ALREADY-registered user. */
+async function mintToken(base, username) {
+  const cred = await fetch(`${base}/idp/credentials`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username, password: PASS }),
+  });
+  const body = await cred.json();
+  assert.ok(body.access_token, `re-mint ${username} failed: ${JSON.stringify(body)}`);
+  return body; // { access_token, webid }
+}
+
 const README_MD = [
   '# Demo Project',
   '',
@@ -896,6 +908,418 @@ describe('forge plugin', () => {
       assert.match(cspHeader, /connect-src 'self'(;|$)/,
         'connect-src stays self — external Solid IdPs blocked by default');
       assert.ok(html.includes('window.xlogin'), 'client integrates the widget when present');
+    });
+  });
+
+  // ------------------------- tier 3a: forks, compare, pull requests, merges
+  // The full story: dana forks casey/demo, pushes a feature branch to HER
+  // fork, compare shows the divergence, a PR (body in dana's pod) carries
+  // the conversation (issues thread machinery verbatim), and the merge is
+  // REAL git: merge-tree --write-tree + commit-tree (two parents) +
+  // update-ref with a compare-and-swap old-value guard. Conflicts, the
+  // ff-when-possible policy, the CAS 409 and a nostr fork are all proven.
+
+  describe('forks, compare and pull requests (tier 3a)', () => {
+    let dana;       // re-minted token for the user registered in tier 2
+    let apiBase;    // casey/demo JSON api
+    let danaClone;  // dana's working clone of HER fork
+    let featureSha; // dana's feature-branch commit
+    let mergeSha;   // the PR #1 merge commit
+    const authed = (token) => ({ 'content-type': 'application/json', authorization: `Bearer ${token}` });
+
+    before(async () => {
+      dana = await mintToken(base, 'dana');
+      apiBase = `${base}/forge/api/repos/casey/demo`;
+    });
+
+    it('anonymous fork is 401; dana forks casey/demo with lineage recorded; refork is 409', async () => {
+      const anon = await fetch(`${apiBase}/fork`, { method: 'POST' });
+      assert.strictEqual(anon.status, 401);
+
+      const res = await fetch(`${apiBase}/fork`, { method: 'POST', headers: authed(dana.access_token) });
+      assert.strictEqual(res.status, 201);
+      const j = await res.json();
+      assert.strictEqual(j.owner, 'dana');
+      assert.strictEqual(j.name, 'demo');
+      assert.strictEqual(j.parent, 'casey/demo');
+      assert.strictEqual(j.cloneUrl, `${base}/forge/dana/demo.git`);
+      assert.ok(fs.existsSync(repoDir('dana', 'demo')), 'bare fork under repos/dana');
+      const parent = (await git(['-C', repoDir('dana', 'demo'), 'config', '--get', 'forge.parent'])).stdout.trim();
+      assert.strictEqual(parent, 'casey/demo', 'lineage in the fork\'s git config');
+
+      const again = await fetch(`${apiBase}/fork`, { method: 'POST', headers: authed(dana.access_token) });
+      assert.strictEqual(again.status, 409, 'same-name fork already exists');
+    });
+
+    it('lineage renders: "forked from" on the fork (home + list), fork count on the parent', async () => {
+      const forkHome = await (await fetch(`${base}/forge/dana/demo`)).text();
+      assert.ok(forkHome.includes('forked from'), 'fork home names its parent');
+      assert.ok(forkHome.includes('href="/forge/casey/demo"'), 'parent linked');
+      const parentHome = await (await fetch(`${base}/forge/casey/demo`)).text();
+      assert.ok(parentHome.includes('1 fork'), 'parent shows the fork count');
+      const list = await (await fetch(`${base}/forge/`)).text();
+      assert.ok(list.includes('forked from'), 'repo list shows lineage');
+      const meta = await (await fetch(`${base}/forge/api/repos/dana/demo`)).json();
+      assert.strictEqual(meta.parent, 'casey/demo');
+      const parentMeta = await (await fetch(apiBase)).json();
+      assert.strictEqual(parentMeta.forks, 1);
+    });
+
+    it('dana pushes a feature branch to her fork', async () => {
+      danaClone = path.join(tmp, 'dana-demo');
+      await git(['clone', '--quiet', `${base}/forge/dana/demo.git`, danaClone]);
+      await git(['checkout', '--quiet', '-b', 'feature'], { cwd: danaClone });
+      fs.writeFileSync(path.join(danaClone, 'CONTRIBUTING.md'), '# Contributing\n\nPlease be kind.\n');
+      await git(['add', '-A'], { cwd: danaClone });
+      await git(['commit', '--quiet', '-m', 'add contributing guide'], { cwd: danaClone });
+      featureSha = (await git(['rev-parse', 'HEAD'], { cwd: danaClone })).stdout.trim();
+      await git([...authFlag(dana.access_token), 'push', '--quiet', 'origin', 'feature'], { cwd: danaClone });
+      // the fork's home hints at the recent push with a compare link
+      const forkHome = await (await fetch(`${base}/forge/dana/demo`)).text();
+      assert.ok(forkHome.includes('open a pull request?'), 'recently-pushed hint');
+      assert.ok(forkHome.includes('/forge/casey/demo/compare/main...dana:feature'), 'hint links the parent compare');
+    });
+
+    it('compare JSON: cross-fork head fetched and diffed; bogus head owner is 404', async () => {
+      const cmp = await (await fetch(`${apiBase}/compare/main...dana:feature`)).json();
+      assert.strictEqual(cmp.aheadBy, 1);
+      assert.strictEqual(cmp.behindBy, 0);
+      assert.strictEqual(cmp.head.owner, 'dana');
+      assert.strictEqual(cmp.head.sha, featureSha);
+      assert.strictEqual(cmp.commits.length, 1);
+      assert.strictEqual(cmp.commits[0].subject, 'add contributing guide');
+      assert.strictEqual(cmp.files.length, 1);
+      assert.strictEqual(cmp.files[0].name, 'CONTRIBUTING.md');
+      assert.ok(cmp.base.sha, 'base sha present');
+
+      assert.strictEqual((await fetch(`${apiBase}/compare/main...nosuchowner:feature`)).status, 404);
+      assert.strictEqual((await fetch(`${apiBase}/compare/main...dana:no-such-branch`)).status, 404);
+      assert.strictEqual((await fetch(`${apiBase}/compare/main`)).status, 404, 'no ... separator');
+      assert.strictEqual((await fetch(`${apiBase}/compare/main...dana:bad..ref`)).status, 404, 'traversal-ish ref refused');
+    });
+
+    it('compare HTML: ahead/behind, commit list, diff, open-PR button', async () => {
+      const res = await fetch(`${base}/forge/casey/demo/compare/main...dana:feature`);
+      assert.strictEqual(res.status, 200);
+      const html = await res.text();
+      assert.ok(html.includes('1 ahead, 0 behind'), 'ahead/behind counts');
+      assert.ok(html.includes('add contributing guide'), 'ahead commit listed');
+      assert.ok(html.includes('CONTRIBUTING.md'), 'diff file section');
+      assert.ok(html.includes('<tr class="add">'), 'green rows');
+      assert.ok(html.includes('Open pull request'), 'the PR button');
+    });
+
+    it('anonymous PR create is 401; dana opens PR #1 and the body lives in HER pod', async () => {
+      const anon = await fetch(`${apiBase}/pulls`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ title: 'nope', body: '', base: 'main', head: 'dana:feature' }),
+      });
+      assert.strictEqual(anon.status, 401);
+
+      const res = await fetch(`${apiBase}/pulls`, {
+        method: 'POST',
+        headers: authed(dana.access_token),
+        body: JSON.stringify({ title: 'Add contributing guide', body: 'Adds **CONTRIBUTING.md** with the basics.', base: 'main', head: 'dana:feature' }),
+      });
+      assert.strictEqual(res.status, 201);
+      const j = await res.json();
+      assert.strictEqual(j.number, 1, 'pull numbering starts at 1, SEPARATE from issues');
+      assert.ok(j.resourceUrl.includes('/dana/public/forge/casey--demo/pull-'),
+        `PR body recorded in dana's pod: ${j.resourceUrl}`);
+      const direct = await fetch(j.resourceUrl);
+      assert.strictEqual(direct.status, 200);
+      const doc = await direct.json();
+      assert.strictEqual(doc.type, 'ForgePullRequest');
+      assert.strictEqual(doc.repo, 'casey/demo');
+      assert.strictEqual(doc.head, 'dana:feature');
+      assert.strictEqual(doc.author, dana.webid);
+
+      const bogus = await fetch(`${apiBase}/pulls`, {
+        method: 'POST',
+        headers: authed(dana.access_token),
+        body: JSON.stringify({ title: 'x', body: '', base: 'main', head: 'nosuchowner:feature' }),
+      });
+      assert.strictEqual(bogus.status, 422, 'unresolvable head refused');
+    });
+
+    it("casey comments (pod resource in CASEY's pod); detail JSON is mergeable", async () => {
+      const res = await fetch(`${apiBase}/pulls/1/comments`, {
+        method: 'POST',
+        headers: authed(casey.access_token),
+        body: JSON.stringify({ body: 'Looks good, thanks!' }),
+      });
+      assert.strictEqual(res.status, 201);
+      const j = await res.json();
+      assert.ok(j.resourceUrl.includes('/casey/public/forge/casey--demo/comment-'),
+        `comment in casey's pod: ${j.resourceUrl}`);
+
+      const pr = await (await fetch(`${apiBase}/pulls/1`)).json();
+      assert.strictEqual(pr.state, 'open');
+      assert.deepStrictEqual({ owner: pr.head.owner, ref: pr.head.ref }, { owner: 'dana', ref: 'feature' });
+      assert.strictEqual(pr.base, 'main');
+      assert.ok(pr.baseSha, 'baseSha exposed (the CAS token for the UI)');
+      assert.strictEqual(pr.mergeable, true);
+      assert.deepStrictEqual(pr.conflicts, []);
+      assert.strictEqual(pr.thread.length, 2);
+      assert.strictEqual(pr.thread[0].author, dana.webid);
+      assert.ok(pr.thread[0].html.includes('<strong>CONTRIBUTING.md</strong>'), 'markdown rendered');
+      assert.strictEqual(pr.thread[1].author, casey.webid);
+    });
+
+    it('pull pages render: tab + list + conversation/commits/files sub-tabs', async () => {
+      const home = await (await fetch(`${base}/forge/casey/demo`)).text();
+      assert.match(home, /Pull requests <span class="badge">1<\/span>/, 'tab carries the open count');
+
+      const list = await (await fetch(`${base}/forge/casey/demo/pulls`)).text();
+      assert.ok(list.includes('Add contributing guide'), 'PR listed');
+      assert.ok(list.includes('pr-open'), 'green open chip');
+      assert.ok(list.includes('dana:feature'), 'head → base shown');
+
+      const conv = await (await fetch(`${base}/forge/casey/demo/pulls/1`)).text();
+      assert.ok(conv.includes('opened this pull request'), 'conversation thread');
+      assert.ok(conv.includes('no conflicts with the base branch'), 'clean banner');
+      assert.ok(conv.includes('id="do-merge"'), 'merge button present');
+      assert.ok(conv.includes('Looks good, thanks!'), 'comment body re-fetched from the pod');
+
+      const commits = await (await fetch(`${base}/forge/casey/demo/pulls/1/commits`)).text();
+      assert.ok(commits.includes('add contributing guide'), 'ahead commit on the Commits tab');
+
+      const files = await (await fetch(`${base}/forge/casey/demo/pulls/1/files`)).text();
+      assert.ok(files.includes('CONTRIBUTING.md'), 'file section');
+      assert.ok(files.includes('<tr class="add">'), 'diff rows');
+    });
+
+    it("dana cannot merge into casey's repo (403); anonymous merge is 401", async () => {
+      const forbidden = await fetch(`${apiBase}/pulls/1/merge`, { method: 'POST', headers: authed(dana.access_token) });
+      assert.strictEqual(forbidden.status, 403);
+      const anon = await fetch(`${apiBase}/pulls/1/merge`, { method: 'POST' });
+      assert.strictEqual(anon.status, 401);
+      const pr = await (await fetch(`${apiBase}/pulls/1`)).json();
+      assert.strictEqual(pr.state, 'open', 'still open');
+    });
+
+    it('casey merges PR #1: a real merge commit, two parents, honest authorship', async () => {
+      // diverge main first (a different file) so this is a genuine
+      // two-parent merge rather than the ff case (proven separately below)
+      await git(['pull', '--quiet', '--ff-only', remote, 'main'], { cwd: work });
+      fs.appendFileSync(path.join(work, 'README.md'), '\nA line added upstream.\n');
+      await git(['commit', '--quiet', '-am', 'upstream readme note'], { cwd: work });
+      await git([...authFlag(casey.access_token), 'push', '--quiet', remote, 'main'], { cwd: work });
+
+      const res = await fetch(`${apiBase}/pulls/1/merge`, { method: 'POST', headers: authed(casey.access_token) });
+      assert.strictEqual(res.status, 200);
+      const j = await res.json();
+      assert.strictEqual(j.state, 'merged');
+      assert.strictEqual(j.fastForward, false, 'histories diverged: a merge commit was made');
+      mergeSha = j.sha;
+
+      const dir = repoDir('casey', 'demo');
+      const log = (await git(['-C', dir, 'log', '--format=%H|%P|%an|%cn|%s', 'main'])).stdout;
+      assert.ok(log.includes(featureSha), "dana's commit is reachable from casey's main");
+      const mergeLine = log.split('\n').find((l) => l.startsWith(mergeSha));
+      assert.ok(mergeLine, 'merge commit on main');
+      const [, parents, an, cn, subject] = mergeLine.split('|');
+      assert.strictEqual(parents.split(' ').length, 2, 'two parents');
+      assert.strictEqual(an, 'casey', 'author is the merging agent');
+      assert.strictEqual(cn, 'forge', 'committer is the forge');
+      assert.strictEqual(subject, 'Merge pull request #1 from dana:feature');
+
+      const pr = await (await fetch(`${apiBase}/pulls/1`)).json();
+      assert.strictEqual(pr.state, 'merged');
+      assert.strictEqual(pr.merged.sha, mergeSha);
+      assert.strictEqual(pr.merged.mergedBy, casey.webid);
+
+      const conv = await (await fetch(`${base}/forge/casey/demo/pulls/1`)).text();
+      assert.ok(conv.includes('state-merged'), 'purple Merged pill on the page');
+      const list = await (await fetch(`${base}/forge/casey/demo/pulls?state=merged`)).text();
+      assert.ok(list.includes('Add contributing guide') && list.includes('pr-merged'),
+        'merged filter shows the PR with the purple chip');
+    });
+
+    it('conflict: both sides change the same line -> 409, conflicted path named, PR stays open', async () => {
+      // casey moves main (same line dana will touch)
+      await git(['pull', '--quiet', '--ff-only', remote, 'main'], { cwd: work });
+      fs.writeFileSync(path.join(work, 'src', 'main.js'), 'function main() {\n  return 3;\n}\n');
+      await git(['commit', '--quiet', '-am', 'main goes to 3'], { cwd: work });
+      await git([...authFlag(casey.access_token), 'push', '--quiet', remote, 'main'], { cwd: work });
+
+      // dana's branch2 (from the fork point) touches the same line
+      await git(['checkout', '--quiet', 'main'], { cwd: danaClone });
+      await git(['checkout', '--quiet', '-b', 'branch2'], { cwd: danaClone });
+      fs.writeFileSync(path.join(danaClone, 'src', 'main.js'), 'function main() {\n  return 42;\n}\n');
+      await git(['commit', '--quiet', '-am', 'main goes to 42'], { cwd: danaClone });
+      await git([...authFlag(dana.access_token), 'push', '--quiet', 'origin', 'branch2'], { cwd: danaClone });
+
+      const create = await fetch(`${apiBase}/pulls`, {
+        method: 'POST',
+        headers: authed(dana.access_token),
+        body: JSON.stringify({ title: 'Return 42', body: 'the answer', base: 'main', head: 'dana:branch2' }),
+      });
+      assert.strictEqual(create.status, 201);
+      assert.strictEqual((await create.json()).number, 2);
+
+      const pr = await (await fetch(`${apiBase}/pulls/2`)).json();
+      assert.strictEqual(pr.mergeable, false, 'detail reports the conflict');
+      assert.deepStrictEqual(pr.conflicts, ['src/main.js']);
+
+      const conv = await (await fetch(`${base}/forge/casey/demo/pulls/2`)).text();
+      assert.ok(conv.includes('conflicts that must be resolved'), 'conflict banner');
+      assert.ok(conv.includes('src/main.js'), 'conflicted path named on the page');
+      assert.ok(!conv.includes('id="do-merge"'), 'merge button withheld');
+
+      const merge = await fetch(`${apiBase}/pulls/2/merge`, { method: 'POST', headers: authed(casey.access_token) });
+      assert.strictEqual(merge.status, 409);
+      const mj = await merge.json();
+      assert.strictEqual(mj.error, 'merge conflict');
+      assert.deepStrictEqual(mj.conflicts, ['src/main.js']);
+      assert.strictEqual((await (await fetch(`${apiBase}/pulls/2`)).json()).state, 'open', 'PR survives the failed merge');
+    });
+
+    it('casey closes the conflicted PR (red chip); a merged PR cannot be closed', async () => {
+      const close = await fetch(`${apiBase}/pulls/2/close`, { method: 'POST', headers: authed(casey.access_token) });
+      assert.deepStrictEqual(await close.json(), { number: 2, state: 'closed' });
+      const closed = await (await fetch(`${apiBase}/pulls?state=closed`)).json();
+      assert.deepStrictEqual(closed.pulls.map((p) => p.number), [2]);
+      const html = await (await fetch(`${base}/forge/casey/demo/pulls?state=closed`)).text();
+      assert.ok(html.includes('Return 42') && html.includes('pr-closed'), 'closed filter, red chip');
+
+      const sealed = await fetch(`${apiBase}/pulls/1/close`, { method: 'POST', headers: authed(casey.access_token) });
+      assert.strictEqual(sealed.status, 422, 'merged is final');
+    });
+
+    it('fast-forward: a branch from the current tip merges with NO merge commit (ff-when-possible)', async () => {
+      await git(['fetch', '--quiet', remote, 'main'], { cwd: danaClone });
+      await git(['checkout', '--quiet', '-b', 'ff', 'FETCH_HEAD'], { cwd: danaClone });
+      fs.writeFileSync(path.join(danaClone, 'docs', 'ff.txt'), 'fast forward\n');
+      await git(['add', '-A'], { cwd: danaClone });
+      await git(['commit', '--quiet', '-m', 'ff change'], { cwd: danaClone });
+      const ffSha = (await git(['rev-parse', 'HEAD'], { cwd: danaClone })).stdout.trim();
+      await git([...authFlag(dana.access_token), 'push', '--quiet', 'origin', 'ff'], { cwd: danaClone });
+
+      const create = await fetch(`${apiBase}/pulls`, {
+        method: 'POST',
+        headers: authed(dana.access_token),
+        body: JSON.stringify({ title: 'FF change', body: '', base: 'main', head: 'dana:ff' }),
+      });
+      const { number } = await create.json();
+      assert.strictEqual(number, 3);
+
+      const merge = await fetch(`${apiBase}/pulls/3/merge`, { method: 'POST', headers: authed(casey.access_token) });
+      assert.strictEqual(merge.status, 200);
+      const j = await merge.json();
+      assert.strictEqual(j.fastForward, true);
+      assert.strictEqual(j.sha, ffSha, "merged sha IS dana's commit — no synthetic merge commit");
+
+      const dir = repoDir('casey', 'demo');
+      const tip = (await git(['-C', dir, 'log', '-1', '--format=%H|%P', 'main'])).stdout.trim();
+      assert.strictEqual(tip.split('|')[0], ffSha, 'main fast-forwarded to the head');
+      assert.strictEqual(tip.split('|')[1].split(' ').length, 1, 'single parent: no merge commit');
+      assert.strictEqual((await (await fetch(`${apiBase}/pulls/3`)).json()).state, 'merged');
+    });
+
+    it('CAS guard: the base moving between diff and merge is a 409 the first time', async () => {
+      await git(['fetch', '--quiet', remote, 'main'], { cwd: danaClone });
+      await git(['checkout', '--quiet', '-b', 'cas', 'FETCH_HEAD'], { cwd: danaClone });
+      fs.writeFileSync(path.join(danaClone, 'cas.txt'), 'compare and swap\n');
+      await git(['add', '-A'], { cwd: danaClone });
+      await git(['commit', '--quiet', '-m', 'cas change'], { cwd: danaClone });
+      await git([...authFlag(dana.access_token), 'push', '--quiet', 'origin', 'cas'], { cwd: danaClone });
+
+      const create = await fetch(`${apiBase}/pulls`, {
+        method: 'POST',
+        headers: authed(dana.access_token),
+        body: JSON.stringify({ title: 'CAS probe', body: '', base: 'main', head: 'dana:cas' }),
+      });
+      assert.strictEqual((await create.json()).number, 4);
+      const seen = (await (await fetch(`${apiBase}/pulls/4`)).json()).baseSha;
+      assert.ok(seen, 'the diff the merger saw is pinned to a base sha');
+
+      // the base moves underneath (an unrelated push to main)
+      await git(['pull', '--quiet', '--ff-only', remote, 'main'], { cwd: work });
+      fs.appendFileSync(path.join(work, 'docs', 'notes.txt'), 'one more note\n');
+      await git(['commit', '--quiet', '-am', 'notes tweak'], { cwd: work });
+      await git([...authFlag(casey.access_token), 'push', '--quiet', remote, 'main'], { cwd: work });
+
+      const stale = await fetch(`${apiBase}/pulls/4/merge`, {
+        method: 'POST',
+        headers: authed(casey.access_token),
+        body: JSON.stringify({ expectedBase: seen }),
+      });
+      assert.strictEqual(stale.status, 409, 'stale expectedBase is rejected');
+      assert.match((await stale.json()).error, /moved/);
+      assert.strictEqual((await (await fetch(`${apiBase}/pulls/4`)).json()).state, 'open');
+
+      // a fresh look merges fine (different files — clean three-way)
+      const retry = await fetch(`${apiBase}/pulls/4/merge`, { method: 'POST', headers: authed(casey.access_token) });
+      assert.strictEqual(retry.status, 200);
+      const j = await retry.json();
+      assert.strictEqual(j.fastForward, false);
+      const line = (await git(['-C', repoDir('casey', 'demo'), 'log', '-1', '--format=%P|%s', 'main'])).stdout.trim();
+      assert.strictEqual(line.split('|')[0].split(' ').length, 2, 'real merge commit after the retry');
+      assert.strictEqual(line.split('|')[1], 'Merge pull request #4 from dana:cas');
+    });
+
+    it('a nostr agent forks into its hex namespace and opens a PR via NIP-98', async () => {
+      const sk = bytesToHex(schnorr.utils.randomPrivateKey());
+      const pk = bytesToHex(schnorr.getPublicKey(sk));
+
+      const forkUrl = `${apiBase}/fork`;
+      const fork = await fetch(forkUrl, {
+        method: 'POST',
+        headers: { authorization: nip98Header(sk, forkUrl, 'POST') },
+      });
+      assert.strictEqual(fork.status, 201);
+      const fj = await fork.json();
+      assert.strictEqual(fj.owner, pk, 'forked into the 64-hex namespace');
+      assert.ok(fs.existsSync(repoDir(pk, 'demo')));
+      const parent = (await git(['-C', repoDir(pk, 'demo'), 'config', '--get', 'forge.parent'])).stdout.trim();
+      assert.strictEqual(parent, 'casey/demo');
+
+      // push a change to the fork with an exchanged bearer, then PR it
+      const tokUrl = `${base}/forge/api/token`;
+      const tok = (await (await fetch(tokUrl, {
+        method: 'POST',
+        headers: { authorization: nip98Header(sk, tokUrl, 'POST') },
+      })).json()).token;
+      const nClone = path.join(tmp, 'nostr-demo');
+      await git(['clone', '--quiet', `${base}/forge/${pk}/demo.git`, nClone]);
+      await git(['checkout', '--quiet', '-b', 'npatch'], { cwd: nClone });
+      fs.writeFileSync(path.join(nClone, 'nostr.txt'), 'signed with schnorr\n');
+      await git(['add', '-A'], { cwd: nClone });
+      await git(['commit', '--quiet', '-m', 'nostr patch'], { cwd: nClone });
+      await git([...authFlag(tok), 'push', '--quiet', 'origin', 'npatch'], { cwd: nClone });
+
+      const prUrl = `${apiBase}/pulls`;
+      const prBody = JSON.stringify({ title: 'Nostr-born PR', body: 'from a **key**, not a pod', base: 'main', head: `${pk}:npatch` });
+      const create = await fetch(prUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: nip98Header(sk, prUrl, 'POST', prBody) },
+        body: prBody,
+      });
+      assert.strictEqual(create.status, 201, 'NIP-98 with a payload tag opens the PR');
+      const pj = await create.json();
+      assert.strictEqual(pj.number, 5);
+      assert.strictEqual(pj.hosted, true, 'podless body is forge-hosted');
+      assert.ok(pj.resourceUrl.includes(`/forge/api/hosted/${pk}/`));
+
+      const pr = await (await fetch(`${apiBase}/pulls/5`)).json();
+      assert.strictEqual(pr.author, `did:nostr:${pk}`);
+      assert.strictEqual(pr.authorInfo.kind, 'nostr');
+      assert.strictEqual(pr.head.owner, pk);
+      assert.strictEqual(pr.thread[0].hosted, true);
+    });
+
+    it('pull and issue numbering are independent (the documented deviation)', async () => {
+      const issue1 = await (await fetch(`${apiBase}/issues/1`)).json();
+      const pull1 = await (await fetch(`${apiBase}/pulls/1`)).json();
+      assert.strictEqual(issue1.number, 1);
+      assert.strictEqual(pull1.number, 1);
+      assert.notStrictEqual(issue1.title, pull1.title, 'same number, different registries');
+      const pulls = await (await fetch(`${apiBase}/pulls?state=open`)).json();
+      assert.strictEqual(pulls.openCount, 1, 'only the nostr PR remains open');
+      assert.strictEqual(pulls.mergedCount, 3);
+      assert.strictEqual(pulls.closedCount, 1);
     });
   });
 

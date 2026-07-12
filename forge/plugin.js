@@ -1,5 +1,6 @@
 // forge — a personal git forge (tier 1: hosting + browsing; tier 2: issues
-// + comments; tier 2.5: first-class did:nostr agents + the xlogin widget)
+// + comments; tier 2.5: first-class did:nostr agents + the xlogin widget;
+// tier 3a: forks, compare, and pull requests with REAL merges)
 // as a #206 loader plugin. The useful slice of Gogs/Gitea: push
 // a repo, get a GitHub-style web UI for it — with the constraints that
 // killed the last attempt made absolute: zero npm dependencies, zero build
@@ -23,6 +24,9 @@
 //   commit        <prefix>/<owner>/<name>/commit/<sha>
 //   refs          <prefix>/<owner>/<name>/{branches,tags}
 //   issues        <prefix>/<owner>/<name>/issues[?state=|/new|/<n>]
+//   compare       <prefix>/<owner>/<name>/compare/<base>...[<owner>:]<ref>
+//   pulls         <prefix>/<owner>/<name>/pulls[?state=|/new|/<n>[/commits|/files]]
+//   fork          POST <prefix>/api/repos/<o>/<n>/fork
 //   push tokens   <prefix>/api/token                 (POST, any getAgent credential)
 //   hosted words  <prefix>/api/hosted/<hex>/<uuid>   (GET public, DELETE author-only)
 //   xlogin        <prefix>/xlogin.js                 (vendored widget, byte-identical)
@@ -205,6 +209,13 @@ const ICON_TAG = '<svg class="icon" width="16" height="16" viewBox="0 0 16 16" f
 // GitHub's issue-opened (green circle-dot) and issue-closed (purple check).
 const ICON_ISSUE_OPEN = '<svg class="icon" width="16" height="16" viewBox="0 0 16 16" fill="#1a7f37" aria-hidden="true"><path d="M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"/><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Z"/></svg>';
 const ICON_ISSUE_CLOSED = '<svg class="icon" width="16" height="16" viewBox="0 0 16 16" fill="#8250df" aria-hidden="true"><path d="M11.28 6.78a.75.75 0 0 0-1.06-1.06L7.25 8.69 5.78 7.22a.75.75 0 0 0-1.06 1.06l2 2a.75.75 0 0 0 1.06 0l3.5-3.5Z"/><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0Zm-1.5 0a6.5 6.5 0 1 0-13 0 6.5 6.5 0 0 0 13 0Z"/></svg>';
+// GitHub's git-pull-request (green open), git-merge (purple merged) and
+// git-pull-request-closed (red closed) octicons — tier 3a.
+const PR_PATH = 'M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354ZM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z';
+const ICON_PR_OPEN = `<svg class="icon pr-open" width="16" height="16" viewBox="0 0 16 16" fill="#1a7f37" aria-hidden="true"><path d="${PR_PATH}"/></svg>`;
+const ICON_PR_TAB = `<svg class="icon" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="${PR_PATH}"/></svg>`;
+const ICON_PR_MERGED = '<svg class="icon pr-merged" width="16" height="16" viewBox="0 0 16 16" fill="#8250df" aria-hidden="true"><path d="M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218ZM4.25 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm8.5-4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 3.25a.75.75 0 1 0 0 .005V3.25Z"/></svg>';
+const ICON_PR_CLOSED = '<svg class="icon pr-closed" width="16" height="16" viewBox="0 0 16 16" fill="#cf222e" aria-hidden="true"><path d="M3.25 1A2.25 2.25 0 0 1 4 5.372v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.251 2.251 0 0 1 3.25 1Zm9.5 5.5a.75.75 0 0 1 .75.75v3.378a2.251 2.251 0 1 1-1.5 0V7.25a.75.75 0 0 1 .75-.75Zm-2.03-5.273a.75.75 0 0 1 1.06 0l.97.97.97-.97a.748.748 0 0 1 1.265.332.75.75 0 0 1-.205.729l-.97.97.97.97a.751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018l-.97-.97-.97.97a.749.749 0 0 1-1.275-.326.749.749 0 0 1 .215-.734l.97-.97-.97-.97a.75.75 0 0 1 0-1.06ZM2.5 3.25a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0ZM3.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm9.5 0a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z"/></svg>';
 
 // ------------------------------------------------- nostr identity (2.5)
 // Canonical form everywhere: did:nostr:<64-hex> (did-nostr.com — exactly
@@ -607,6 +618,18 @@ h1.page{font-size:24px;margin:0 0 16px}
   border-radius:6px;font-size:14px;font-family:inherit;margin-bottom:8px;background:#ffffff}
 .issueform textarea{min-height:140px;line-height:1.5;resize:vertical}
 .formmsg{color:#cf222e;font-size:13px}
+.state-merged{background:#8250df}
+.state-closed-red{background:#cf222e}
+.mergebox{border:1px solid #d0d7de;border-radius:8px;margin-bottom:16px;padding:12px 16px}
+.mergebox.clean{border-color:#1f883d}
+.mergebox.conflict{border-color:#cf222e}
+.mergebox h3{margin:0 0 4px;font-size:14px}
+.mergebox .clean-note{color:#1a7f37}
+.mergebox .conflict-note{color:#cf222e}
+.pushhint{display:flex;align-items:center;gap:8px;border:1px solid #d4a72c66;background:#fff8c5;
+  border-radius:8px;padding:10px 16px;margin-bottom:16px;font-size:13px}
+.aheadbehind{display:inline-block;border:1px solid #d0d7de;border-radius:6px;padding:2px 10px;
+  font-size:12px;color:#59636e}
 `;
 
 // connect-src 'self' is load-bearing for tier 2: the issues client drives
@@ -647,6 +670,17 @@ export async function activate(api) {
   const privateRepos = api.config.privateRepos ?? false;
   const backend = await findBackend(api.config);
   const csp = buildCsp(api.config.cspConnect);
+
+  // Tier 3a: real merges need `git merge-tree --write-tree` (git >= 2.38).
+  // Checked once at activate; the merge route 501s with the version when
+  // the installed git is too old (a Finding, not a crash).
+  let gitVersion = 'unknown';
+  let mergeTreeOk = false;
+  try {
+    gitVersion = (await execFileP('git', ['--version'])).stdout.trim();
+    const vm = /(\d+)\.(\d+)/.exec(gitVersion);
+    mergeTreeOk = !!vm && (+vm[1] > 2 || (+vm[1] === 2 && +vm[2] >= 38));
+  } catch { /* no git at all fails later, loudly */ }
 
   const reposDir = path.join(api.storage.pluginDir(), 'repos');
   fs.mkdirSync(reposDir, { recursive: true });
@@ -876,7 +910,8 @@ export async function activate(api) {
         }
       } catch { /* unreadable README is not an error */ }
     }
-    return { owner, name, description, lastPush };
+    const parent = readForkParent(owner, name);
+    return { owner, name, description, lastPush, parent: parent ? parent.full : null };
   }
 
   /** The bare repo's `description` file, only if explicitly customized. */
@@ -886,6 +921,133 @@ export async function activate(api) {
       if (d && !d.startsWith('Unnamed repository')) return d;
     } catch { /* no description file */ }
     return '';
+  }
+
+  // --------------------------------------------- forks + compare (tier 3a)
+
+  async function revParse(dir, spec) {
+    try { return (await gitText(dir, ['rev-parse', '--verify', '--quiet', spec])).trim() || null; } catch { return null; }
+  }
+  async function isAncestor(dir, a, b) {
+    try {
+      await execFileP('git', ['-C', dir, 'merge-base', '--is-ancestor', a, b], { env: gitEnv });
+      return true;
+    } catch { return false; }
+  }
+
+  // Fork lineage lives in the fork's own bare-repo config (forge.parent =
+  // <owner>/<name>, written with `git config` at fork time). Reading it is
+  // a plain file read, not a git spawn — the value is forge-written, so the
+  // `[forge]\n\tparent = …` shape is known — which keeps repo cards and
+  // fork counts cheap (Finding 5's cost profile, not worse).
+  function readForkParent(owner, name) {
+    try {
+      const conf = fs.readFileSync(path.join(repoDirOf(owner, name), 'config'), 'utf8');
+      const section = /^\[forge\]\n((?:[ \t]+[^\n]*\n?)*)/m.exec(conf);
+      if (!section) return null;
+      const m = /^[ \t]+parent\s*=\s*(\S+)\s*$/m.exec(section[1]);
+      if (!m) return null;
+      const [po, pn, extra] = m[1].split('/');
+      if (extra !== undefined || !OWNER_NAME.test(po ?? '') || !REPO_NAME.test(pn ?? '')) return null;
+      return { owner: po, name: pn, full: `${po}/${pn}` };
+    } catch { return null; }
+  }
+
+  /** How many repos name <owner>/<name> as forge.parent (bounded scan). */
+  function countForks(owner, name) {
+    const target = `${owner}/${name}`;
+    let count = 0;
+    let scanned = 0;
+    for (const o of listOwners()) {
+      for (const n of listRepoNames(o)) {
+        if (scanned >= 400) return count;
+        scanned += 1;
+        if (readForkParent(o, n)?.full === target) count += 1;
+      }
+    }
+    return count;
+  }
+
+  /** 'ref' or 'owner:ref' -> { owner, ref } (validated), or null. */
+  function parseHeadSpec(baseOwner, headSpec) {
+    if (typeof headSpec !== 'string' || headSpec.length > 320) return null;
+    let headOwner = baseOwner;
+    let ref = headSpec;
+    const c = headSpec.indexOf(':');
+    if (c !== -1) { headOwner = headSpec.slice(0, c); ref = headSpec.slice(c + 1); }
+    if (!OWNER_NAME.test(headOwner) || headOwner.includes('..') || !okRef(ref)) return null;
+    return { owner: headOwner, ref };
+  }
+
+  /**
+   * Resolve the head of a compare/PR: a branch of THIS repo, or
+   * `<owner>:<ref>` — a branch of the named owner's SAME-NAMED repo (the
+   * documented fork rule: lineage is not chased, the name is the link).
+   * Cross-repo heads are path-fetched into the base repo under a hidden,
+   * REUSABLE ref (refs/forge/heads/<owner>/<ref>, force-updated each call
+   * — repeat compares refresh it, nothing to clean up). Both ends of the
+   * fetch are forge-owned paths; no user-supplied URLs.
+   */
+  async function resolveHead(baseOwner, name, headSpec) {
+    const parsed = parseHeadSpec(baseOwner, headSpec);
+    if (!parsed) return null;
+    const dir = repoDirOf(baseOwner, name);
+    if (parsed.owner === baseOwner) {
+      const sha = await revParse(dir, `refs/heads/${parsed.ref}`);
+      return sha ? { ...parsed, repo: name, sha } : null;
+    }
+    const headDir = repoDirOf(parsed.owner, name);
+    if (!fs.existsSync(headDir)) return null;
+    const localRef = `refs/forge/heads/${parsed.owner}/${parsed.ref}`;
+    try {
+      await execFileP('git', ['-C', dir, 'fetch', '--quiet', '--no-tags', headDir,
+        `+refs/heads/${parsed.ref}:${localRef}`], { env: gitEnv, maxBuffer: MAX_EXEC_BUFFER });
+    } catch { return null; }
+    const sha = await revParse(dir, localRef);
+    return sha ? { ...parsed, repo: name, sha } : null;
+  }
+
+  /** Everything a compare view needs, or null (bad refs, no such head). */
+  async function compareData(owner, name, baseRef, headSpec) {
+    if (!okRef(baseRef)) return null;
+    const dir = repoDirOf(owner, name);
+    const baseSha = (await revParse(dir, `refs/heads/${baseRef}`))
+      ?? (await revParse(dir, `refs/tags/${baseRef}^{commit}`))
+      ?? (SHA_RE.test(baseRef) ? await revParse(dir, `${baseRef}^{commit}`) : null);
+    if (!baseSha) return null;
+    const head = await resolveHead(owner, name, headSpec);
+    if (!head) return null;
+    const counts = (await gitText(dir, ['rev-list', '--left-right', '--count', `${baseSha}...${head.sha}`]))
+      .trim().split(/\s+/);
+    const behindBy = +counts[0];
+    const aheadBy = +counts[1];
+    let mergeBase = null;
+    try { mergeBase = (await gitText(dir, ['merge-base', baseSha, head.sha])).trim() || null; } catch { /* unrelated histories */ }
+    const { commits, hasMore } = await commitLog(dir, `${baseSha}..${head.sha}`, 1);
+    const patch = await gitText(dir, ['diff', '--no-color', mergeBase ?? baseSha, head.sha]).catch(() => '');
+    return { baseRef, baseSha, head, aheadBy, behindBy, mergeBase, commits, hasMore, files: parsePatch(patch) };
+  }
+
+  /**
+   * `git merge-tree --write-tree` (git >= 2.38), bare-repo safe: computes
+   * the merged tree without a worktree. Exit 0 -> { clean, tree }; exit 1
+   * -> conflicted file list (--name-only section, deduped).
+   */
+  async function mergeTreeOf(dir, baseSha, headSha) {
+    try {
+      const out = await gitText(dir, ['merge-tree', '--write-tree', '--name-only', baseSha, headSha]);
+      return { clean: true, tree: out.split('\n')[0].trim(), conflicts: [] };
+    } catch (err) {
+      if (err.code === 1 && typeof err.stdout === 'string') {
+        const lines = err.stdout.split('\n');
+        const conflicts = [];
+        for (let i = 1; i < lines.length && lines[i]; i++) {
+          if (!conflicts.includes(lines[i])) conflicts.push(lines[i]);
+        }
+        return { clean: false, tree: null, conflicts };
+      }
+      throw err;
+    }
   }
 
   // ------------------------------------------------------------ issues model
@@ -963,13 +1125,91 @@ export async function activate(api) {
   }
 
   // One writer at a time per repo index — number allocation must not race.
-  const issueLocks = new Map();
-  function withIssueLock(owner, name, fn) {
+  // The same serializer guards the pulls index (and, through it, merges:
+  // a merge mutates refs, so per-repo merge serialization rides the lock).
+  function serializeOn(locks, owner, name, fn) {
     const key = `${owner}/${name}`;
-    const prev = issueLocks.get(key) ?? Promise.resolve();
+    const prev = locks.get(key) ?? Promise.resolve();
     const run = prev.then(fn, fn);
-    issueLocks.set(key, run.then(() => {}, () => {}));
+    locks.set(key, run.then(() => {}, () => {}));
     return run;
+  }
+  const issueLocks = new Map();
+  const withIssueLock = (owner, name, fn) => serializeOn(issueLocks, owner, name, fn);
+  const pullLocks = new Map();
+  const withPullLock = (owner, name, fn) => serializeOn(pullLocks, owner, name, fn);
+
+  // ---------------------------------------------------- pulls model (3a)
+  // Same shape discipline as issues — atomic tmp+rename index at
+  // pluginDir/pulls/<owner>/<repo>.json, bodies in pods (or forge-hosted
+  // for podless agents), thread machinery verbatim. Numbering is SEPARATE
+  // from issues (a documented GitHub deviation — see README).
+  const pullsDir = path.join(api.storage.pluginDir(), 'pulls');
+  fs.mkdirSync(pullsDir, { recursive: true });
+  const pullIndexPathOf = (owner, name) => path.join(pullsDir, owner, `${name}.json`);
+
+  function loadPullIndex(owner, name) {
+    try {
+      const idx = JSON.parse(fs.readFileSync(pullIndexPathOf(owner, name), 'utf8'));
+      if (idx && Number.isInteger(idx.next) && idx.next >= 1 && idx.pulls && typeof idx.pulls === 'object') {
+        return idx;
+      }
+    } catch { /* no pulls yet */ }
+    return { next: 1, pulls: {} };
+  }
+  function savePullIndex(owner, name, idx) {
+    const file = pullIndexPathOf(owner, name);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${crypto.randomUUID()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(idx)); // atomic: tmp + rename
+    fs.renameSync(tmp, file);
+  }
+  function openPullCount(owner, name) {
+    return Object.values(loadPullIndex(owner, name).pulls).filter((p) => p.state === 'open').length;
+  }
+
+  /** The head of a PR as a compare spec (owner:ref — same-repo included). */
+  const prHeadSpec = (pr) => `${pr.head.owner}:${pr.head.ref}`;
+
+  /**
+   * Live mergeability for an OPEN PR's banner/JSON: resolves both ends
+   * (re-fetching the fork head), then ff-check or merge-tree. mergeable is
+   * null when an end is gone or merge-tree is unavailable.
+   */
+  async function pullMergeInfo(owner, name, pr) {
+    const dir = repoDirOf(owner, name);
+    const baseSha = await revParse(dir, `refs/heads/${pr.base}`);
+    const head = await resolveHead(owner, name, prHeadSpec(pr));
+    const info = { baseSha, headSha: head?.sha ?? null, mergeable: null, conflicts: [], fastForward: false, upToDate: false };
+    if (!baseSha || !head) return info;
+    if (await isAncestor(dir, head.sha, baseSha)) {
+      return { ...info, mergeable: false, upToDate: true }; // nothing to merge
+    }
+    if (await isAncestor(dir, baseSha, head.sha)) {
+      return { ...info, mergeable: true, fastForward: true };
+    }
+    if (!mergeTreeOk) return info;
+    const mt = await mergeTreeOf(dir, baseSha, head.sha);
+    return { ...info, mergeable: mt.clean, conflicts: mt.conflicts };
+  }
+
+  /**
+   * Commit list + structured diff for a PR's Commits / Files-changed tabs.
+   * Merged PRs use the shas frozen at merge time (the objects outlive the
+   * branch), open/closed ones compute live from base...head.
+   */
+  async function pullDiffData(owner, name, pr) {
+    const dir = repoDirOf(owner, name);
+    if (pr.state === 'merged' && pr.merged?.baseSha && pr.merged?.headSha) {
+      const { baseSha, headSha } = pr.merged;
+      let mergeBase = null;
+      try { mergeBase = (await gitText(dir, ['merge-base', baseSha, headSha])).trim() || null; } catch { /* kept shas */ }
+      const { commits, hasMore } = await commitLog(dir, `${baseSha}..${headSha}`, 1);
+      const patch = await gitText(dir, ['diff', '--no-color', mergeBase ?? baseSha, headSha]).catch(() => '');
+      return { commits, hasMore, files: parsePatch(patch) };
+    }
+    const cmp = await compareData(owner, name, pr.base, prHeadSpec(pr));
+    return cmp ? { commits: cmp.commits, hasMore: cmp.hasMore, files: cmp.files } : { commits: [], hasMore: false, files: [] };
   }
 
   /**
@@ -995,6 +1235,23 @@ export async function activate(api) {
     if (put.status === 401 || put.status === 403) return { status: 403, error: 'your pod refused the write' };
     if (!(put.ok || put.status === 204)) return { status: 502, error: `pod write failed (${put.status})` };
     return { url: `${publicOrigin()}${resourcePath}` };
+  }
+
+  /**
+   * The one storage beat for authored words (tier-2 semantics, shared by
+   * issues and pulls): pod users get a loopback PUT into their own pod,
+   * podless did:nostr agents get forge-hosted storage. Returns
+   * { url, hosted } or { status, error }.
+   */
+  async function persistBody(request, agent, owner, name, doc, filePrefix) {
+    const podPath = podPathFromAgent(agent);
+    const hex = nostrHexOf(agent);
+    if (!podPath && !hex) return { status: 403, error: 'no pod namespace for this agent' };
+    const stored = hex
+      ? storeHosted(hex, { ...doc, hosted: true })
+      : await storeAuthored(request, podPath, owner, name, doc, `${filePrefix}-${crypto.randomUUID()}.jsonld`);
+    if (stored.error) return stored;
+    return { url: stored.url, hosted: !!hex };
   }
 
   /** Loopback path of a stored resource URL (absolute or path form). */
@@ -1218,9 +1475,11 @@ ${body}
   function repoStrip(owner, name, tab, branch) {
     const base = `${prefix}/${owner}/${name}`;
     const open = openIssueCount(owner, name);
+    const openPulls = openPullCount(owner, name);
     const tabs = [
       ['code', 'Code', base],
       ['issues', `Issues${open ? ` <span class="badge">${open}</span>` : ''}`, `${base}/issues`],
+      ['pulls', `${ICON_PR_TAB} Pull requests${openPulls ? ` <span class="badge">${openPulls}</span>` : ''}`, `${base}/pulls`],
       ['commits', 'Commits', `${base}/commits/${branch}`],
       ['branches', 'Branches', `${base}/branches`],
       ['tags', 'Tags', `${base}/tags`],
@@ -1270,6 +1529,7 @@ ${body}
     cards.sort((a, b) => (b.lastPush ?? 0) - (a.lastPush ?? 0));
     const body = cards.length ? cards.map((r) => `<div class="repocard">
 <h3>${ICON_REPO} <a href="${prefix}/${r.owner}">${esc(dispOwner(r.owner))}</a><span class="muted">/</span><a href="${prefix}/${r.owner}/${r.name}"><b>${esc(r.name)}</b></a> <span class="badge">${privateRepos ? 'Private' : 'Public'}</span></h3>
+${r.parent ? `<div class="muted" style="font-size:12px">forked from <a href="${prefix}/${r.parent}">${esc(r.parent)}</a></div>` : ''}
 ${r.description ? `<div class="muted">${esc(r.description)}</div>` : ''}
 ${r.lastPush ? `<div class="muted" style="font-size:12px;margin-top:4px">Updated ${relTime(r.lastPush)}</div>` : '<div class="muted" style="font-size:12px;margin-top:4px">Empty repository</div>'}
 </div>`).join('\n')
@@ -1289,6 +1549,7 @@ git push forge main</pre></div>`;
     cards.sort((a, b) => (b.lastPush ?? 0) - (a.lastPush ?? 0));
     const body = cards.map((r) => `<div class="repocard">
 <h3>${ICON_REPO} <a href="${prefix}/${r.owner}/${r.name}"><b>${esc(r.name)}</b></a> <span class="badge">${privateRepos ? 'Private' : 'Public'}</span></h3>
+${r.parent ? `<div class="muted" style="font-size:12px">forked from <a href="${prefix}/${r.parent}">${esc(r.parent)}</a></div>` : ''}
 ${r.description ? `<div class="muted">${esc(r.description)}</div>` : ''}
 ${r.lastPush ? `<div class="muted" style="font-size:12px;margin-top:4px">Updated ${relTime(r.lastPush)}</div>` : '<div class="muted" style="font-size:12px;margin-top:4px">Empty repository</div>'}
 </div>`).join('\n') || '<p class="muted">No repositories.</p>';
@@ -1336,15 +1597,29 @@ ${r.lastPush ? `<div class="muted" style="font-size:12px;margin-top:4px">Updated
     return `<div class="readme"><div class="rtitle">${esc(readme.name)}</div><div class="markdown-body">${inner}</div></div>`;
   }
 
+  /** "forked from parent / N forks" line under the repo crumb, or ''. */
+  function lineageLine(owner, name, parent) {
+    const bits = [];
+    if (parent) {
+      bits.push(`forked from <a href="${prefix}/${parent.owner}/${parent.name}">${esc(dispOwner(parent.owner))}/${esc(parent.name)}</a>`);
+    }
+    const forks = countForks(owner, name);
+    if (forks) bits.push(`${forks} fork${forks === 1 ? '' : 's'}`);
+    return bits.length ? `<p class="muted" style="margin:0 0 12px;font-size:13px">${bits.join(' &middot; ')}</p>` : '';
+  }
+
   async function repoHome(reply, owner, name) {
     const dir = repoDirOf(owner, name);
     const branch = await defaultBranch(dir);
     const branches = await listRefs(dir, 'heads');
     const tags = await listRefs(dir, 'tags');
     const base = `${prefix}/${owner}/${name}`;
+    const parent = readForkParent(owner, name);
+    const lineage = lineageLine(owner, name, parent);
 
     if (!branches.length) {
       const body = `${repoStrip(owner, name, 'code', branch)}<main><div class="container">
+${lineage}
 <div style="display:flex;justify-content:flex-end">${cloneBox(owner, name)}</div>
 <div class="empty"><h3>This repository is empty</h3>
 <p class="muted">Push an existing repository to populate it:</p>
@@ -1353,11 +1628,24 @@ git push -u forge ${esc(branch)}</pre></div></div></main>`;
       return sendHtml(reply, 200, page(`${owner}/${name} · Forge`, body));
     }
 
+    // A recently pushed non-default branch on a FORK earns a gentle
+    // "open a PR?" hint — cheap: the branch list is already in hand.
+    let pushHint = '';
+    if (parent && repoExists(parent.owner, parent.name)) {
+      const recent = branches.find((b) => b.name !== branch && (Date.now() / 1000 - b.when) < 3600);
+      if (recent) {
+        const parentBranch = await defaultBranch(repoDirOf(parent.owner, parent.name));
+        pushHint = `<div class="pushhint">${ICON_BRANCH} <b>${esc(recent.name)}</b> had recent pushes ${relTime(recent.when)} &mdash;
+<a href="${prefix}/${parent.owner}/${parent.name}/compare/${esc(parentBranch)}...${owner}:${esc(recent.name)}">open a pull request?</a></div>`;
+      }
+    }
+
     const entries = await lsTree(dir, branch, '');
     const tip = await lastCommit(dir, branch, '');
     const readme = await findReadme(dir, branch, entries);
     const description = repoDescription(owner, name);
     const body = `${repoStrip(owner, name, 'code', branch)}<main><div class="container">
+${lineage}${pushHint}
 ${description ? `<p class="muted" style="margin:0 0 16px">${esc(description)}</p>` : ''}
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
 ${branchSelector(owner, name, 'tree', branch, branches, tags, '')}
@@ -1543,8 +1831,9 @@ ${kind === 'branches' && r.name === branch ? '<span class="badge">default</span>
   // textContent/createElement only; fetched strings never meet innerHTML.
 
   function issuesScript(cfg) {
-    // cfg values are validated owner/repo names and numbers — JSON.stringify
-    // of them cannot contain quotes, angle brackets, or a </script> breaker.
+    // cfg values are validated owner/repo names, refs (okRef/OWNER_NAME —
+    // no quotes or angle brackets possible), shas and numbers —
+    // JSON.stringify of them cannot contain a </script> breaker.
     // The vendored xlogin widget loads first (script-src 'self'); when it is
     // present the auth area offers its button beside the local
     // username/password fallback, and writes go through
@@ -1560,7 +1849,7 @@ function el(tag,props){const e=document.createElement(tag);Object.assign(e,props
   for(let i=2;i<arguments.length;i++)e.append(arguments[i]);return e}
 function setMsg(text){const m=document.getElementById('form-msg');if(m)m.textContent=text}
 function shortId(id){return id.length>28?id.slice(0,16)+'…'+id.slice(-6):id}
-function wireForms(){for(const id of ['submit-issue','submit-comment','toggle-state']){
+function wireForms(){for(const id of ['submit-issue','submit-comment','toggle-state','submit-pull','do-merge']){
   const b=document.getElementById(id);if(b)b.disabled=!(T()||X())}}
 function renderAuth(){
   const box=document.getElementById('forge-auth');if(!box)return;
@@ -1622,11 +1911,20 @@ if(si)si.onclick=async function(){
     location.href=CFG.base+'/issues/'+r.number;
   }catch(e){setMsg(String(e.message||e))}
 };
+const sp=document.getElementById('submit-pull');
+if(sp)sp.onclick=async function(){
+  setMsg('');
+  try{
+    const r=await call('/pulls',{title:document.getElementById('f-title').value,
+      body:document.getElementById('f-body').value,base:CFG.prBase,head:CFG.prHead});
+    location.href=CFG.base+'/pulls/'+r.number;
+  }catch(e){setMsg(String(e.message||e))}
+};
 const sc=document.getElementById('submit-comment');
 if(sc)sc.onclick=async function(){
   setMsg('');
   try{
-    await call('/issues/'+CFG.issue+'/comments',{body:document.getElementById('f-body').value});
+    await call(CFG.thread+'/comments',{body:document.getElementById('f-body').value});
     location.reload();
   }catch(e){setMsg(String(e.message||e))}
 };
@@ -1634,7 +1932,15 @@ const ts=document.getElementById('toggle-state');
 if(ts)ts.onclick=async function(){
   setMsg('');
   try{
-    await call('/issues/'+CFG.issue+'/'+(CFG.state==='open'?'close':'reopen'),{});
+    await call(CFG.thread+'/'+(CFG.state==='open'?'close':'reopen'),{});
+    location.reload();
+  }catch(e){setMsg(String(e.message||e))}
+};
+const mg=document.getElementById('do-merge');
+if(mg)mg.onclick=async function(){
+  setMsg('');
+  try{
+    await call(CFG.thread+'/merge',{expectedBase:CFG.expectedBase});
     location.reload();
   }catch(e){setMsg(String(e.message||e))}
 };
@@ -1685,6 +1991,22 @@ ${pager}
     return sendHtml(reply, 200, page(`Issues · ${owner}/${name}`, body));
   }
 
+  /** The comment boxes of a thread — issues and pulls render identically. */
+  function threadBoxes(entries, ctx, owner, openVerb) {
+    return entries.map((e, i) => {
+      const who = displayName(e.author);
+      const ownerBadge = ownerFromAgent(e.author) === owner ? ' <span class="badge">owner</span>' : '';
+      // Podless authors: their words live in pluginDir, not a pod — say so.
+      const hostedTag = e.hosted ? ' <span class="badge">hosted by the forge</span>' : '';
+      const head = `${identicon(who)} <a href="${esc(authorHref(e.author))}"><b>${esc(who)}</b></a>${ownerBadge}${hostedTag}
+<span class="muted">${i === 0 ? openVerb : 'commented'} ${relTime(e.at)}</span>`;
+      const slot = e.removed
+        ? '<div class="removed">content removed by its author</div>'
+        : `<div class="markdown-body">${renderMarkdown(e.body, ctx)}</div>`;
+      return `<div class="cbox"><div class="chead">${head}</div>${slot}</div>`;
+    }).join('\n');
+  }
+
   async function issueThreadPage(reply, owner, name, number) {
     const idx = loadIssueIndex(owner, name);
     const issue = idx.issues[number];
@@ -1693,18 +2015,7 @@ ${pager}
     const entries = await resolveThread(issue.thread);
     const ctx = issueMdCtx(owner, name);
     const base = `${prefix}/${owner}/${name}`;
-    const boxes = entries.map((e, i) => {
-      const who = displayName(e.author);
-      const ownerBadge = ownerFromAgent(e.author) === owner ? ' <span class="badge">owner</span>' : '';
-      // Podless authors: their words live in pluginDir, not a pod — say so.
-      const hostedTag = e.hosted ? ' <span class="badge">hosted by the forge</span>' : '';
-      const head = `${identicon(who)} <a href="${esc(authorHref(e.author))}"><b>${esc(who)}</b></a>${ownerBadge}${hostedTag}
-<span class="muted">${i === 0 ? 'opened this issue' : 'commented'} ${relTime(e.at)}</span>`;
-      const slot = e.removed
-        ? '<div class="removed">content removed by its author</div>'
-        : `<div class="markdown-body">${renderMarkdown(e.body, ctx)}</div>`;
-      return `<div class="cbox"><div class="chead">${head}</div>${slot}</div>`;
-    }).join('\n');
+    const boxes = threadBoxes(entries, ctx, owner, 'opened this issue');
     const open = issue.state === 'open';
     const nComments = issue.thread.length - 1;
     const body = `${repoStrip(owner, name, 'issues', branch)}<main><div class="container">
@@ -1724,7 +2035,7 @@ ${authBox('Commenting, closing, or reopening')}
 <button id="submit-comment" class="btn btn-primary" type="button" disabled>Comment</button>
 </div></div></div>
 </div></main>
-${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: issue.number, state: issue.state })}`;
+${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: `/issues/${issue.number}`, state: issue.state })}`;
     return sendHtml(reply, 200, page(`${issue.title} · #${issue.number} · ${owner}/${name}`, body));
   }
 
@@ -1743,8 +2054,222 @@ ${authBox('Opening an issue')}
 <button id="submit-issue" class="btn btn-primary" type="button" disabled>Submit new issue</button>
 </div></div></div>
 </div></main>
-${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null, state: null })}`;
+${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null, state: null })}`;
     return sendHtml(reply, 200, page(`New issue · ${owner}/${name}`, body));
+  }
+
+  // -------------------------------------------- compare + pulls pages (3a)
+
+  const PR_STATE = {
+    open: { icon: ICON_PR_OPEN, pill: 'state-open', label: 'Open' },
+    merged: { icon: ICON_PR_MERGED, pill: 'state-merged', label: 'Merged' },
+    closed: { icon: ICON_PR_CLOSED, pill: 'state-closed-red', label: 'Closed' },
+  };
+
+  function commitRows(owner, name, commits) {
+    const base = `${prefix}/${owner}/${name}`;
+    return commits.map((c) => `<div class="row">${identicon(c.email)}
+<div class="grow"><div><a href="${base}/commit/${c.sha}" style="color:#1f2328;font-weight:600">${esc(c.subject)}</a></div>
+<div class="muted" style="font-size:12px"><b>${esc(c.author)}</b> committed ${relTime(c.at)}</div></div>
+<a class="sha" href="${base}/commit/${c.sha}">${esc(c.short)}</a></div>`).join('\n');
+  }
+
+  async function comparePage(reply, owner, name, spec) {
+    const dots = spec.indexOf('...');
+    if (dots < 1) return notFound(reply);
+    const baseRef = spec.slice(0, dots);
+    const headSpec = spec.slice(dots + 3);
+    const cmp = await compareData(owner, name, baseRef, headSpec);
+    if (!cmp) return notFound(reply);
+    const branch = await defaultBranch(repoDirOf(owner, name));
+    const base = `${prefix}/${owner}/${name}`;
+    const headLabel = `${dispOwner(cmp.head.owner)}:${cmp.head.ref}`;
+    const prHref = `${base}/pulls/new?base=${encodeURIComponent(baseRef)}&head=${encodeURIComponent(headSpec)}`;
+    const n = cmp.commits.length;
+    const body = `${repoStrip(owner, name, 'pulls', branch)}<main><div class="container">
+<h1 class="page">Comparing <span class="mono">${esc(baseRef)}...${esc(headLabel)}</span></h1>
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+<span class="aheadbehind">${cmp.aheadBy} ahead, ${cmp.behindBy} behind ${esc(baseRef)}</span>
+${cmp.aheadBy ? `<a class="btn btn-primary" href="${prHref}">Open pull request</a>` : '<span class="muted">Nothing to compare: the base contains the head.</span>'}
+</div>
+<h3>${n}${cmp.hasMore ? '+' : ''} commit${n === 1 ? '' : 's'}</h3>
+<div class="list" style="margin-bottom:20px">${commitRows(owner, name, cmp.commits) || '<div class="row muted">No commits.</div>'}</div>
+${renderDiff(cmp.files)}
+</div></main>`;
+    return sendHtml(reply, 200, page(`Comparing ${baseRef}...${headLabel} · ${owner}/${name}`, body));
+  }
+
+  async function pullsListPage(reply, owner, name, query) {
+    const branch = await defaultBranch(repoDirOf(owner, name));
+    const idx = loadPullIndex(owner, name);
+    const all = Object.values(idx.pulls).sort((a, b) => b.number - a.number);
+    const count = (s) => all.filter((p) => p.state === s).length;
+    const state = ['merged', 'closed'].includes(query?.state) ? query.state : 'open';
+    const pageNo = Math.max(1, Math.min(10000, parseInt(query?.page, 10) || 1));
+    const filtered = all.filter((p) => p.state === state);
+    const slice = filtered.slice((pageNo - 1) * ISSUES_PER_PAGE, pageNo * ISSUES_PER_PAGE);
+    const base = `${prefix}/${owner}/${name}`;
+    const rows = slice.map((p) => {
+      const nc = p.thread.length - 1;
+      return `<div class="row">${PR_STATE[p.state].icon}
+<div class="grow"><a class="ititle" href="${base}/pulls/${p.number}">${esc(p.title)}</a>
+<div class="muted" style="font-size:12px">#${p.number} opened ${relTime(p.createdAt)} by <a href="${esc(authorHref(p.author))}">${esc(displayName(p.author))}</a>
+&middot; <span class="mono">${esc(dispOwner(p.head.owner))}:${esc(p.head.ref)} &rarr; ${esc(p.base)}</span></div></div>
+${nc ? `<span class="muted" style="font-size:12px">${nc} comment${nc === 1 ? '' : 's'}</span>` : ''}</div>`;
+    }).join('\n');
+    const filterTabs = `<div class="fstate">
+<a class="${state === 'open' ? 'active' : ''}" href="${base}/pulls?state=open">${ICON_PR_OPEN} ${count('open')} Open</a>
+<a class="${state === 'merged' ? 'active' : ''}" href="${base}/pulls?state=merged">${ICON_PR_MERGED} ${count('merged')} Merged</a>
+<a class="${state === 'closed' ? 'active' : ''}" href="${base}/pulls?state=closed">${ICON_PR_CLOSED} ${count('closed')} Closed</a>
+</div>`;
+    const pager = `<div class="pager">
+${pageNo > 1 ? `<a class="btn" href="${base}/pulls?state=${state}&page=${pageNo - 1}">&larr; Newer</a>` : ''}
+${filtered.length > pageNo * ISSUES_PER_PAGE ? `<a class="btn" href="${base}/pulls?state=${state}&page=${pageNo + 1}">Older &rarr;</a>` : ''}
+</div>`;
+    const body = `${repoStrip(owner, name, 'pulls', branch)}<main><div class="container">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+<h1 class="page" style="margin:0">Pull requests</h1>
+</div>
+<div class="list">${filterTabs}${rows || `<div class="row muted">No ${state} pull requests.</div>`}</div>
+${pager}
+</div></main>`;
+    return sendHtml(reply, 200, page(`Pull requests · ${owner}/${name}`, body));
+  }
+
+  function pullSubTabs(base, number, active) {
+    const tabs = [
+      ['conversation', 'Conversation', `${base}/pulls/${number}`],
+      ['commits', 'Commits', `${base}/pulls/${number}/commits`],
+      ['files', 'Files changed', `${base}/pulls/${number}/files`],
+    ].map(([id, label, href]) => `<a class="${active === id ? 'active' : ''}" href="${href}">${label}</a>`).join('\n');
+    return `<div class="fstate" style="border:1px solid #d0d7de;border-radius:8px;margin-bottom:16px">${tabs}</div>`;
+  }
+
+  function pullHeadline(pr) {
+    const st = PR_STATE[pr.state];
+    const who = pr.state === 'merged' ? displayName(pr.merged?.mergedBy ?? pr.author) : displayName(pr.author);
+    const verb = pr.state === 'merged'
+      ? `merged ${(pr.merged?.headSha ?? '').slice(0, 7) ? `<span class="sha">${esc(pr.merged.headSha.slice(0, 7))}</span> ` : ''}into <b>${esc(pr.base)}</b> ${relTime(pr.merged?.at ?? pr.createdAt)}`
+      : `wants to merge <span class="mono">${esc(dispOwner(pr.head.owner))}:${esc(pr.head.ref)}</span> into <b>${esc(pr.base)}</b>`;
+    return `<div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+<span class="state-pill ${st.pill}">${st.label}</span>
+<span class="muted"><b>${esc(who)}</b> ${verb}</span>
+</div>`;
+  }
+
+  async function pullPage(reply, owner, name, number) {
+    const pr = loadPullIndex(owner, name).pulls[number];
+    if (!pr) return notFound(reply);
+    const branch = await defaultBranch(repoDirOf(owner, name));
+    const entries = await resolveThread(pr.thread);
+    const ctx = issueMdCtx(owner, name);
+    const base = `${prefix}/${owner}/${name}`;
+    const boxes = threadBoxes(entries, ctx, owner, 'opened this pull request');
+    const open = pr.state === 'open';
+    const info = open ? await pullMergeInfo(owner, name, pr) : null;
+
+    // The state banner: merged (purple), closed (red), open with a clean /
+    // conflicting / unavailable merge verdict (GitHub's beats).
+    let mergeBox = '';
+    if (pr.state === 'merged') {
+      mergeBox = `<div class="mergebox"><h3>${ICON_PR_MERGED} Merged</h3>
+<div class="muted">merge commit <span class="sha">${esc((pr.merged?.sha ?? '').slice(0, 12))}</span> by <b>${esc(displayName(pr.merged?.mergedBy ?? ''))}</b> ${relTime(pr.merged?.at ?? pr.createdAt)}${pr.merged?.fastForward ? ' (fast-forward)' : ''}</div></div>`;
+    } else if (pr.state === 'closed') {
+      mergeBox = `<div class="mergebox"><h3>${ICON_PR_CLOSED} Closed</h3>
+<div class="muted">This pull request was closed without merging.</div></div>`;
+    } else if (info.mergeable === true) {
+      mergeBox = `<div class="mergebox clean"><h3 class="clean-note">This branch has no conflicts with the base branch</h3>
+<div class="muted" style="margin-bottom:8px">${info.fastForward ? 'Fast-forward merge (no merge commit needed).' : 'A merge commit will join the histories.'}</div>
+<button id="do-merge" class="btn btn-primary" type="button" disabled>Merge pull request</button></div>`;
+    } else if (info.mergeable === false && info.upToDate) {
+      mergeBox = `<div class="mergebox"><h3>Nothing to merge</h3>
+<div class="muted">The base branch already contains every commit of this branch.</div></div>`;
+    } else if (info.mergeable === false) {
+      mergeBox = `<div class="mergebox conflict"><h3 class="conflict-note">This branch has conflicts that must be resolved</h3>
+<div class="muted">Conflicting file${info.conflicts.length === 1 ? '' : 's'}:</div>
+<ul>${info.conflicts.map((c) => `<li><code>${esc(c)}</code></li>`).join('')}</ul></div>`;
+    } else {
+      mergeBox = `<div class="mergebox"><h3>Merge status unknown</h3>
+<div class="muted">${mergeTreeOk ? 'The head branch (or the base branch) is no longer available.' : `This server's ${esc(gitVersion)} lacks merge-tree --write-tree (needs git &ge; 2.38).`}</div></div>`;
+    }
+
+    const nComments = pr.thread.length - 1;
+    const body = `${repoStrip(owner, name, 'pulls', branch)}<main><div class="container">
+<h1 class="page" style="margin-bottom:8px">${esc(pr.title)} <span class="muted" style="font-weight:400">#${pr.number}</span></h1>
+${pullHeadline(pr)}
+${pullSubTabs(base, pr.number, 'conversation')}
+${boxes}
+${mergeBox}
+${authBox('Commenting, merging, closing, or reopening')}
+<div class="cbox issueform"><div class="chead"><b>Add a comment</b> <span class="muted">(stored in YOUR pod, markdown supported)</span></div>
+<div style="padding:16px">
+<textarea id="f-body" placeholder="Leave a comment"></textarea>
+<div style="display:flex;justify-content:flex-end;align-items:center;gap:8px">
+<span id="form-msg" class="formmsg"></span>
+${pr.state !== 'merged' ? `<button id="toggle-state" class="btn" type="button" disabled>${open ? 'Close pull request' : 'Reopen pull request'}</button>` : ''}
+<button id="submit-comment" class="btn btn-primary" type="button" disabled>Comment</button>
+</div></div></div>
+</div></main>
+${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: `/pulls/${pr.number}`, state: pr.state, expectedBase: info?.baseSha ?? null })}`;
+    return sendHtml(reply, 200, page(`${pr.title} · #${pr.number} · ${owner}/${name}`, body));
+  }
+
+  async function pullCommitsPage(reply, owner, name, number) {
+    const pr = loadPullIndex(owner, name).pulls[number];
+    if (!pr) return notFound(reply);
+    const branch = await defaultBranch(repoDirOf(owner, name));
+    const { commits, hasMore } = await pullDiffData(owner, name, pr);
+    const base = `${prefix}/${owner}/${name}`;
+    const body = `${repoStrip(owner, name, 'pulls', branch)}<main><div class="container">
+<h1 class="page" style="margin-bottom:8px">${esc(pr.title)} <span class="muted" style="font-weight:400">#${pr.number}</span></h1>
+${pullHeadline(pr)}
+${pullSubTabs(base, pr.number, 'commits')}
+<div class="list">${commitRows(owner, name, commits) || '<div class="row muted">No commits.</div>'}</div>
+${hasMore ? '<p class="muted">Only the first 30 commits are shown.</p>' : ''}
+</div></main>`;
+    return sendHtml(reply, 200, page(`Commits · #${pr.number} · ${owner}/${name}`, body));
+  }
+
+  async function pullFilesPage(reply, owner, name, number) {
+    const pr = loadPullIndex(owner, name).pulls[number];
+    if (!pr) return notFound(reply);
+    const branch = await defaultBranch(repoDirOf(owner, name));
+    const { files } = await pullDiffData(owner, name, pr);
+    const base = `${prefix}/${owner}/${name}`;
+    const body = `${repoStrip(owner, name, 'pulls', branch)}<main><div class="container">
+<h1 class="page" style="margin-bottom:8px">${esc(pr.title)} <span class="muted" style="font-weight:400">#${pr.number}</span></h1>
+${pullHeadline(pr)}
+${pullSubTabs(base, pr.number, 'files')}
+${renderDiff(files)}
+</div></main>`;
+    return sendHtml(reply, 200, page(`Files changed · #${pr.number} · ${owner}/${name}`, body));
+  }
+
+  async function newPullPage(reply, owner, name, query) {
+    const baseRef = typeof query?.base === 'string' ? query.base : '';
+    const headSpec = typeof query?.head === 'string' ? query.head : '';
+    const cmp = await compareData(owner, name, baseRef, headSpec);
+    if (!cmp) return notFound(reply);
+    const branch = await defaultBranch(repoDirOf(owner, name));
+    const base = `${prefix}/${owner}/${name}`;
+    const headLabel = `${dispOwner(cmp.head.owner)}:${cmp.head.ref}`;
+    const body = `${repoStrip(owner, name, 'pulls', branch)}<main><div class="container">
+<h1 class="page">Open a pull request</h1>
+<p class="muted"><span class="mono">${esc(headLabel)}</span> &rarr; <b>${esc(baseRef)}</b>
+&middot; <span class="aheadbehind">${cmp.aheadBy} commit${cmp.aheadBy === 1 ? '' : 's'} ahead</span>
+&middot; <a href="${base}/compare/${esc(baseRef)}...${esc(headSpec)}">view the full comparison</a></p>
+${authBox('Opening a pull request')}
+<div class="cbox issueform"><div class="chead"><b>Describe the change</b> <span class="muted">(the body is stored in YOUR pod, markdown supported)</span></div>
+<div style="padding:16px">
+<input type="text" id="f-title" placeholder="Title">
+<textarea id="f-body" placeholder="What does this change, and why?"></textarea>
+<div style="display:flex;justify-content:flex-end;align-items:center;gap:8px">
+<span id="form-msg" class="formmsg"></span>
+<button id="submit-pull" class="btn btn-primary" type="button" disabled>Create pull request</button>
+</div></div></div>
+</div></main>
+${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null, state: null, prBase: baseRef, prHead: headSpec })}`;
+    return sendHtml(reply, 200, page(`New pull request · ${owner}/${name}`, body));
   }
 
   function notFound(reply) {
@@ -1806,6 +2331,8 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
       name,
       description: summary.description,
       lastPush: summary.lastPush,
+      parent: summary.parent, // additive (3a): "<owner>/<name>" | null
+      forks: countForks(owner, name), // additive (3a)
       empty: branches.length === 0,
       defaultBranch: branch,
       branches,
@@ -2107,6 +2634,344 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
     return apiErr(reply, 404, 'not found');
   }
 
+  // ---- tier 3a: forks, compare, pull requests with real merges ----------
+
+  /**
+   * POST api/repos/<o>/<n>/fork — `git clone --local --bare` into the
+   * CALLER's namespace (same name; optional {name} override so an owner
+   * can fork their own repo — GitHub allows self-forks, and a same-name
+   * self-fork would always collide). 409 when the target exists. Lineage
+   * is recorded in the fork's git config (forge.parent = <o>/<n>).
+   */
+  async function apiForkCreate(request, reply, owner, name) {
+    const p = await readJsonBody(request); // body before auth (NIP-98 payload tag)
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    const caller = ownerFromAgent(agent);
+    if (!caller) return apiErr(reply, 403, 'no namespace for this agent');
+    let target = name;
+    if (p && p.name !== undefined) {
+      if (typeof p.name !== 'string' || !REPO_NAME.test(p.name) || p.name.includes('..') || p.name.endsWith('.git')) {
+        return apiErr(reply, 422, 'invalid fork name');
+      }
+      target = p.name;
+    }
+    if (repoExists(caller, target)) return apiErr(reply, 409, `${caller}/${target} already exists`);
+    const dir = repoDirOf(caller, target);
+    fs.mkdirSync(path.join(reposDir, caller), { recursive: true });
+    await execFileP('git', ['clone', '--local', '--bare', '--quiet', repoDirOf(owner, name), dir],
+      { env: gitEnv, maxBuffer: MAX_EXEC_BUFFER });
+    await execFileP('git', ['-C', dir, 'config', 'http.receivepack', 'true'], { env: gitEnv });
+    await execFileP('git', ['-C', dir, 'config', 'forge.parent', `${owner}/${name}`], { env: gitEnv });
+    // the clone's origin remote is an internal filesystem path — drop it
+    await execFileP('git', ['-C', dir, 'remote', 'remove', 'origin'], { env: gitEnv }).catch(() => {});
+    fs.writeFileSync(path.join(dir, 'hooks', 'post-receive'), POST_RECEIVE_HOOK, { mode: 0o755 });
+    fs.writeFileSync(path.join(dir, META_FILE),
+      JSON.stringify({ createdAt: Date.now(), creator: agent, forkedFrom: `${owner}/${name}` }, null, 2));
+    api.log.info(`forge: ${agent} forked ${owner}/${name} -> ${caller}/${target}`);
+    return sendJson(reply, 201, {
+      owner: caller,
+      name: target,
+      parent: `${owner}/${name}`,
+      url: `${prefix}/${caller}/${target}`,
+      cloneUrl: cloneUrlOf(caller, target),
+    });
+  }
+
+  async function apiCompare(reply, owner, name, spec) {
+    const dots = spec.indexOf('...');
+    if (dots < 1) return apiErr(reply, 404, 'not found');
+    const cmp = await compareData(owner, name, spec.slice(0, dots), spec.slice(dots + 3));
+    if (!cmp) return apiErr(reply, 404, 'not found');
+    return sendJson(reply, 200, {
+      base: { ref: cmp.baseRef, sha: cmp.baseSha },
+      head: { owner: cmp.head.owner, repo: cmp.head.repo, ref: cmp.head.ref, sha: cmp.head.sha },
+      aheadBy: cmp.aheadBy,
+      behindBy: cmp.behindBy,
+      mergeBase: cmp.mergeBase,
+      hasMore: cmp.hasMore,
+      commits: cmp.commits,
+      files: cmp.files,
+    });
+  }
+
+  function apiPullList(reply, owner, name, query) {
+    const idx = loadPullIndex(owner, name);
+    const all = Object.values(idx.pulls).sort((a, b) => b.number - a.number);
+    const count = (s) => all.filter((p) => p.state === s).length;
+    const state = ['merged', 'closed'].includes(query?.state) ? query.state : 'open';
+    const pageNo = Math.max(1, Math.min(10000, parseInt(query?.page, 10) || 1));
+    const filtered = all.filter((p) => p.state === state);
+    return sendJson(reply, 200, {
+      state,
+      page: pageNo,
+      perPage: ISSUES_PER_PAGE,
+      hasMore: filtered.length > pageNo * ISSUES_PER_PAGE,
+      openCount: count('open'),
+      mergedCount: count('merged'),
+      closedCount: count('closed'),
+      pulls: filtered.slice((pageNo - 1) * ISSUES_PER_PAGE, pageNo * ISSUES_PER_PAGE).map((p) => ({
+        number: p.number,
+        title: p.title,
+        state: p.state,
+        author: p.author,
+        authorInfo: authorMeta(p.author),
+        createdAt: p.createdAt,
+        base: p.base,
+        head: p.head,
+        merged: p.merged ?? null,
+        comments: p.thread.length - 1,
+      })),
+    });
+  }
+
+  async function apiPullGet(reply, owner, name, number) {
+    const pr = loadPullIndex(owner, name).pulls[number];
+    if (!pr) return apiErr(reply, 404, 'not found');
+    const resolved = await resolveThread(pr.thread);
+    const ctx = issueMdCtx(owner, name);
+    const info = pr.state === 'open'
+      ? await pullMergeInfo(owner, name, pr)
+      : { baseSha: await revParse(repoDirOf(owner, name), `refs/heads/${pr.base}`), headSha: null, mergeable: null, conflicts: [], fastForward: false };
+    return sendJson(reply, 200, {
+      number: pr.number,
+      title: pr.title,
+      state: pr.state,
+      author: pr.author,
+      authorInfo: authorMeta(pr.author),
+      createdAt: pr.createdAt,
+      base: pr.base,
+      baseSha: info.baseSha,
+      head: { ...pr.head, sha: info.headSha ?? undefined },
+      merged: pr.merged ?? null,
+      mergeable: info.mergeable,
+      conflicts: info.conflicts,
+      thread: resolved.map((e) => ({
+        ...e,
+        authorInfo: authorMeta(e.author),
+        html: e.removed ? null : renderMarkdown(e.body, ctx),
+      })),
+    });
+  }
+
+  async function apiPullCreate(request, reply, owner, name) {
+    const p = await readJsonBody(request); // body before auth (NIP-98 payload tag)
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    if (!p) return apiErr(reply, 400, 'invalid JSON body');
+    const title = typeof p.title === 'string' ? p.title.trim() : '';
+    const bodyText = typeof p.body === 'string' ? p.body : '';
+    if (!title || title.length > ISSUE_TITLE_CAP) return apiErr(reply, 422, `title required (1-${ISSUE_TITLE_CAP} chars)`);
+    if (bodyText.length > ISSUE_BODY_CAP) return apiErr(reply, 422, 'body too large');
+    const baseRef = typeof p.base === 'string' ? p.base : '';
+    if (!okRef(baseRef)) return apiErr(reply, 422, 'base must be a branch of this repository');
+    const dir = repoDirOf(owner, name);
+    const baseSha = await revParse(dir, `refs/heads/${baseRef}`);
+    if (!baseSha) return apiErr(reply, 422, `base branch ${baseRef} does not exist`);
+    const head = await resolveHead(owner, name, typeof p.head === 'string' ? p.head : '');
+    if (!head) return apiErr(reply, 422, 'head must be <branch> or <owner>:<branch> of a same-named repo');
+    const counts = (await gitText(dir, ['rev-list', '--left-right', '--count', `${baseSha}...${head.sha}`]))
+      .trim().split(/\s+/);
+    if (!+counts[1]) return apiErr(reply, 422, 'no commits between base and head');
+    return withPullLock(owner, name, async () => {
+      const idx = loadPullIndex(owner, name);
+      const number = idx.next;
+      const doc = {
+        type: 'ForgePullRequest',
+        repo: `${owner}/${name}`,
+        pull: number,
+        title,
+        body: bodyText,
+        base: baseRef,
+        head: `${head.owner}:${head.ref}`,
+        published: new Date().toISOString(),
+        author: agent,
+      };
+      const stored = await persistBody(request, agent, owner, name, doc, 'pull');
+      if (stored.error) return apiErr(reply, stored.status, stored.error);
+      const at = Math.floor(Date.now() / 1000);
+      idx.next = number + 1;
+      idx.pulls[number] = {
+        number,
+        title,
+        state: 'open',
+        author: agent,
+        createdAt: at,
+        base: baseRef,
+        head: { owner: head.owner, repo: head.repo, ref: head.ref },
+        merged: null,
+        thread: [{ author: agent, resourceUrl: stored.url, at, ...(stored.hosted ? { hosted: true } : {}) }],
+      };
+      savePullIndex(owner, name, idx);
+      return sendJson(reply, 201, {
+        number,
+        url: `${prefix}/${owner}/${name}/pulls/${number}`,
+        resourceUrl: stored.url,
+        ...(stored.hosted ? { hosted: true } : {}),
+      });
+    });
+  }
+
+  async function apiPullComment(request, reply, owner, name, number) {
+    const p = await readJsonBody(request); // body before auth (NIP-98 payload tag)
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    if (!p) return apiErr(reply, 400, 'invalid JSON body');
+    const bodyText = typeof p.body === 'string' ? p.body : '';
+    if (!bodyText.trim()) return apiErr(reply, 422, 'body required');
+    if (bodyText.length > ISSUE_BODY_CAP) return apiErr(reply, 422, 'body too large');
+    return withPullLock(owner, name, async () => {
+      const idx = loadPullIndex(owner, name);
+      const pr = idx.pulls[number];
+      if (!pr) return apiErr(reply, 404, 'not found');
+      if (pr.thread.length >= THREAD_CAP) return apiErr(reply, 422, 'thread is full');
+      const doc = {
+        type: 'ForgeComment',
+        repo: `${owner}/${name}`,
+        pull: number,
+        body: bodyText,
+        published: new Date().toISOString(),
+        author: agent,
+      };
+      const stored = await persistBody(request, agent, owner, name, doc, 'comment');
+      if (stored.error) return apiErr(reply, stored.status, stored.error);
+      pr.thread.push({
+        author: agent,
+        resourceUrl: stored.url,
+        at: Math.floor(Date.now() / 1000),
+        ...(stored.hosted ? { hosted: true } : {}),
+      });
+      savePullIndex(owner, name, idx);
+      return sendJson(reply, 201, {
+        number,
+        comments: pr.thread.length - 1,
+        resourceUrl: stored.url,
+        ...(stored.hosted ? { hosted: true } : {}),
+      });
+    });
+  }
+
+  /** close/reopen: target repo owner or the PR author; merged is final. */
+  async function apiPullState(request, reply, owner, name, number, state) {
+    await readJsonBody(request); // content unused; buffered for NIP-98 payload tags
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    return withPullLock(owner, name, async () => {
+      const idx = loadPullIndex(owner, name);
+      const pr = idx.pulls[number];
+      if (!pr) return apiErr(reply, 404, 'not found');
+      if (!mayModerate(agent, owner, pr)) return apiErr(reply, 403, 'only the repo owner or the pull-request author may do that');
+      if (pr.state === 'merged') return apiErr(reply, 422, 'a merged pull request cannot be reopened or closed');
+      pr.state = state;
+      savePullIndex(owner, name, idx);
+      return sendJson(reply, 200, { number, state });
+    });
+  }
+
+  /**
+   * POST .../pulls/<n>/merge — a REAL merge on the bare repo (target repo
+   * owner only): fetch the head objects, `merge-tree --write-tree` (or a
+   * fast-forward when the base is an ancestor — ff-when-possible policy),
+   * `commit-tree` with two parents, then `update-ref` with an old-value
+   * guard. Optional {expectedBase: <sha>} is the UI's CAS token: 409 when
+   * the base moved since the diff the merger saw.
+   */
+  async function apiPullMerge(request, reply, owner, name, number) {
+    const p = await readJsonBody(request);
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    if (ownerFromAgent(agent) !== owner) return apiErr(reply, 403, 'only the repo owner may merge');
+    if (!mergeTreeOk) {
+      return apiErr(reply, 501,
+        `merging needs git >= 2.38 (merge-tree --write-tree); this server has "${gitVersion}"`);
+    }
+    return withPullLock(owner, name, async () => {
+      const idx = loadPullIndex(owner, name);
+      const pr = idx.pulls[number];
+      if (!pr) return apiErr(reply, 404, 'not found');
+      if (pr.state !== 'open') return apiErr(reply, 422, `pull request is ${pr.state}`);
+      const dir = repoDirOf(owner, name);
+      const baseSha = await revParse(dir, `refs/heads/${pr.base}`);
+      if (!baseSha) return apiErr(reply, 422, `base branch ${pr.base} no longer exists`);
+      const expected = typeof p?.expectedBase === 'string' && p.expectedBase ? p.expectedBase : null;
+      if (expected !== null && !SHA_RE.test(expected)) return apiErr(reply, 422, 'expectedBase must be a sha');
+      if (expected !== null && !baseSha.startsWith(expected)) {
+        return sendJson(reply, 409, { error: `the base branch has moved since the diff you saw (now at ${baseSha.slice(0, 7)}) — review and retry`, baseSha });
+      }
+      const head = await resolveHead(owner, name, prHeadSpec(pr));
+      if (!head) return apiErr(reply, 422, 'the head branch no longer exists');
+      if (head.sha === baseSha || await isAncestor(dir, head.sha, baseSha)) {
+        return apiErr(reply, 422, 'nothing to merge: the base already contains the head');
+      }
+      let mergedSha;
+      let fastForward = false;
+      if (await isAncestor(dir, baseSha, head.sha)) {
+        // ff-when-possible: no synthetic merge commit when none is needed.
+        fastForward = true;
+        mergedSha = head.sha;
+      } else {
+        const mt = await mergeTreeOf(dir, baseSha, head.sha);
+        if (!mt.clean) {
+          return sendJson(reply, 409, { error: 'merge conflict', conflicts: mt.conflicts });
+        }
+        // Honest authorship: author = the merging agent, committer = forge.
+        const who = ownerFromAgent(agent) ?? 'agent';
+        const env = {
+          ...gitEnv,
+          GIT_AUTHOR_NAME: displayName(agent),
+          GIT_AUTHOR_EMAIL: `${who}@forge.invalid`,
+          GIT_COMMITTER_NAME: 'forge',
+          GIT_COMMITTER_EMAIL: 'forge@forge.invalid',
+        };
+        const msg = `Merge pull request #${pr.number} from ${prHeadSpec(pr)}`;
+        const { stdout } = await execFileP('git',
+          ['-C', dir, 'commit-tree', mt.tree, '-p', baseSha, '-p', head.sha, '-m', msg], { env });
+        mergedSha = stdout.trim();
+      }
+      // Compare-and-swap: update-ref's old-value guard rejects the write
+      // if the base moved between our read and now (e.g. a racing push).
+      try {
+        await execFileP('git', ['-C', dir, 'update-ref', `refs/heads/${pr.base}`, mergedSha, baseSha], { env: gitEnv });
+      } catch {
+        return sendJson(reply, 409, { error: 'the base branch moved during the merge — retry' });
+      }
+      pr.state = 'merged';
+      pr.merged = {
+        sha: mergedSha,
+        mergedBy: agent,
+        at: Math.floor(Date.now() / 1000),
+        baseSha,
+        headSha: head.sha,
+        fastForward,
+      };
+      savePullIndex(owner, name, idx);
+      api.log.info(`forge: merged PR #${pr.number} into ${owner}/${name}@${pr.base} (${mergedSha.slice(0, 7)}${fastForward ? ', ff' : ''})`);
+      return sendJson(reply, 200, { number: pr.number, state: 'merged', sha: mergedSha, fastForward });
+    });
+  }
+
+  async function apiPullsHandler(request, reply, owner, name, tail) {
+    const method = request.method;
+    if (tail.length === 0) {
+      if (method === 'POST') return apiPullCreate(request, reply, owner, name);
+      if (method === 'GET' || method === 'HEAD') return apiPullList(reply, owner, name, request.query);
+      return apiErr(reply, 405, 'method not allowed');
+    }
+    if (!ISSUE_NUM_RE.test(tail[0])) return apiErr(reply, 404, 'not found');
+    const number = +tail[0];
+    if (tail.length === 1) {
+      if (method === 'GET' || method === 'HEAD') return apiPullGet(reply, owner, name, number);
+      return apiErr(reply, 405, 'method not allowed');
+    }
+    if (tail.length === 2 && ['comments', 'close', 'reopen', 'merge'].includes(tail[1])) {
+      if (method !== 'POST') return apiErr(reply, 405, 'method not allowed');
+      if (tail[1] === 'comments') return apiPullComment(request, reply, owner, name, number);
+      if (tail[1] === 'merge') return apiPullMerge(request, reply, owner, name, number);
+      return apiPullState(request, reply, owner, name, number, tail[1] === 'close' ? 'closed' : 'open');
+    }
+    return apiErr(reply, 404, 'not found');
+  }
+
   // ---- tier 2.5: NIP-98 -> push-token exchange + hosted-content routes ----
 
   /**
@@ -2212,10 +3077,16 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
 
     const action = rest[2];
     const tail = rest.slice(3);
-    if (action !== 'issues' && !isRead) return apiErr(reply, 405, 'method not allowed');
+    if (!['issues', 'pulls', 'fork'].includes(action) && !isRead) return apiErr(reply, 405, 'method not allowed');
     try {
       switch (action) {
         case 'issues': return await apiIssuesHandler(request, reply, owner, name, tail);
+        case 'pulls': return await apiPullsHandler(request, reply, owner, name, tail);
+        case 'fork':
+          if (tail.length !== 0) return apiErr(reply, 404, 'not found');
+          if (request.method !== 'POST') return apiErr(reply, 405, 'method not allowed');
+          return await apiForkCreate(request, reply, owner, name);
+        case 'compare': return tail.length ? await apiCompare(reply, owner, name, tail.join('/')) : apiErr(reply, 404, 'not found');
         case 'tree': return tail.length ? await apiTree(reply, owner, name, tail) : apiErr(reply, 404, 'not found');
         case 'blob': return tail.length >= 2 ? await apiBlob(reply, owner, name, tail) : apiErr(reply, 404, 'not found');
         case 'commits': return tail.length ? await apiCommits(reply, owner, name, tail, request.query) : apiErr(reply, 404, 'not found');
@@ -2352,6 +3223,17 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
           case 'commit': return tail.length === 1 ? await commitPage(reply, owner, name, tail[0]) : notFound(reply);
           case 'branches': return tail.length === 0 ? await refsPage(reply, owner, name, 'branches') : notFound(reply);
           case 'tags': return tail.length === 0 ? await refsPage(reply, owner, name, 'tags') : notFound(reply);
+          case 'compare': return tail.length ? await comparePage(reply, owner, name, tail.join('/')) : notFound(reply);
+          case 'pulls': {
+            if (tail.length === 0) return await pullsListPage(reply, owner, name, request.query);
+            if (tail.length === 1 && tail[0] === 'new') return await newPullPage(reply, owner, name, request.query);
+            if (ISSUE_NUM_RE.test(tail[0])) {
+              if (tail.length === 1) return await pullPage(reply, owner, name, +tail[0]);
+              if (tail.length === 2 && tail[1] === 'commits') return await pullCommitsPage(reply, owner, name, +tail[0]);
+              if (tail.length === 2 && tail[1] === 'files') return await pullFilesPage(reply, owner, name, +tail[0]);
+            }
+            return notFound(reply);
+          }
           case 'issues': {
             if (tail.length === 0) return await issuesListPage(reply, owner, name, request.query);
             if (tail.length === 1 && tail[0] === 'new') return await newIssuePage(reply, owner, name);
@@ -2372,8 +3254,9 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null,
 
   api.log.info(
     `forge: repos at ${prefix}/<owner>/<name>.git, UI at ${prefix}/, issues at ${prefix}/<owner>/<name>/issues, `
-    + `push tokens at ${prefix}/api/token, xlogin at ${prefix}/xlogin.js `
-    + `(backend ${backend}, reads ${privateRepos ? 'owner-only' : 'public'})`,
+    + `pulls at ${prefix}/<owner>/<name>/pulls, push tokens at ${prefix}/api/token, xlogin at ${prefix}/xlogin.js `
+    + `(backend ${backend}, reads ${privateRepos ? 'owner-only' : 'public'}, `
+    + `merges ${mergeTreeOk ? 'on' : `OFF — ${gitVersion} lacks merge-tree --write-tree`})`,
   );
 
   return { deactivate() { /* nothing persistent to tear down */ } };

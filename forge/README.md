@@ -1,4 +1,4 @@
-# forge — a personal git forge (tier 1: hosting + browsing; tier 2: issues; tier 2.5: nostr agents + xlogin)
+# forge — a personal git forge (tier 1: hosting + browsing; tier 2: issues; tier 2.5: nostr agents + xlogin; tier 3a: forks + pull requests)
 
 The useful slice of Gogs/Gitea as a JSS plugin: push a repo over smart
 HTTP, get a GitHub-style (light theme) web UI for it — repo list, file
@@ -9,7 +9,10 @@ the author's pod** (the forge keeps only a pointer index — see the
 architecture below). Tier 2.5 makes **did:nostr agents first-class**
 (hex-pubkey namespaces, a NIP-98 → push-token exchange, forge-hosted
 issue bodies for podless agents) and puts the vendored **xlogin** widget
-on the issues pages. Zero npm dependencies, zero build step, no
+on the issues pages. Tier 3a adds **forks, compare, and pull requests
+with real merges** (`merge-tree --write-tree` + `commit-tree` +
+compare-and-swap `update-ref` — see "Forks & pull requests").
+Zero npm dependencies, zero build step, no
 framework: every page is server-rendered HTML with inline CSS, all git
 work is done by the system `git` binary, and the wire protocol is
 delegated to the stock `git-http-backend` CGI (gitscratch's proven
@@ -70,6 +73,11 @@ git -c http.extraHeader="Authorization: Bearer <token>" push forge main
 | `.../issues?state=open\|closed&page=N` | issue list: GitHub-style filter tabs, green open / purple closed icons, relative times, comment counts |
 | `.../issues/<n>` | thread: issue body then comments in comment boxes (identicon, author → WebID link, relative time, `owner` badge), markdown bodies |
 | `.../issues/new` | new-issue form (vanilla-JS client, see below) |
+| `.../compare/<base>...[<owner>:]<ref>` | compare view: ahead/behind counts, the ahead commit list, the structured diff, an "Open pull request" button |
+| `.../pulls?state=open\|merged\|closed&page=N` | PR list: three-state filter tabs — green open, purple merged, red closed |
+| `.../pulls/<n>` | PR conversation: state banner (merged / closed / clean-with-merge-button / conflict list), thread, comment form |
+| `.../pulls/<n>/commits`, `.../pulls/<n>/files` | GitHub-style sub-tabs: the ahead commits, the structured diff |
+| `.../pulls/new?base=...&head=...` | new-PR form (from the compare page) |
 | `<prefix>/<owner>/<name>.git/...` | git smart HTTP (`info/refs`, `git-upload-pack`, `git-receive-pack`) |
 | `<prefix>/api/token` | POST: exchange any `getAgent` credential for a push token (see "Nostr agents") |
 | `<prefix>/api/hosted/<hex>/<uuid>` | GET (public) / DELETE (author-only): a podless agent's hosted issue words |
@@ -103,6 +111,41 @@ renderer's already-escaped HTML, safe to inject as markup. Shapes:
   `{ sha, short, author, email, at, parents, message,
      files: [{ name, binary, adds, dels, hunks: [{ header,
        lines: [{ type: 'add'|'del'|'ctx'|'meta', oldLine, newLine, text }] }] }] }`
+
+Tier 3a (additive):
+
+- `api/repos/<o>/<n>` gains `parent` (`"<owner>/<name>" | null` — fork
+  lineage) and `forks` (count); list entries gain `parent`.
+- `POST api/repos/<o>/<n>/fork` (authed; optional `{name}` override so
+  you can fork your own repo under a new name) → 201
+  `{ owner, name, parent, url, cloneUrl }`; 409 if the target exists.
+- `GET .../compare/<base>...[<owner>:]<ref>` →
+  `{ base: {ref, sha}, head: {owner, repo, ref, sha}, aheadBy, behindBy,
+     mergeBase, hasMore, commits, files }` (same commit/diff shapes as
+  above — one parser, every surface).
+- `GET .../pulls?state=open|merged|closed&page=N` →
+  `{ state, page, perPage, hasMore, openCount, mergedCount, closedCount,
+     pulls: [{ number, title, state, author, authorInfo, createdAt, base,
+       head: {owner, repo, ref}, merged, comments }] }`
+- `GET .../pulls/<n>` → the list fields plus `baseSha` (the CAS token the
+  UI hands back at merge time), `head.sha`, `mergeable` (`true|false|null`
+  — null when an end is gone or merge-tree is unavailable), `conflicts`
+  (paths, from merge-tree), `merged` (`{sha, mergedBy, at, baseSha,
+  headSha, fastForward} | null`) and the resolved `thread` (issues shape
+  verbatim).
+- `POST .../pulls` `{title, body, base, head}` → 201
+  `{ number, url, resourceUrl, hosted? }` — body stored in the author's
+  pod (or forge-hosted for podless agents), exactly like issues. 422 when
+  the head is unresolvable or there are no commits between base and head.
+- `POST .../pulls/<n>/comments` `{body}`, `POST .../pulls/<n>/close` /
+  `.../reopen` — the issues beats (owner or PR author; merged is final,
+  422).
+- `POST .../pulls/<n>/merge` `{expectedBase?}` (TARGET repo owner only) →
+  200 `{ number, state: 'merged', sha, fastForward }`; 409
+  `{ error: 'merge conflict', conflicts }` or 409 when the base moved
+  (stale `expectedBase`, or a race caught by update-ref's old-value
+  guard); 501 naming the git version when `merge-tree --write-tree` is
+  missing (needs git ≥ 2.38).
 
 Errors are `{ error }` with 4xx. `cloneUrl` is absolute: the origin comes
 from `api.serverInfo` (#601) at request time, with `config.baseUrl` as
@@ -181,6 +224,73 @@ Every issues page embeds one dependency-free inline
 
 With JS off the pages stay fully readable and a `<noscript>` note says
 interactive actions need JavaScript and sign-in.
+
+## Forks & pull requests (tier 3a)
+
+The flow: **fork** (`POST api/repos/<o>/<n>/fork`) runs `git clone
+--local --bare` into the caller's namespace — same repo name, 409 on
+collision, optional `{name}` override (that's how you fork your *own*
+repo, which GitHub also allows; a same-name self-fork would always
+collide). Lineage is recorded in the fork's bare-repo config
+(`forge.parent = <o>/<n>`); the fork's home and the repo lists show
+"forked from …", the parent shows a fork count, and a freshly pushed
+non-default branch on a fork earns an "open a pull request?" hint.
+**Compare** (`/compare/<base>...<head>`) takes a ref of THIS repo as
+base and either a same-repo ref or `<owner>:<ref>` as head. The fork
+rule is deliberately simple and name-based: *the head owner's repo with
+the same name* — lineage chains are not chased. Cross-repo heads are
+fetched **by filesystem path** (both ends forge-owned, never a
+user-supplied URL) into a hidden, reusable ref in the base repo
+(`refs/forge/heads/<owner>/<ref>`, force-updated per call — repeat
+compares refresh it, nothing to clean up). A **pull request** is the
+issues architecture verbatim: the body/comments live in their authors'
+pods (or forge-hosted for podless nostr agents), the spine lives in
+`pluginDir/pulls/<owner>/<repo>.json` with the same atomic-write +
+per-repo-lock discipline, plus base ref, head `{owner, repo, ref}` and
+merge info.
+
+**Merge semantics — real git, bare-repo safe.** The target repos are
+bare, so nothing ever checks out a worktree:
+
+1. head objects are path-fetched into the base repo (as in compare);
+2. `git merge-tree --write-tree` (git ≥ 2.38 — probed at activate; the
+   merge route answers **501 naming the installed version** when it's
+   missing) computes the merged tree, or reports the conflicted paths,
+   which the PR page renders as a GitHub-style "this branch has
+   conflicts" banner (merge button withheld, PR stays open, the API says
+   409 + `conflicts`);
+3. a clean tree is committed with `git commit-tree` — **two parents,
+   honest authorship**: author = the merging agent's display id with a
+   synthesized `<owner>@forge.invalid` email, committer = `forge`,
+   message `Merge pull request #N from <owner>:<ref>`;
+4. `git update-ref refs/heads/<base> <new> <old>` lands it with an
+   **old-value guard — the compare-and-swap**. The PR page pins the base
+   sha it rendered (`baseSha` in the detail JSON, `expectedBase` in the
+   merge POST); if the base moved since the diff the merger saw, the
+   route answers 409 before touching anything, and even a race between
+   the route's own read and the ref write is caught by update-ref
+   itself.
+
+**ff-when-possible policy**: when the base is an ancestor of the head,
+the merge is a plain compare-and-swapped `update-ref` — no synthetic
+merge commit — recorded as merged with `fastForward: true` and the head
+sha as the merge sha. (GitHub's default always creates a merge commit;
+this forge prefers not to invent history where none is needed. The
+Commits/Files tabs of a merged PR stay exact either way: the shas are
+frozen in the merge record.)
+
+**Separate numbering, documented deviation**: GitHub numbers issues and
+PRs from one shared counter; here `pulls/<owner>/<repo>.json` numbers
+independently of the issues index. Sharing would entangle every PR
+write with the issues index (one more lock, one more file rewritten,
+crossed failure modes) for no user value in a personal forge — `#N` is
+unambiguous because issues and pulls live under different routes.
+
+Auth: fork needs any authenticated agent (it writes to the CALLER's
+namespace); PR create/comment need an authenticated agent with
+somewhere to keep the words (pod or hosted); close/reopen are for the
+target repo owner or the PR author; **merge is target repo owner
+only**. Anonymous writes are 401, everything else 403 — house rules.
 
 ## Nostr agents (tier 2.5)
 
@@ -334,8 +444,9 @@ detection is a NUL sniff over the first 8 KB.
   bundle came from. A `<pre>` with line numbers covers tier-1 browsing;
   highlighting is a candidate for a later wave *if* it can be done
   server-side and dependency-free.
-- **No search, no PRs/webhooks** — later tiers (see Findings 3). Issues
-  arrived in tier 2; PRs want the same pod-native treatment.
+- **No search, no webhooks** — later tiers (see Findings 3). Issues
+  arrived in tier 2; PRs arrived in tier 3a with the same pod-native
+  treatment (bodies in pods, spine in pluginDir).
 - **No browser-git** — every byte of git logic is the system binary;
   server-side rendering made the old client bundle unnecessary.
 
@@ -536,3 +647,47 @@ signing real events in the tests:
   round-trip on the auth hot path that the agent cannot opt out of.
   One more reason the token exchange is the right shape: it pays that
   cost once per TTL, not per request.
+
+### 13. merge-tree --write-tree is the whole trick — and its availability is a real precondition
+
+Everything GitHub does with a merge queue and a worktree farm, a bare
+repo can do with three plumbing commands: `merge-tree --write-tree`
+(compute the merged tree OR the conflicted paths, no worktree),
+`commit-tree -p A -p B` (make the two-parent commit), `update-ref
+<ref> <new> <old>` (land it atomically with a compare-and-swap). But
+`merge-tree --write-tree` only exists since git 2.38 (2022); on older
+gits there is NO bare-safe conflict-aware merge without a scratch
+clone. The forge probes `git --version` at activate and the merge route
+answers 501 naming the installed version rather than pretending — the
+dev machine's git 2.53.0 is fine, and the conflict output's
+`--name-only` section parses cleanly into the banner's path list. One
+sharp edge found while parsing: merge-tree signals conflicts via **exit
+code 1**, so the child-process wrapper must treat exit 1 + stdout as
+data, not as failure.
+
+### 14. protocol.file.allow was NOT needed — direct path fetches still count as user-initiated
+
+The CVE-2022-39253 hardening (git ≥ 2.38.1) demoted `protocol.file.allow`
+to `user`, which kills `file://`/local-path transports **when triggered
+indirectly** (submodule clones). The forge's cross-repo fetches
+(`git -C <base> fetch <abs-path-to-head> +refs/heads/x:refs/forge/...`)
+are direct top-level invocations, which the `user` default still
+permits — measured on git 2.53.0: no `-c protocol.file.allow=always`
+override was required. Written down because it is one hardening release
+away from mattering: if a future git demotes direct local fetches too,
+the per-invocation override is the correct, bounded fix — both ends are
+forge-owned paths under pluginDir, no user-supplied URLs ever reach the
+fetch argv (owner/name/ref are strictly validated first).
+
+### 15. Hidden refs are visible refs: refs/forge/* rides the wire, harmlessly
+
+The reusable compare refs (`refs/forge/heads/<owner>/<ref>`) live
+outside refs/heads and refs/tags, so no UI surface lists them — but
+`git ls-remote` shows them and a fetching client may copy them, because
+upload-pack advertises everything. That is accepted, not accidental:
+the objects they pin are exactly the fork branches a compare or PR
+already published, so nothing leaks; the cost is advertisement noise
+proportional to compared branches. The alternative (fetch into a
+temp ref + delete) re-downloads objects on every compare AND still
+leaves the objects in the odb until gc. If it ever grates,
+`uploadpack.hideRefs=refs/forge` per repo is the one-line cure.
