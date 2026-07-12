@@ -1,12 +1,17 @@
 // forge — a personal git forge (tier 1: hosting + browsing; tier 2: issues
 // + comments; tier 2.5: first-class did:nostr agents + the xlogin widget;
 // tier 3a: forks, compare, and pull requests with REAL merges; polish:
-// labels, read-time search, releases/archives, hidden compare refs)
-// as a #206 loader plugin. The useful slice of Gogs/Gitea: push
-// a repo, get a GitHub-style web UI for it — with the constraints that
-// killed the last attempt made absolute: zero npm dependencies, zero build
-// step, every page server-rendered HTML with inline CSS, all git work done
-// by the system `git` binary. Client JavaScript is the 3-line clone-URL
+// labels, read-time search, releases/archives, hidden compare refs;
+// tier 3.5: git-mark anchoring via Blocktrails — Bitcoin(testnet)-anchored,
+// tamper-evident repo history) as a #206 loader plugin. The useful slice of
+// Gogs/Gitea: push a repo, get a GitHub-style web UI for it — with the
+// constraints that killed the last attempt made absolute: zero build step,
+// every page server-rendered HTML with inline CSS, all git work done
+// by the system `git` binary, and one npm dependency, @noble/curves — the
+// host's own crypto library — for the Blocktrails secp256k1 point math
+// (the blocktrails npm package is deliberately NOT imported; the spec math
+// is implemented here and cross-checked against a reference-impl vector in
+// test.js). Client JavaScript is the 3-line clone-URL
 // copy button plus one dependency-free inline module on the issues pages
 // (login + fetch against the JSON API; the server always renders the truth).
 //
@@ -31,6 +36,10 @@
 //   labels        <prefix>/api/repos/<o>/<n>/labels[/<name>] (+ PUT .../{issues,pulls}/<n>/labels)
 //   compare       <prefix>/<owner>/<name>/compare/<base>...[<owner>:]<ref>
 //   pulls         <prefix>/<owner>/<name>/pulls[?state=|/new|/<n>[/commits|/files]]
+//   anchors       <prefix>/<owner>/<name>/marks     (HTML) + api/repos/<o>/<n>/marks (JSON)
+//                 POST api/repos/<o>/<n>/marks/enable        (owner: genesis mark)
+//                 POST api/repos/<o>/<n>/marks/<i>/txo       (owner: record on-chain txo)
+//                 GET  <prefix>/<owner>/<name>/blocktrails.json  (CORS-readable trail doc)
 //   fork          POST <prefix>/api/repos/<o>/<n>/fork
 //   push tokens   <prefix>/api/token                 (POST, any getAgent credential)
 //   hosted words  <prefix>/api/hosted/<hex>/<uuid>   (GET public, DELETE author-only)
@@ -61,6 +70,22 @@
 // asymmetry is a named Finding), deletable by their author over the API.
 // The issues pages also serve/load the vendored xlogin widget (NIP-98 /
 // DPoP client-side auth) beside the local username/password fallback.
+//
+// TIER 3.5 — git-mark anchoring via Blocktrails (see README "Anchors"):
+// the server DERIVES AND RECORDS; it NEVER touches the network. Per-repo
+// trail state (a forge-held testnet trail key + the mark list) lives at
+// pluginDir/marks/<owner>/<repo>.json. Each mark commits one state
+// { commit, repo, branch }; its P2TR address is derived by chained
+// BIP-341 TapTweak (blocktrails spec v0.2) over
+// sha256(JSON.stringify(state)) — pure @noble/curves + node:crypto.
+// Spending the PREVIOUS mark's UTXO to the NEW mark's address IS the
+// advance; the transactions happen elsewhere (the maintainer's fund-agent
+// / git-mark CLIs), the owner reports { txid, vout, amount } back and the
+// hosted blocktrails verifier checks the chain client-side. Bitcoin
+// appears here only as derived bech32m addresses, mempool.space links in
+// HTML, and the served blocktrails.json. Testnet-only defaults
+// (chain 'tbtc4'); mainnet chains are refused at activate unless
+// config.allowMainnet is explicitly true.
 //
 // Ownership: owner = the pod username derived from the pusher's WebID
 // (mastodon/'s podFromWebid rule), or the 64-hex pubkey for did:nostr
@@ -100,6 +125,8 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+
+import { secp256k1 } from '@noble/curves/secp256k1';
 
 const execFileP = promisify(execFile);
 
@@ -157,6 +184,18 @@ const SEARCH_HIT_CAP = 100;     // total grep hits returned
 const SEARCH_PATH_CAP = 100;    // total path matches returned
 const SEARCH_PER_FILE_CAP = 5;  // grep --max-count per file
 const SEARCH_EXCERPT_CAP = 200; // chars of line excerpt
+
+// Tier-3.5: Blocktrails anchoring. chain -> bech32(m) HRP (BIP-173/350)
+// and mempool.space explorer path. Mainnet identifiers are refused at
+// activate unless config.allowMainnet — this plugin's custody posture is
+// testnet-grade (see README Findings).
+const CHAIN_HRP = { btc: 'bc', mainnet: 'bc', bitcoin: 'bc', tbtc4: 'tb', tbtc3: 'tb', signet: 'tb', regtest: 'bcrt' };
+const MAINNET_CHAINS = new Set(['btc', 'mainnet', 'bitcoin']);
+const MEMPOOL_PATH = { btc: '', mainnet: '', bitcoin: '', tbtc4: '/testnet4', tbtc3: '/testnet', signet: '/signet' };
+const TXID64 = /^[0-9a-f]{64}$/;
+const MARK_INDEX_RE = /^(0|[1-9][0-9]{0,5})$/;
+const MARKS_CAP = 500;           // marks per trail (each push stacks one)
+const SATS_CAP = 2_100_000_000_000_000; // 21M BTC in sats
 
 // ---------------------------------------------------------------- helpers
 
@@ -266,8 +305,12 @@ function nostrHexOf(agent) {
 }
 
 // bech32 (BIP-173, full checksum — no shortcuts) npub encoder, pure node.
-// Unit-tested against the canonical NIP-19 vector in test.js.
+// Unit-tested against the canonical NIP-19 vector in test.js. Tier 3.5
+// generalizes the same polymod into a bech32m (BIP-350) P2TR address
+// encoder — the two specs differ ONLY by the checksum constant
+// (bech32 xors 1, bech32m xors 0x2bc830a3).
 const BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+const BECH32M_CONST = 0x2bc830a3;
 
 function bech32Polymod(values) {
   const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
@@ -280,23 +323,100 @@ function bech32Polymod(values) {
   return chk;
 }
 
-/** 64-hex pubkey -> npub1... (NIP-19). Exported for the vector test. */
-export function npubEncode(hex) {
-  const data = []; // 8-bit bytes regrouped big-endian into 5-bit words
+/** 8-bit bytes regrouped big-endian into 5-bit words (padded). */
+function to5bit(bytes) {
+  const words = [];
   let acc = 0;
   let bits = 0;
-  for (let i = 0; i < hex.length; i += 2) {
-    acc = (acc << 8) | parseInt(hex.slice(i, i + 2), 16);
+  for (const b of bytes) {
+    acc = (acc << 8) | b;
     bits += 8;
-    while (bits >= 5) { bits -= 5; data.push((acc >>> bits) & 31); }
+    while (bits >= 5) { bits -= 5; words.push((acc >>> bits) & 31); }
   }
-  if (bits) data.push((acc << (5 - bits)) & 31);
-  const hrp = 'npub';
+  if (bits) words.push((acc << (5 - bits)) & 31);
+  return words;
+}
+
+/** hrp + data words + 6-word checksum (constant picks bech32 vs bech32m). */
+function bech32Assemble(hrp, words, constant) {
   const expanded = [...hrp].map((c) => c.charCodeAt(0) >>> 5)
     .concat([0], [...hrp].map((c) => c.charCodeAt(0) & 31));
-  const poly = bech32Polymod([...expanded, ...data, 0, 0, 0, 0, 0, 0]) ^ 1;
+  const poly = bech32Polymod([...expanded, ...words, 0, 0, 0, 0, 0, 0]) ^ constant;
   const checksum = Array.from({ length: 6 }, (_, i) => (poly >>> (5 * (5 - i))) & 31);
-  return `${hrp}1${[...data, ...checksum].map((d) => BECH32_CHARSET[d]).join('')}`;
+  return `${hrp}1${[...words, ...checksum].map((d) => BECH32_CHARSET[d]).join('')}`;
+}
+
+/** 64-hex pubkey -> npub1... (NIP-19). Exported for the vector test. */
+export function npubEncode(hex) {
+  return bech32Assemble('npub', to5bit(Buffer.from(hex, 'hex')), 1);
+}
+
+/** 32-byte P2TR witness program -> bech32m address (BIP-350, version 1). */
+export function p2trAddressEncode(hrp, program) {
+  return bech32Assemble(hrp, [1, ...to5bit(program)], BECH32M_CONST);
+}
+
+// ------------------------------------------- Blocktrails trail math (3.5)
+// Implemented FROM THE SPEC (blocktrails spec v0.2 — the mirror at
+// blocktrails/spec/spec.md is normative): chained BIP-341 TapTweak.
+//
+//   h  = sha256(serialize(state))                       state hash
+//   tᵢ = tagged_hash("TapTweak", x_only(Pᵢ₋₁) || h) mod n
+//   Pᵢ = Pᵢ₋₁ + tᵢ·G                                    full point kept
+//   output = x_only(Pᵢ)  →  bech32m (tb1p…)             x-only at the boundary
+//
+// serialize(state) is the git-mark-demo convention:
+// JSON.stringify({ commit, repo, branch }) — canonical because the object
+// is built literally in that key order everywhere it is hashed.
+// Parity note (a Finding): the spec keeps FULL points through the chain
+// and takes x_only only at the output boundary — x(P) == x(-P) makes the
+// output comparison parity-free, and the tweak input is the raw
+// x-coordinate of the (possibly odd-Y) running point, NOT a re-lifted
+// even-Y key as in BIP-341 wallet derivation. Cross-checked in test.js
+// against a vector generated by the maintainer's reference implementation.
+// The blocktrails npm package is deliberately not imported (spec cited,
+// math local); @noble/curves does the point arithmetic.
+
+const SECP_N = secp256k1.CURVE.n;
+const sha256Of = (...parts) => {
+  const h = crypto.createHash('sha256');
+  for (const p of parts) h.update(p);
+  return h.digest();
+};
+const TAPTWEAK_TAG = sha256Of(Buffer.from('TapTweak', 'utf8'));
+
+/** Canonical mark state hash: sha256 hex of the state JSON. Exported for tests. */
+export function markStateHash(state) {
+  return crypto.createHash('sha256').update(JSON.stringify(state), 'utf8').digest('hex');
+}
+
+/** BIP-341 TapTweak scalar over (x_only(P), stateHash), in [1, n-1]. */
+function tapTweakScalar(xOnly, stateHashBytes) {
+  const t = BigInt(`0x${sha256Of(TAPTWEAK_TAG, TAPTWEAK_TAG, xOnly, stateHashBytes).toString('hex')}`) % SECP_N;
+  // The spec REQUIRES rejecting t = 0 (probability ~2^-256).
+  if (t === 0n) throw new Error('blocktrails: TapTweak scalar is zero — state rejected');
+  return t;
+}
+
+/** Chain the tweaks: base pubkey + one TapTweak per state hash (hex list). */
+function trailPoint(pubkeyBaseHex, stateHashes) {
+  let P = secp256k1.ProjectivePoint.fromHex(pubkeyBaseHex);
+  for (const h of stateHashes) {
+    const xOnly = P.toRawBytes(true).subarray(1); // raw x of the running point
+    const t = tapTweakScalar(xOnly, Buffer.from(h, 'hex'));
+    P = P.add(secp256k1.ProjectivePoint.BASE.multiply(t));
+  }
+  return P;
+}
+
+/** Witness program (x-only, 64-hex) after chaining stateHashes. Exported for tests. */
+export function trailProgram(pubkeyBaseHex, stateHashes) {
+  return Buffer.from(trailPoint(pubkeyBaseHex, stateHashes).toRawBytes(true).subarray(1)).toString('hex');
+}
+
+/** Derived P2TR address after chaining stateHashes. Exported for tests. */
+export function trailAddress(pubkeyBaseHex, stateHashes, hrp) {
+  return p2trAddressEncode(hrp, Buffer.from(trailProgram(pubkeyBaseHex, stateHashes), 'hex'));
 }
 
 /** Shortened npub for UI rendering: npub1abcd…wxyz. */
@@ -675,6 +795,15 @@ h1.page{font-size:24px;margin:0 0 16px}
   background:#ffffff;min-width:220px}
 .excerpt{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;
   white-space:pre-wrap;word-break:break-all;color:#1f2328}
+.chip{display:inline-block;padding:0 10px;border-radius:999px;font-size:12px;font-weight:500;line-height:20px;white-space:nowrap}
+.chip-pending{background:#fff8c5;color:#7d4e00;border:1px solid #d4a72c66}
+.chip-marked{background:#dafbe1;color:#1a7f37;border:1px solid #1f883d55}
+table.marks{width:100%;border-spacing:0;font-size:13px}
+table.marks th,table.marks td{padding:8px 12px;border-top:1px solid #d0d7de;text-align:left;vertical-align:top}
+table.marks th{border-top:0;background:#f6f8fa;font-size:12px;color:#59636e;font-weight:600}
+table.marks code{font-size:12px;word-break:break-all}
+.fundbox{border:1px solid #d4a72c66;background:#fff8c5;border-radius:8px;padding:12px 16px;margin-top:16px}
+.fundbox pre{background:#ffffffaa;border-radius:6px;padding:12px;overflow-x:auto;font-size:12px}
 `;
 
 // connect-src 'self' is load-bearing for tier 2: the issues client drives
@@ -715,6 +844,29 @@ async function findBackend(config) {
 export async function activate(api) {
   const prefix = api.prefix || '/forge';
   const privateRepos = api.config.privateRepos ?? false;
+
+  // Tier 3.5: anchoring chain, testnet4 by default. Checked FIRST, before
+  // any other activation work. Mainnet is REFUSED at
+  // activate unless the operator opts in explicitly — this plugin derives
+  // addresses for a forge-held key with testnet-grade custody (the trail
+  // key sits in pluginDir; see README Findings). Refusing loudly here
+  // beats deriving mainnet addresses someone might actually fund.
+  const chain = String(api.config.chain ?? 'tbtc4');
+  if (MAINNET_CHAINS.has(chain) && api.config.allowMainnet !== true) {
+    throw new Error(
+      `forge: config.chain "${chain}" is Bitcoin MAINNET — refusing to derive mainnet anchor addresses. `
+      + 'This plugin holds the trail key server-side (testnet posture) and never verifies or broadcasts; '
+      + 'anchoring defaults to tbtc4 (testnet4). Set config.allowMainnet: true only if you accept that custody.',
+    );
+  }
+  const chainHrp = CHAIN_HRP[chain];
+  if (!chainHrp) {
+    throw new Error(`forge: unknown config.chain "${chain}" (supported: ${Object.keys(CHAIN_HRP).join(', ')})`);
+  }
+  // mempool.space explorer base for txid links; undefined (regtest) means
+  // "no explorer" and the marks page renders plain text instead of a link.
+  const mempoolBase = MEMPOOL_PATH[chain] !== undefined ? `https://mempool.space${MEMPOOL_PATH[chain]}` : null;
+
   const backend = await findBackend(api.config);
   const csp = buildCsp(api.config.cspConnect);
 
@@ -1229,6 +1381,109 @@ export async function activate(api) {
     return Object.values(loadPullIndex(owner, name).pulls).filter((p) => p.state === 'open').length;
   }
 
+  // ---------------------------------------------------- marks model (3.5)
+  // Per-repo Blocktrails trail at pluginDir/marks/<owner>/<repo>.json:
+  // { v, chain, privkey, pubkeyBase, createdAt, marks: [...] } — same
+  // atomic tmp+rename + per-repo serializer discipline as issues/pulls.
+  // Each mark = { index, state: {commit, repo, branch}, stateHash,
+  // program, address, status: 'pending'|'marked', txid?, vout?, amount? }.
+  // The PRIVKEY never crosses an API boundary: it is the forge-held
+  // (testnet) trail key, written 0600, read only to be excluded — the
+  // custody trade-off is a named README Finding. The file existing IS the
+  // "anchoring enabled" bit.
+  const marksDir = path.join(api.storage.pluginDir(), 'marks');
+  fs.mkdirSync(marksDir, { recursive: true });
+  const marksPathOf = (owner, name) => path.join(marksDir, owner, `${name}.json`);
+  const marksEnabled = (owner, name) => fs.existsSync(marksPathOf(owner, name));
+  const markLocks = new Map();
+  const withMarkLock = (owner, name, fn) => serializeOn(markLocks, owner, name, fn);
+
+  function loadTrail(owner, name) {
+    try {
+      const t = JSON.parse(fs.readFileSync(marksPathOf(owner, name), 'utf8'));
+      if (t && typeof t.pubkeyBase === 'string' && Array.isArray(t.marks)) return t;
+    } catch { /* not enabled */ }
+    return null;
+  }
+  function saveTrail(owner, name, trail) {
+    const file = marksPathOf(owner, name);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${crypto.randomUUID()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(trail), { mode: 0o600 }); // key inside: 0600
+    fs.renameSync(tmp, file);
+  }
+
+  /** A mark as served over every API surface — everything BUT the key. */
+  function publicMark(m) {
+    return {
+      index: m.index,
+      state: m.state,
+      stateHash: m.stateHash,
+      program: m.program,
+      address: m.address,
+      status: m.status,
+      at: m.at,
+      ...(m.status === 'marked' ? { txid: m.txid, vout: m.vout, amount: m.amount, markedAt: m.markedAt } : {}),
+    };
+  }
+
+  /** The verifier's TXO URI shape (git-mark's format, parseTxo-compatible). */
+  const txoUriOf = (trail, m) => `txo:${trail.chain}:${m.txid}:${m.vout}?amount=${m.amount}&commit=${m.state.commit}&pubkey=${m.program}`;
+
+  /** Derive and append one mark for `state`; caller holds the mark lock. */
+  function appendMark(trail, state) {
+    const stateHash = markStateHash(state);
+    const hashes = [...trail.marks.map((m) => m.stateHash), stateHash];
+    const program = trailProgram(trail.pubkeyBase, hashes);
+    const mark = {
+      index: trail.marks.length,
+      state,
+      stateHash,
+      program,
+      address: p2trAddressEncode(chainHrp, Buffer.from(program, 'hex')),
+      status: 'pending',
+      at: Math.floor(Date.now() / 1000),
+    };
+    trail.marks.push(mark);
+    return mark;
+  }
+
+  /**
+   * THE one advance beat (3.5): whenever the default-branch tip may have
+   * moved on an anchoring-enabled repo — receive-pack completing, a PR
+   * merge landing via update-ref — compare the tip to the last mark's
+   * state and append a new PENDING mark for the new {commit, repo,
+   * branch}. Deriving the address is the whole job: spending the previous
+   * mark's UTXO to this address IS the on-chain advance, and it happens
+   * elsewhere (the owner's own CLIs). Multiple pushes stack pending marks
+   * honestly — each mark is one state; only funded/spent marks are ever
+   * reported 'marked'.
+   */
+  async function recordTip(owner, name) {
+    if (!marksEnabled(owner, name)) return;
+    const dir = repoDirOf(owner, name);
+    const branch = await defaultBranch(dir);
+    const tip = await revParse(dir, `refs/heads/${branch}`);
+    if (!tip) return;
+    await withMarkLock(owner, name, async () => {
+      const trail = loadTrail(owner, name);
+      if (!trail) return;
+      const last = trail.marks.at(-1);
+      if (last && last.state.commit === tip && last.state.branch === branch) return; // tip unchanged
+      if (trail.marks.length >= MARKS_CAP) {
+        api.log.warn(`forge: ${owner}/${name} hit the ${MARKS_CAP}-mark cap — not recording ${tip.slice(0, 7)}`);
+        return;
+      }
+      const mark = appendMark(trail, { commit: tip, repo: `${owner}/${name}`, branch });
+      saveTrail(owner, name, trail);
+      api.log.info(`forge: mark #${mark.index} pending for ${owner}/${name}@${branch} (${tip.slice(0, 7)}) -> ${mark.address}`);
+    });
+  }
+
+  /** recordTip as a fire-safe hook: log, never throw into the caller. */
+  const recordTipSafe = (owner, name) => recordTip(owner, name)
+    .catch((err) => api.log.warn(`forge: recordTip ${owner}/${name} failed: ${err.message}`));
+
   // ------------------------------------------------- labels model (polish)
   // The per-repo label SET lives in the repo's issues index file
   // (idx.labels); GitHub's default set applies until the first label write
@@ -1508,7 +1763,12 @@ export async function activate(api) {
 
   // ------------------------------------------------------------- CGI bridge
   // gitscratch's runBackend, re-rooted at repos/<owner>/<name>.git.
-  function runBackend(request, reply, { owner, name, subPath, agent }) {
+  // onExit (3.5) fires when the CGI child CLOSES after a served response —
+  // for git-receive-pack that is "the receive finished, refs are final",
+  // which is exactly the post-receive moment the anchoring advance needs
+  // (core ISSUES.md #271 called this hook "core, not a plugin" — owning
+  // the receive path moved that line; see README Findings).
+  function runBackend(request, reply, { owner, name, subPath, agent, onExit }) {
     return new Promise((resolve, reject) => {
       const env = {
         PATH: process.env.PATH,
@@ -1585,9 +1845,14 @@ export async function activate(api) {
       child.on('close', (code) => {
         if (!headersDone) {
           reject(new Error(`forge: git-http-backend exited ${code} before headers${stderr ? `: ${stderr.trim()}` : ''}`));
-        } else if (code !== 0 && stderr) {
+          return;
+        }
+        if (code !== 0 && stderr) {
           api.log.warn(`forge: git-http-backend exited ${code}: ${stderr.trim()}`);
         }
+        // Refs may have moved even on a non-zero exit (partial pushes);
+        // the hook compares tips itself, so fire it either way.
+        onExit?.();
       });
 
       reply.raw.on('close', () => {
@@ -1629,6 +1894,9 @@ ${body}
       ['commits', 'Commits', `${base}/commits/${branch}`],
       ['branches', 'Branches', `${base}/branches`],
       ['tags', 'Tags', `${base}/tags`],
+      // Anchors only surfaces once the owner enabled anchoring (the marks
+      // page itself always exists — it carries the Enable pitch).
+      ...(marksEnabled(owner, name) ? [['anchors', 'Anchors', `${base}/marks`]] : []),
     ].map(([id, label, href]) => `<a class="tab${tab === id ? ' active' : ''}" href="${href}">${label}</a>`).join('');
     return `<div class="repo-strip"><div class="container">
 <div class="crumb">${ICON_REPO} <a href="${prefix}/${owner}">${esc(dispOwner(owner))}</a><span class="muted">/</span><a href="${base}"><b>${esc(name)}</b></a>
@@ -2015,7 +2283,7 @@ function el(tag,props){const e=document.createElement(tag);Object.assign(e,props
   for(let i=2;i<arguments.length;i++)e.append(arguments[i]);return e}
 function setMsg(text){const m=document.getElementById('form-msg');if(m)m.textContent=text}
 function shortId(id){return id.length>28?id.slice(0,16)+'…'+id.slice(-6):id}
-function wireForms(){for(const id of ['submit-issue','submit-comment','toggle-state','submit-pull','do-merge']){
+function wireForms(){for(const id of ['submit-issue','submit-comment','toggle-state','submit-pull','do-merge','do-enable','submit-txo']){
   const b=document.getElementById(id);if(b)b.disabled=!(T()||X())}}
 function renderAuth(){
   const box=document.getElementById('forge-auth');if(!box)return;
@@ -2107,6 +2375,25 @@ if(mg)mg.onclick=async function(){
   setMsg('');
   try{
     await call(CFG.thread+'/merge',{expectedBase:CFG.expectedBase});
+    location.reload();
+  }catch(e){setMsg(String(e.message||e))}
+};
+const de=document.getElementById('do-enable');
+if(de)de.onclick=async function(){
+  setMsg('');
+  try{
+    await call('/marks/enable',{});
+    location.reload();
+  }catch(e){setMsg(String(e.message||e))}
+};
+const tx=document.getElementById('submit-txo');
+if(tx)tx.onclick=async function(){
+  setMsg('');
+  try{
+    await call('/marks/'+CFG.markIndex+'/txo',{
+      txid:document.getElementById('f-txid').value.trim(),
+      vout:parseInt(document.getElementById('f-vout').value,10),
+      amount:parseInt(document.getElementById('f-amount').value,10)});
     location.reload();
   }catch(e){setMsg(String(e.message||e))}
 };
@@ -2534,6 +2821,111 @@ ${cards || '<div class="empty"><h3>No releases yet</h3><p class="muted">Push a t
       .header('content-disposition', `attachment; filename="${name}-${flat}${ext}"`)
       .header('x-content-type-options', 'nosniff')
       .send(child.stdout);
+  }
+
+  // ------------------------------------------------- marks page (3.5)
+
+  /** Human chain badge: tbtc4 -> "testnet4", plus an honest testnet tag. */
+  function chainBadge(c) {
+    const label = c === 'tbtc4' ? 'testnet4' : c === 'tbtc3' ? 'testnet3' : c;
+    return `<span class="badge">${esc(label)}</span>${MAINNET_CHAINS.has(c) ? '' : ' <span class="muted" style="font-size:12px">(testnet — demonstrations, not value)</span>'}`;
+  }
+
+  async function marksPage(reply, owner, name) {
+    const branch = await defaultBranch(repoDirOf(owner, name));
+    const base = `${prefix}/${owner}/${name}`;
+    const trail = loadTrail(owner, name);
+
+    if (!trail) {
+      // Not enabled: the Enable pitch. The button is the house client-JS
+      // beat (sign in, authFetch POST, reload); the API enforces owner.
+      const body = `${repoStrip(owner, name, 'anchors', branch)}<main><div class="container">
+<h1 class="page">Anchors ${chainBadge(chain)}</h1>
+<div class="empty"><h3>Anchoring is not enabled</h3>
+<p class="muted">Anchor this repository's history to Bitcoin (${esc(chain)}) via
+<a href="https://blocktrails.org">Blocktrails</a>: each default-branch tip derives a fresh taproot
+address by BIP-341 TapTweak; spending the previous mark's output to the new address advances a
+tamper-evident, Bitcoin-ordered trail. The forge only <b>derives and records</b> — funding,
+spending and verification all happen off-server.</p>
+<p class="muted">Enabling mints a forge-held trail key (${esc(chain)} custody — see the README)
+and derives mark&nbsp;0 from the current <b>${esc(branch)}</b> tip.</p>
+${authBox('Enabling anchoring')}
+<div style="display:flex;align-items:center;gap:8px">
+<button id="do-enable" class="btn btn-primary" type="button" disabled>Enable anchoring</button>
+<span id="form-msg" class="formmsg"></span>
+</div>
+</div>
+</div></main>
+${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null, state: null })}`;
+      return sendHtml(reply, 200, page(`Anchors · ${owner}/${name}`, body));
+    }
+
+    const explorerTx = (txid) => (mempoolBase
+      ? `<a class="sha" href="${esc(`${mempoolBase}/tx/${txid}`)}">${esc(txid.slice(0, 10))}…</a>`
+      : `<span class="sha">${esc(txid.slice(0, 10))}…</span>`);
+    const rows = trail.marks.map((m) => `<tr>
+<td>#${m.index}</td>
+<td><a class="sha" href="${base}/commit/${esc(m.state.commit)}">${esc(m.state.commit.slice(0, 7))}</a>
+<div class="muted" style="font-size:11px">${esc(m.state.branch)}</div></td>
+<td><code>${esc(m.stateHash.slice(0, 12))}…</code></td>
+<td><code>${esc(m.address)}</code>
+<button class="btn" style="padding:1px 8px;font-size:11px" type="button"
+ onclick="navigator.clipboard.writeText(this.previousElementSibling.textContent)">Copy</button></td>
+<td><span class="chip chip-${m.status === 'marked' ? 'marked' : 'pending'}">${m.status === 'marked' ? 'marked' : 'pending'}</span></td>
+<td>${m.status === 'marked' ? explorerTx(m.txid) : '<span class="muted">—</span>'}</td>
+</tr>`).join('\n');
+
+    const trailUrl = `${publicOrigin()}${base}/blocktrails.json`;
+    const verifyHref = `https://blocktrails.github.io/verify/?uri=${encodeURIComponent(trailUrl)}`;
+    // The next mark to land on-chain: first pending (marks are recorded
+    // in order — the trail is a linear spend chain).
+    const firstPending = trail.marks.find((m) => m.status !== 'marked') ?? null;
+    const latest = trail.marks.at(-1);
+    const fundBox = latest && latest.status !== 'marked' ? `<div class="fundbox">
+<h3 style="margin:0 0 4px">Fund this mark <span class="chip chip-pending">pending</span></h3>
+<p class="muted" style="margin:4px 0 8px">Mark #${firstPending.index} is waiting for its on-chain output. Send ${esc(chain)}
+sats to the derived address${firstPending.index > 0 ? ' — by <b>spending the previous mark’s output</b>, which IS the advance' : ' (the genesis funding)'} — the forge never broadcasts anything itself.</p>
+<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+<code>${esc(firstPending.address)}</code>
+<button class="btn" style="padding:1px 8px;font-size:11px" type="button"
+ onclick="navigator.clipboard.writeText(this.previousElementSibling.textContent)">Copy</button>
+</div>
+<pre># on YOUR machine — funding and spending happen off-server
+# 1. redeem a TXO voucher into git config nostr.privkey (maintainer's fund-agent):
+npx fund-agent "txo:${esc(chain)}:&lt;txid&gt;:&lt;vout&gt;?amount=&lt;sats&gt;&amp;key=&lt;privkey&gt;"
+# 2. send/spend to the address above (any ${esc(chain)} wallet, or the git-mark CLI, npm: git-seal):
+git mark ${firstPending.index === 0 ? 'genesis' : 'advance'} --txid &lt;txid&gt; --vout &lt;n&gt; --amount &lt;sats&gt;
+# 3. report where it landed (repo owner), and the mark turns green:
+#    POST ${esc(`${prefix}/api/repos/${owner}/${name}/marks/${firstPending.index}/txo`)}  {"txid":"…","vout":0,"amount":…}</pre>
+${authBox('Recording a transaction')}
+<div class="issueform" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+<input type="text" id="f-txid" placeholder="txid (64 hex)" style="flex:2;min-width:280px;margin-bottom:0">
+<input type="text" id="f-vout" placeholder="vout" style="width:80px;margin-bottom:0">
+<input type="text" id="f-amount" placeholder="amount (sats)" style="width:140px;margin-bottom:0">
+<button id="submit-txo" class="btn btn-primary" type="button" disabled>Record</button>
+<span id="form-msg" class="formmsg"></span>
+</div>
+</div>` : '';
+
+    const body = `${repoStrip(owner, name, 'anchors', branch)}<main><div class="container">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+<h1 class="page" style="margin:0">Anchors ${chainBadge(trail.chain)}</h1>
+<div style="display:flex;gap:8px">
+<a class="btn" href="${base}/blocktrails.json">blocktrails.json</a>
+<a class="btn btn-primary" href="${esc(verifyHref)}">Verify independently</a>
+</div>
+</div>
+<p class="muted" style="margin:4px 0 16px">Trail key <code>${esc(trail.pubkeyBase.slice(0, 10))}…</code> (forge-held, ${esc(trail.chain)}) &middot;
+${trail.marks.length} mark${trail.marks.length === 1 ? '' : 's'} &middot; the server derives and records; verification runs
+<b>client-side</b> in the hosted verifier against the chain.</p>
+<div class="box"><table class="marks">
+<tr><th>mark</th><th>commit</th><th>state hash</th><th>derived address</th><th>status</th><th>tx</th></tr>
+${rows}
+</table></div>
+${fundBox}
+</div></main>
+${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, thread: null, state: null, markIndex: firstPending ? firstPending.index : null })}`;
+    return sendHtml(reply, 200, page(`Anchors · ${owner}/${name}`, body));
   }
 
   function notFound(reply) {
@@ -3391,6 +3783,12 @@ ${cards || '<div class="empty"><h3>No releases yet</h3><p class="muted">Push a t
       };
       savePullIndex(owner, name, idx);
       api.log.info(`forge: merged PR #${pr.number} into ${owner}/${name}@${pr.base} (${mergedSha.slice(0, 7)}${fastForward ? ', ff' : ''})`);
+      // Anchoring advance (3.5): a merge moves the base ref via update-ref
+      // — the same tip-change beat as a push, routed through the same
+      // helper. recordTip no-ops when the DEFAULT branch didn't move
+      // (e.g. a merge into a side branch). Awaited so the response only
+      // goes out once the mark (if any) is derived and recorded.
+      await recordTipSafe(owner, name);
       return sendJson(reply, 200, { number: pr.number, state: 'merged', sha: mergedSha, fastForward });
     });
   }
@@ -3419,6 +3817,156 @@ ${cards || '<div class="empty"><h3>No releases yet</h3><p class="muted">Push a t
       return apiPullState(request, reply, owner, name, number, tail[1] === 'close' ? 'closed' : 'open');
     }
     return apiErr(reply, 404, 'not found');
+  }
+
+  // ---- tier 3.5: git-mark anchoring via Blocktrails --------------------
+
+  /**
+   * POST api/repos/<o>/<n>/marks/enable (owner only) — genesis: mint a
+   * fresh trail key (forge-held, testnet posture — README Findings) and
+   * derive mark 0's address from the CURRENT default-branch tip. Needs a
+   * commit to commit to; an empty repo is 422.
+   */
+  async function apiMarksEnable(request, reply, owner, name) {
+    await readJsonBody(request); // content unused; buffered for NIP-98 payload tags
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    if (ownerFromAgent(agent) !== owner) return apiErr(reply, 403, 'only the repo owner may enable anchoring');
+    const dir = repoDirOf(owner, name);
+    const branch = await defaultBranch(dir);
+    const tip = await revParse(dir, `refs/heads/${branch}`);
+    if (!tip) return apiErr(reply, 422, 'anchoring needs a commit on the default branch — push first');
+    return withMarkLock(owner, name, async () => {
+      if (loadTrail(owner, name)) return apiErr(reply, 409, 'anchoring is already enabled for this repository');
+      const priv = secp256k1.utils.randomPrivateKey(); // throwaway-grade custody, by design
+      const trail = {
+        v: 1,
+        chain,
+        privkey: Buffer.from(priv).toString('hex'),
+        pubkeyBase: Buffer.from(secp256k1.getPublicKey(priv, true)).toString('hex'),
+        createdAt: Math.floor(Date.now() / 1000),
+        marks: [],
+      };
+      const mark = appendMark(trail, { commit: tip, repo: `${owner}/${name}`, branch });
+      saveTrail(owner, name, trail);
+      api.log.info(`forge: anchoring enabled for ${owner}/${name} on ${chain} — genesis mark ${mark.address} `
+        + '(trail key is FORGE-HELD in pluginDir/marks; testnet custody)');
+      return sendJson(reply, 201, { enabled: true, chain, pubkeyBase: trail.pubkeyBase, mark: publicMark(mark) });
+    });
+  }
+
+  /**
+   * POST api/repos/<o>/<n>/marks/<i>/txo (owner only) { txid, vout,
+   * amount } — record where the mark landed on-chain. Shape-validated and
+   * RECORDED, never verified: the server does no chain fetches, ever —
+   * independent verification is the hosted verifier's job, client-side
+   * (that split is the point; README Findings). Marks are recorded in
+   * order because the trail is a linear spend chain.
+   */
+  async function apiMarkTxo(request, reply, owner, name, index) {
+    const p = await readJsonBody(request); // body before auth (NIP-98 payload tag)
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    if (ownerFromAgent(agent) !== owner) return apiErr(reply, 403, 'only the repo owner may record a mark transaction');
+    if (!p) return apiErr(reply, 400, 'invalid JSON body');
+    const txid = typeof p.txid === 'string' ? p.txid.toLowerCase() : '';
+    if (!TXID64.test(txid)) return apiErr(reply, 422, 'txid must be 64 hex chars');
+    if (!Number.isInteger(p.vout) || p.vout < 0 || p.vout > 0x7fffffff) return apiErr(reply, 422, 'vout must be a non-negative integer');
+    if (!Number.isInteger(p.amount) || p.amount <= 0 || p.amount > SATS_CAP) return apiErr(reply, 422, 'amount must be a positive integer (satoshis)');
+    return withMarkLock(owner, name, async () => {
+      const trail = loadTrail(owner, name);
+      if (!trail) return apiErr(reply, 404, 'anchoring is not enabled for this repository');
+      const mark = trail.marks[index];
+      if (!mark) return apiErr(reply, 404, 'no such mark');
+      if (mark.status === 'marked') return apiErr(reply, 409, 'this mark already has a recorded transaction');
+      if (index > 0 && trail.marks[index - 1].status !== 'marked') {
+        return apiErr(reply, 409, 'record marks in order: the trail is a linear spend chain (mark N spends mark N-1)');
+      }
+      Object.assign(mark, { txid, vout: p.vout, amount: p.amount, status: 'marked', markedAt: Math.floor(Date.now() / 1000) });
+      saveTrail(owner, name, trail);
+      api.log.info(`forge: mark #${mark.index} of ${owner}/${name} recorded as ${txid.slice(0, 10)}…:${p.vout} (claim recorded, not verified)`);
+      return sendJson(reply, 200, { index: mark.index, status: 'marked', txid, vout: p.vout, amount: p.amount });
+    });
+  }
+
+  /** GET api/repos/<o>/<n>/marks — the full mark list (never the key). */
+  function apiMarksList(reply, owner, name) {
+    const trail = loadTrail(owner, name);
+    if (!trail) return sendJson(reply, 200, { enabled: false, chain });
+    return sendJson(reply, 200, {
+      enabled: true,
+      chain: trail.chain,
+      pubkeyBase: trail.pubkeyBase,
+      marks: trail.marks.map(publicMark),
+    });
+  }
+
+  async function apiMarksHandler(request, reply, owner, name, tail) {
+    const method = request.method;
+    if (tail.length === 0) {
+      if (method === 'GET' || method === 'HEAD') return apiMarksList(reply, owner, name);
+      return apiErr(reply, 405, 'method not allowed');
+    }
+    if (tail.length === 1 && tail[0] === 'enable') {
+      if (method !== 'POST') return apiErr(reply, 405, 'method not allowed');
+      return apiMarksEnable(request, reply, owner, name);
+    }
+    if (tail.length === 2 && tail[1] === 'txo' && MARK_INDEX_RE.test(tail[0])) {
+      if (method !== 'POST') return apiErr(reply, 405, 'method not allowed');
+      return apiMarkTxo(request, reply, owner, name, +tail[0]);
+    }
+    return apiErr(reply, 404, 'not found');
+  }
+
+  /**
+   * GET <prefix>/<owner>/<name>/blocktrails.json — the verifier-compatible
+   * trail document (the shape blocktrails/verify consumes: pubkeyBase,
+   * chain, states[], txo[] as `txo:` URIs whose amounts/spend-chain the
+   * verifier checks on-chain, client-side). Served with
+   * Access-Control-Allow-Origin: * — this ONE route is a public
+   * verification document whose whole purpose is to be fetched
+   * cross-origin by the hosted verifier page; everything in it is already
+   * public via the marks page, so the CORS grant widens reach, not
+   * exposure (README Findings). Only MARKED marks enter states/txo (the
+   * verifier walks the spend chain; pending marks have nothing on-chain
+   * yet) — the full list, pending included, rides in the additive `marks`
+   * field.
+   */
+  function blocktrailsResp(reply, owner, name) {
+    const trail = loadTrail(owner, name);
+    if (!trail) {
+      return reply.code(404)
+        .header('content-type', 'application/json; charset=utf-8')
+        .header('access-control-allow-origin', '*')
+        .header('x-content-type-options', 'nosniff')
+        .send(JSON.stringify({ error: 'anchoring is not enabled for this repository' }));
+    }
+    const marked = [];
+    for (const m of trail.marks) {
+      if (m.status !== 'marked') break; // recorded strictly in order; the chain stops at the first pending
+      marked.push(m);
+    }
+    const doc = {
+      ...(marked.length ? { '@id': txoUriOf(trail, marked[0]) } : {}),
+      '@type': 'Blocktrail',
+      version: '0.0.3',
+      profile: 'gitmark',
+      pubkeyBase: trail.pubkeyBase,
+      chain: trail.chain,
+      // Additive, self-describing fields (the verifier ignores them):
+      // how addresses are derived and how states are hashed, so a future
+      // re-deriving verifier needs nothing out-of-band.
+      derivation: 'blocktrails-v0.2 chained BIP-341 TapTweak',
+      stateHash: 'sha256(JSON.stringify({commit,repo,branch}))',
+      states: marked.map((m) => m.state.commit),
+      txo: marked.map((m) => txoUriOf(trail, m)),
+      marks: trail.marks.map(publicMark),
+    };
+    return reply.code(200)
+      .header('content-type', 'application/json; charset=utf-8')
+      .header('access-control-allow-origin', '*')
+      .header('x-content-type-options', 'nosniff')
+      .send(JSON.stringify(doc, null, 2));
   }
 
   // ---- tier 2.5: NIP-98 -> push-token exchange + hosted-content routes ----
@@ -3525,12 +4073,13 @@ ${cards || '<div class="empty"><h3>No releases yet</h3><p class="muted">Push a t
 
     const action = rest[2];
     const tail = rest.slice(3);
-    if (!['issues', 'pulls', 'fork', 'labels'].includes(action) && !isRead) return apiErr(reply, 405, 'method not allowed');
+    if (!['issues', 'pulls', 'fork', 'labels', 'marks'].includes(action) && !isRead) return apiErr(reply, 405, 'method not allowed');
     try {
       switch (action) {
         case 'issues': return await apiIssuesHandler(request, reply, owner, name, tail);
         case 'pulls': return await apiPullsHandler(request, reply, owner, name, tail);
         case 'labels': return await apiLabelsHandler(request, reply, owner, name, tail);
+        case 'marks': return await apiMarksHandler(request, reply, owner, name, tail);
         case 'search': return tail.length === 0 ? await apiSearch(reply, owner, name, request.query) : apiErr(reply, 404, 'not found');
         case 'releases': return tail.length === 0 ? await apiReleases(reply, owner, name) : apiErr(reply, 404, 'not found');
         case 'fork':
@@ -3640,7 +4189,13 @@ ${cards || '<div class="empty"><h3>No releases yet</h3><p class="muted">Push a t
           if (!isWrite) return reply.code(404).send('no such repository\n');
           await materialize(owner, name, agent); // push-to-create, own namespace only
         }
-        return runBackend(request, reply, { owner, name, subPath, agent });
+        // Anchoring advance (3.5): when a receive-pack on an enabled repo
+        // finishes, compare the default-branch tip and stack a pending
+        // mark if it moved. recordTip re-checks everything under the lock.
+        const onExit = (isWrite && marksEnabled(owner, name))
+          ? () => recordTipSafe(owner, name)
+          : undefined;
+        return runBackend(request, reply, { owner, name, subPath, agent, onExit });
       }
 
       // ---- web UI lane (GET only from here on)
@@ -3676,6 +4231,8 @@ ${cards || '<div class="empty"><h3>No releases yet</h3><p class="muted">Push a t
           case 'tags': return tail.length === 0 ? await refsPage(reply, owner, name, 'tags') : notFound(reply);
           case 'search': return tail.length === 0 ? await searchPage(reply, owner, name, request.query) : notFound(reply);
           case 'releases': return tail.length === 0 ? await releasesPage(reply, owner, name) : notFound(reply);
+          case 'marks': return tail.length === 0 ? await marksPage(reply, owner, name) : notFound(reply);
+          case 'blocktrails.json': return tail.length === 0 ? blocktrailsResp(reply, owner, name) : notFound(reply);
           case 'archive': return tail.length ? await archiveResp(reply, owner, name, tail) : notFound(reply);
           case 'compare': return tail.length ? await comparePage(reply, owner, name, tail.join('/')) : notFound(reply);
           case 'pulls': {
@@ -3710,7 +4267,8 @@ ${cards || '<div class="empty"><h3>No releases yet</h3><p class="muted">Push a t
     `forge: repos at ${prefix}/<owner>/<name>.git, UI at ${prefix}/, issues at ${prefix}/<owner>/<name>/issues, `
     + `pulls at ${prefix}/<owner>/<name>/pulls, push tokens at ${prefix}/api/token, xlogin at ${prefix}/xlogin.js `
     + `(backend ${backend}, reads ${privateRepos ? 'owner-only' : 'public'}, `
-    + `merges ${mergeTreeOk ? 'on' : `OFF — ${gitVersion} lacks merge-tree --write-tree`})`,
+    + `merges ${mergeTreeOk ? 'on' : `OFF — ${gitVersion} lacks merge-tree --write-tree`}, `
+    + `anchoring on ${chain} — derive-and-record only, no chain I/O)`,
   );
 
   return { deactivate() { /* nothing persistent to tear down */ } };

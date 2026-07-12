@@ -1,4 +1,4 @@
-# forge — a personal git forge (tier 1: hosting + browsing; tier 2: issues; tier 2.5: nostr agents + xlogin; tier 3a: forks + pull requests; polish: labels, search, releases)
+# forge — a personal git forge (tier 1: hosting + browsing; tier 2: issues; tier 2.5: nostr agents + xlogin; tier 3a: forks + pull requests; polish: labels, search, releases; tier 3.5: Bitcoin-anchored history via Blocktrails)
 
 The useful slice of Gogs/Gitea as a JSS plugin: push a repo over smart
 HTTP, get a GitHub-style (light theme) web UI for it — repo list, file
@@ -16,12 +16,20 @@ wave adds **labels** on issues and PRs (GitHub's default set, colored
 chips, `?label=` filters), **read-time search** (repo-list filter +
 in-repo `git grep`, bounded, no index), **releases** (every tag with
 streamed tar.gz/zip archives), and hides the internal compare refs from
-`ls-remote` (closing Finding 15).
-Zero npm dependencies, zero build step, no
-framework: every page is server-rendered HTML with inline CSS, all git
-work is done by the system `git` binary, and the wire protocol is
-delegated to the stock `git-http-backend` CGI (gitscratch's proven
-plumbing, re-rooted).
+`ls-remote` (closing Finding 15). Tier 3.5 adds **git-mark anchoring via
+[Blocktrails](https://blocktrails.org)** — Bitcoin(testnet)-anchored,
+tamper-evident repo history: every default-branch tip derives a fresh
+taproot address; spending the previous mark's output to the new address
+IS the advance; the forge only **derives and records** (see "Anchors").
+Zero build step, no framework: every page is server-rendered HTML with
+inline CSS, all git work is done by the system `git` binary, and the
+wire protocol is delegated to the stock `git-http-backend` CGI
+(gitscratch's proven plumbing, re-rooted). One npm dependency —
+`@noble/curves`, the host's own crypto library — arrived with tier 3.5
+for the secp256k1 point math (the `blocktrails` npm package is
+deliberately **not** imported: the spec math is implemented locally and
+cross-checked in test.js against a vector generated from the
+maintainer's reference implementation).
 
 ```js
 plugins: [{ id: 'forge', module: 'forge/plugin.js', prefix: '/forge',
@@ -30,6 +38,8 @@ plugins: [{ id: 'forge', module: 'forge/plugin.js', prefix: '/forge',
               gitHttpBackend: '/usr/lib/git-core/git-http-backend', // optional
               pushTokenTtl: 3600,       // default lifetime of exchanged push tokens (s)
               cspConnect: [],           // extra connect-src origins (e.g. external Solid IdPs)
+              chain: 'tbtc4',           // anchoring chain (testnet4); 'btc' is REFUSED …
+              allowMainnet: false,      // … unless this is explicitly true (see Finding 18)
             } }]
 ```
 
@@ -86,6 +96,8 @@ git -c http.extraHeader="Authorization: Bearer <token>" push forge main
 | `.../pulls/<n>` | PR conversation: state banner (merged / closed / clean-with-merge-button / conflict list), thread, comment form |
 | `.../pulls/<n>/commits`, `.../pulls/<n>/files` | GitHub-style sub-tabs: the ahead commits, the structured diff |
 | `.../pulls/new?base=...&head=...` | new-PR form (from the compare page) |
+| `.../marks` | Anchors: the mark table (commit, state hash, derived tb1p… address, pending/marked chips, mempool.space tx links), chain badge, "Verify independently" hand-off, fund-this-mark box; the Enable pitch when anchoring is off |
+| `.../blocktrails.json` | the verifier-compatible trail document — the ONE CORS-open (`Access-Control-Allow-Origin: *`) route |
 | `<prefix>/<owner>/<name>.git/...` | git smart HTTP (`info/refs`, `git-upload-pack`, `git-receive-pack`) |
 | `<prefix>/api/token` | POST: exchange any `getAgent` credential for a push token (see "Nostr agents") |
 | `<prefix>/api/hosted/<hex>/<uuid>` | GET (public) / DELETE (author-only): a podless agent's hosted issue words |
@@ -184,6 +196,26 @@ Polish wave (additive):
   `{ releases: [{ tag, sha, at, annotated, message, tarball, zipball }] }`
   — every tag, newest first; `message` is the first line of an annotated
   tag's message, `null` for lightweight tags; `sha` is the peeled commit.
+
+Tier 3.5 (additive):
+
+- `GET api/repos/<o>/<n>/marks` → `{ enabled: false, chain }` or
+  `{ enabled: true, chain, pubkeyBase, marks: [{ index,
+     state: {commit, repo, branch}, stateHash, program, address, status:
+     'pending'|'marked', at, txid?, vout?, amount?, markedAt? }] }` —
+  never the trail privkey (test-proven).
+- `POST .../marks/enable` (OWNER only) → 201 `{ enabled, chain,
+  pubkeyBase, mark }` — genesis: mints the trail key and derives mark 0
+  from the current default-branch tip; 422 on an empty repo, 409 when
+  already enabled (no silent key rotation).
+- `POST .../marks/<i>/txo` `{txid, vout, amount}` (OWNER only) →
+  `{ index, status: 'marked', txid, vout, amount }` — records where the
+  mark landed on-chain. Shape-validated (64-hex txid, integer vout,
+  positive integer sats) and **recorded, never verified** — the server
+  does no chain I/O. 409 out of order (the trail is a linear spend
+  chain), 409 when already marked.
+- `GET <prefix>/<o>/<n>/blocktrails.json` → the verifier document (see
+  "Anchors"); 404 (still CORS-readable) when anchoring is off.
 
 Errors are `{ error }` with 4xx. `cloneUrl` is absolute: the origin comes
 from `api.serverInfo` (#601) at request time, with `config.baseUrl` as
@@ -374,6 +406,79 @@ stdout** to the response (attachment disposition, no buffering); the ref
 is validated (`okRef`/sha) and resolved with `rev-parse` *before* any
 header goes out, so a bogus ref is a clean 404. Any resolvable ref works
 — tags, branches, shas — which is exactly GitHub's archive behavior.
+
+## Anchors (tier 3.5): git-mark anchoring via Blocktrails
+
+**The design stance, absolute: the server derives and records; it NEVER
+touches the network.** All trail math is pure `@noble/curves` +
+`node:crypto`; Bitcoin appears only as derived bech32m addresses,
+mempool.space **links** in HTML (the user clicks), the served
+`blocktrails.json`, and README instructions for the maintainer's own
+CLIs (`fund-agent`, `git mark`) which do the funding/broadcasting
+elsewhere. No fetch to any chain API from the plugin, ever (Finding 19).
+
+**The derivation** (blocktrails spec v0.2, normative — implemented from
+the spec, not imported):
+
+```
+state      = { commit, repo, branch }              one per default-branch tip
+h          = sha256(JSON.stringify(state))         the git-mark-demo state-hash convention
+tᵢ         = tagged_hash("TapTweak", x_only(Pᵢ₋₁) || h) mod n     BIP-341 TapTweak
+Pᵢ         = Pᵢ₋₁ + tᵢ·G                           chained; P₋₁ = the trail base key
+address    = bech32m(hrp, 1, x_only(Pᵢ))           tb1p… on testnet4
+```
+
+Each state derives a **new** address by tweaking; **spending the
+previous mark's UTXO to the new address IS the advance** — a linear,
+Bitcoin-ordered chain of commitments. The plugin derives and records
+addresses and the expected chain; the transactions happen outside.
+
+**The lifecycle**:
+
+1. **Enable** (`POST .../marks/enable`, owner): mints a fresh trail key
+   (forge-held, 0600 in `pluginDir/marks/<owner>/<repo>.json` — the
+   custody trade-off is Finding 18) and derives mark 0 from the CURRENT
+   default-branch tip.
+2. **Advance on tip change**: when `git-receive-pack` completes on an
+   anchoring-enabled repo (the CGI child's exit is the post-receive
+   moment — Finding 17), or a PR merge lands via `update-ref`, one
+   `recordTip` helper compares the default-branch tip to the last mark
+   and appends a new **pending** mark. Multiple pushes stack pending
+   marks honestly — each mark is one state; only funded/spent marks ever
+   become `marked`. Non-default-branch pushes never advance
+   (test-proven). 500-mark cap per trail.
+3. **Fund/spend off-server**: the marks page shows the first pending
+   mark's address plus copy-paste `npx fund-agent "txo:tbtc4:…"` /
+   `git mark advance` instructions per the maintainer's READMEs.
+4. **Record** (`POST .../marks/<i>/txo`, owner): report `{txid, vout,
+   amount}`; the mark flips to `marked`. Recorded in order — the trail
+   is a linear spend chain. Shape-checked, never chain-checked.
+5. **Verify independently**: the marks page hands off to the hosted
+   verifier (`https://blocktrails.github.io/verify/?uri=<this repo's
+   blocktrails.json>`), which fetches the trail document cross-origin
+   and checks every mark against the chain **client-side** — tx exists,
+   confirmed, amount matches, spends the previous mark. The server
+   records claims; an independent client verifies them. That split is
+   the architecture's point.
+
+**`blocktrails.json`** is exactly the shape the zero-build verifier
+consumes (`@type: Blocktrail`, `profile: gitmark`, `pubkeyBase`,
+`chain`, `states[]` = the marked commits, `txo[]` =
+`txo:<chain>:<txid>:<vout>?amount=…&commit=…&pubkey=…` URIs), plus
+additive self-description (`derivation`, `stateHash`, and the full
+`marks[]` list including pendings). It is served with
+`Access-Control-Allow-Origin: *` — a deliberate one-route CORS grant:
+the document is a public verification artifact whose entire purpose is
+to be fetched cross-origin by a verifier page; everything in it is
+already public on the marks page, so CORS widens reach, not exposure.
+(The hosted-verifier hand-off is a plain `<a href>` navigation, which
+CSP's `connect-src 'self'` does not govern — no CSP delta needed.)
+
+**Testnet-only defaults**: `chain: 'tbtc4'` (testnet4). Mainnet chain
+identifiers (`btc`/`mainnet`/`bitcoin`) are **refused at activate** —
+loudly, naming the stakes — unless `config.allowMainnet: true`; unknown
+chains are refused too (no address is better than a wrong-network
+address someone might fund).
 
 ## Nostr agents (tier 2.5)
 
@@ -798,3 +903,92 @@ invisible — the page renders, the button clicks, nothing happens, and
 only the browser console says why. Same lesson as Finding 8's
 connect-src discovery: each new *kind* of page interactivity trips a
 different CSP directive.
+
+### 17. Core called git-mark post-receive "core, not a plugin" (#271) — the forge moved that line
+
+Core's ISSUES.md argued a git-mark hook must live in core because only
+core owns the receive path. The forge is the counter-witness: because
+this plugin delegates the wire protocol to `git-http-backend` but OWNS
+the CGI child, "receive finished, refs are final" is simply the child's
+`close` event — a one-line `onExit` seam on the existing `runBackend`.
+Both tip-movers route through one `recordTip` helper: receive-pack via
+`onExit`, PR merges via a direct call after `update-ref` (they move the
+tip without any receive-pack). `recordTip` re-checks everything under
+the per-repo mark lock (compares the tip to the last mark's state), so
+firing it on *any* child exit — even a partially failed push — is
+correct rather than optimistic. What made it plugin-able wasn't a new
+api seam; it was owning the receive path in the first place. The test
+wrinkle: the hook fires after the response, so push-advance assertions
+poll (the merge route, by contrast, awaits `recordTip` before
+answering — the mark is in the response's happens-before).
+
+### 18. Forge-held trail keys are testnet custody — real custody is the xlogin/NIP-07 path
+
+Enabling anchoring mints the trail privkey server-side and keeps it in
+`pluginDir/marks/<owner>/<repo>.json` (0600, never crossing an API
+surface — test-proven against every marks route). That is CUSTODY: the
+operator can read the key, and whoever holds the key controls all
+future transitions and the funds in the head output (the spec's own
+threat model). On testnet4 — the enforced default — the stakes are
+demonstration sats, and the convenience (the forge can derive every
+future address without a signing round-trip) is worth it. On mainnet it
+would not be, which is exactly why `chain: 'btc'` is refused at
+activate unless `allowMainnet` is explicit. The honest next step is
+client-side keys: the owner's OWN key signs each advance in the browser
+(xlogin already ships NIP-07/NIP-98 plumbing on these very pages), the
+forge stores only `pubkeyBase` and derives addresses from public
+material — the derivation needs no secrets, only the spend does. Then
+the forge is purely a recorder and the custody Finding dissolves.
+
+### 19. Derive-and-record vs. broadcast-and-verify: the SSRF-free anchoring architecture
+
+The obvious design — server calls mempool.space to check funding, maybe
+broadcasts too — makes the pod server an outbound HTTP client steered
+by user-shaped data (SSRF surface, availability coupling, and a trusted
+third party smuggled into the trust chain). The split here keeps the
+server pure: it DERIVES addresses (local math) and RECORDS owner-shaped
+claims (shape-validated JSON); funding and broadcasting happen in the
+owner's own CLIs; verification happens in an independent, zero-build
+client-side verifier that anyone can point at the served
+`blocktrails.json`. The server never learns whether a claim is true —
+and doesn't need to, because the verifier checks the actual chain and
+the claims are cheap-talk until it does. One deliberate CORS grant
+(`Access-Control-Allow-Origin: *` on `blocktrails.json` alone) is the
+entire integration surface between the two halves. Bitcoin appears in
+the plugin as: bech32m strings, `https://mempool.space/...` hrefs, and
+instructions. `grep -c fetch` on the anchoring code: zero.
+
+### 20. x-only parity in TapTweak land — and the maintainer's own CLI disagrees with the spec
+
+Two real discoveries from implementing the derivation instead of
+importing it:
+
+- **Parity is an output-encoding concern, not a chain concern.** The
+  spec keeps FULL points through the chain (`Pᵢ = Pᵢ₋₁ + tᵢ·G`, parity
+  and all) and takes `x_only` twice per step: as the tweak input (the
+  raw x of the possibly-odd-Y running point — NOT re-lifted to even-Y
+  as BIP-341 wallet stacks do between steps) and at the output boundary
+  (where `x(P) == x(−P)` makes comparison parity-free; only a SPENDER
+  must negate per BIP-340, and this plugin never spends). Get the
+  lift-x placement wrong and addresses diverge silently — which is why
+  the test suite pins a vector generated by RUNNING the maintainer's
+  reference implementation (`blocktrails` deriveChainedPublicKey +
+  p2trXonly on fixed inputs; the mirror carries no hard-coded spec
+  vectors, so the reference impl is the vector source), plus an
+  independent bech32m decode round-trip. bech32 vs bech32m turned out
+  to be ONE constant (`1` vs `0x2bc830a3`) over the same polymod — the
+  tier-2.5 npub encoder and the tb1p… encoder now share their guts.
+- **The git-mark CLI (npm `git-seal`) does not implement the spec's
+  derivation.** It uses the raw commit hash as the scalar
+  (`t = commit mod n` — no TapTweak, no state hash, no pubkey
+  binding), while the spec mandates
+  `tagged_hash("TapTweak", x_only(P) || sha256(state))` and the
+  git-mark-demo hashes `{commit, repo, branch}`. This plugin follows
+  the SPEC (the task's normative reference) with the demo's state
+  convention — so addresses derived here will not match `git mark
+  address` for the same commits under the same key. Interop survives
+  because the hosted verifier checks the SPEND CHAIN (tx exists,
+  confirmed, amount, spends-previous), not the derivation; the
+  divergence is written down here and self-described in the served
+  document (`derivation`, `stateHash` fields) so a future re-deriving
+  verifier knows exactly what it is looking at.
