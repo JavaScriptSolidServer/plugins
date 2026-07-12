@@ -393,6 +393,270 @@ describe('forge plugin', () => {
     assert.ok(evil.status >= 400 && evil.status < 500, `api traversal got ${evil.status}`);
   });
 
+  // ------------------------------------------ tier 2: issues + comments
+  // The architecture under test: bodies are pod resources the AUTHOR owns
+  // (loopback PUT with the author's own forwarded Bearer), the forge keeps
+  // only a pointer spine in pluginDir — so deleting the pod resource
+  // deletes the words everywhere, and cross-user comments really live in
+  // the commenter's pod.
+
+  describe('issues (tier 2: bodies in pods, spine in pluginDir)', () => {
+    let dana;
+    let apiBase;
+    let issueUrl;   // casey's issue #1 body, in casey's pod
+    let commentUrl; // dana's comment, in dana's pod
+
+    before(async () => {
+      dana = await registerAndMint(base, 'dana');
+      apiBase = `${base}/forge/api/repos/casey/demo`;
+    });
+
+    const authed = (token) => ({ 'content-type': 'application/json', authorization: `Bearer ${token}` });
+
+    it('anonymous issue POST is 401', async () => {
+      const res = await fetch(`${apiBase}/issues`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ title: 'nope', body: 'anon' }),
+      });
+      assert.strictEqual(res.status, 401);
+      assert.ok(res.headers.get('www-authenticate'), 'WWW-Authenticate on the API 401');
+      assert.ok((await res.json()).error);
+    });
+
+    it("casey opens issue #1 and the body lives in casey's OWN pod", async () => {
+      const res = await fetch(`${apiBase}/issues`, {
+        method: 'POST',
+        headers: authed(casey.access_token),
+        body: JSON.stringify({ title: 'Clone fails on Windows', body: 'Steps:\n\n1. clone\n2. see **boom**' }),
+      });
+      assert.strictEqual(res.status, 201);
+      const j = await res.json();
+      assert.strictEqual(j.number, 1);
+      issueUrl = j.resourceUrl;
+      assert.ok(issueUrl.includes('/casey/public/forge/casey--demo/issue-'),
+        `resource recorded in casey's pod namespace: ${issueUrl}`);
+      // The pod resource is REAL: fetch it directly, no forge in the path.
+      const direct = await fetch(issueUrl);
+      assert.strictEqual(direct.status, 200);
+      const doc = await direct.json();
+      assert.strictEqual(doc.type, 'ForgeIssue');
+      assert.strictEqual(doc.repo, 'casey/demo');
+      assert.strictEqual(doc.issue, 1);
+      assert.strictEqual(doc.author, casey.webid);
+      assert.ok(doc.body.includes('**boom**'), 'raw markdown stored in the pod');
+    });
+
+    it("dana's comment lives in DANA's pod (the cross-user proof)", async () => {
+      const res = await fetch(`${apiBase}/issues/1/comments`, {
+        method: 'POST',
+        headers: authed(dana.access_token),
+        body: JSON.stringify({ body: 'Repro on my machine too, with `git 2.44`.' }),
+      });
+      assert.strictEqual(res.status, 201);
+      const j = await res.json();
+      assert.strictEqual(j.comments, 1);
+      commentUrl = j.resourceUrl;
+      assert.ok(commentUrl.includes('/dana/public/forge/casey--demo/comment-'),
+        `resource recorded in dana's pod namespace: ${commentUrl}`);
+      const direct = await fetch(commentUrl);
+      assert.strictEqual(direct.status, 200);
+      const doc = await direct.json();
+      assert.strictEqual(doc.type, 'ForgeComment');
+      assert.strictEqual(doc.issue, 1);
+      assert.strictEqual(doc.author, dana.webid);
+    });
+
+    it('thread JSON re-fetches both bodies from the pods, authors correct', async () => {
+      const t = await (await fetch(`${apiBase}/issues/1`)).json();
+      assert.strictEqual(t.number, 1);
+      assert.strictEqual(t.state, 'open');
+      assert.strictEqual(t.author, casey.webid);
+      assert.strictEqual(t.thread.length, 2);
+      const [head, c1] = t.thread;
+      assert.strictEqual(head.author, casey.webid);
+      assert.strictEqual(head.removed, false);
+      assert.ok(head.body.includes('**boom**'), 'raw body straight from the pod');
+      assert.ok(head.html.includes('<strong>boom</strong>'), 'pre-rendered markdown html');
+      assert.strictEqual(c1.author, dana.webid);
+      assert.strictEqual(c1.resourceUrl, commentUrl);
+      assert.ok(c1.html.includes('<code>git 2.44</code>'));
+    });
+
+    it('thread HTML: comment boxes, rendered markdown, owner badge', async () => {
+      const res = await fetch(`${base}/forge/casey/demo/issues/1`);
+      assert.strictEqual(res.status, 200);
+      const html = await res.text();
+      assert.ok(html.includes('Clone fails on Windows'), 'title shown');
+      assert.ok(html.includes('<strong>boom</strong>'), 'issue body markdown rendered');
+      assert.ok(html.includes('>owner</span>'), "casey's box carries the owner badge");
+      assert.ok(html.includes('>dana</b>'), 'commenter named');
+      assert.ok(html.includes('state-open'), 'open pill');
+    });
+
+    it('the Issues tab carries an open-count badge on repo pages', async () => {
+      const html = await (await fetch(`${base}/forge/casey/demo`)).text();
+      assert.match(html, /Issues <span class="badge">1<\/span>/);
+    });
+
+    it('XSS probe: evil title and <script> body render inert everywhere', async () => {
+      const res = await fetch(`${apiBase}/issues`, {
+        method: 'POST',
+        headers: authed(casey.access_token),
+        body: JSON.stringify({
+          title: '<img src=x onerror=alert(1)> "quoted" title',
+          body: 'attack:\n\n<script>alert("issue-xss")</script>\n\nend',
+        }),
+      });
+      assert.strictEqual(res.status, 201);
+      const { number } = await res.json();
+      assert.strictEqual(number, 2, 'numbering survives a second issue');
+
+      const html = await (await fetch(`${base}/forge/casey/demo/issues/2`)).text();
+      assert.ok(!html.includes('<script>alert'), 'no literal script tag from the body');
+      assert.ok(!html.includes('<img src=x'), 'no literal img injection from the title');
+      assert.ok(html.includes('&lt;script&gt;alert('), 'body attack line visible but escaped');
+
+      const t = await (await fetch(`${apiBase}/issues/2`)).json();
+      assert.ok(!t.thread[0].html.includes('<script>'), 'html field escaped');
+      assert.ok(t.thread[0].html.includes('&lt;script&gt;'), 'attack visible as text in html field');
+      assert.ok(t.thread[0].body.includes('<script>'), 'raw body stays raw in JSON — JSON is the escape');
+      assert.strictEqual(t.title, '<img src=x onerror=alert(1)> "quoted" title', 'title raw in JSON');
+    });
+
+    it('deleting the pod resource turns the slot into a removed placeholder', async () => {
+      // dana deletes HER OWN resource from HER pod — the forge is not asked.
+      const del = await fetch(commentUrl, {
+        method: 'DELETE',
+        headers: { authorization: `Bearer ${dana.access_token}` },
+      });
+      assert.ok([200, 202, 204, 205].includes(del.status), `dana deletes her own resource: ${del.status}`);
+
+      const t = await (await fetch(`${apiBase}/issues/1`)).json();
+      const slot = t.thread[1];
+      assert.strictEqual(slot.removed, true);
+      assert.strictEqual(slot.body, null);
+      assert.strictEqual(slot.html, null);
+      assert.strictEqual(slot.author, dana.webid, 'the pointer (who/when) remains');
+
+      const html = await (await fetch(`${base}/forge/casey/demo/issues/1`)).text();
+      assert.ok(html.includes('content removed by its author'), 'placeholder rendered');
+      assert.ok(!html.includes('git 2.44'), 'the deleted words are gone from the forge');
+    });
+
+    it("dana cannot close casey's issue (403); anonymous close is 401", async () => {
+      const res = await fetch(`${apiBase}/issues/1/close`, { method: 'POST', headers: authed(dana.access_token) });
+      assert.strictEqual(res.status, 403);
+      const anon = await fetch(`${apiBase}/issues/1/close`, { method: 'POST' });
+      assert.strictEqual(anon.status, 401);
+      const t = await (await fetch(`${apiBase}/issues/1`)).json();
+      assert.strictEqual(t.state, 'open', 'still open');
+    });
+
+    it('casey (owner) closes; the list filters split open/closed correctly', async () => {
+      const res = await fetch(`${apiBase}/issues/1/close`, { method: 'POST', headers: authed(casey.access_token) });
+      assert.strictEqual(res.status, 200);
+      assert.deepStrictEqual(await res.json(), { number: 1, state: 'closed' });
+
+      const open = await (await fetch(`${apiBase}/issues?state=open`)).json();
+      assert.deepStrictEqual(open.issues.map((i) => i.number), [2]);
+      assert.strictEqual(open.openCount, 1);
+      assert.strictEqual(open.closedCount, 1);
+
+      const closed = await (await fetch(`${apiBase}/issues?state=closed`)).json();
+      assert.deepStrictEqual(closed.issues.map((i) => i.number), [1]);
+      assert.strictEqual(closed.issues[0].comments, 1, 'comment count survives deletion (pointer, not body)');
+
+      const html = await (await fetch(`${base}/forge/casey/demo/issues?state=closed`)).text();
+      assert.ok(html.includes('Clone fails on Windows'), 'closed filter tab lists issue #1');
+      const openHtml = await (await fetch(`${base}/forge/casey/demo/issues`)).text();
+      assert.ok(!openHtml.includes('Clone fails on Windows'), 'open list no longer shows it');
+    });
+
+    it('reopen + retitle work for owner/author; a third party gets 403', async () => {
+      const re = await fetch(`${apiBase}/issues/1/reopen`, { method: 'POST', headers: authed(casey.access_token) });
+      assert.deepStrictEqual(await re.json(), { number: 1, state: 'open' });
+
+      const pa = await fetch(`${apiBase}/issues/1`, {
+        method: 'PATCH',
+        headers: authed(casey.access_token),
+        body: JSON.stringify({ title: 'Clone fails on Windows 11' }),
+      });
+      assert.strictEqual(pa.status, 200);
+      const t = await (await fetch(`${apiBase}/issues/1`)).json();
+      assert.strictEqual(t.state, 'open');
+      assert.strictEqual(t.title, 'Clone fails on Windows 11');
+
+      const forbidden = await fetch(`${apiBase}/issues/1`, {
+        method: 'PATCH',
+        headers: authed(dana.access_token),
+        body: JSON.stringify({ title: 'hijack' }),
+      });
+      assert.strictEqual(forbidden.status, 403);
+      // leave #1 closed again so later readers see a stable split
+      await fetch(`${apiBase}/issues/1/close`, { method: 'POST', headers: authed(casey.access_token) });
+    });
+
+    it('a non-owner issue author can close their own issue', async () => {
+      const res = await fetch(`${apiBase}/issues`, {
+        method: 'POST',
+        headers: authed(dana.access_token),
+        body: JSON.stringify({ title: 'Docs typo', body: 'in the README' }),
+      });
+      assert.strictEqual(res.status, 201);
+      const { number } = await res.json();
+      assert.strictEqual(number, 3, 'numbering keeps counting');
+      const close = await fetch(`${apiBase}/issues/${number}/close`, { method: 'POST', headers: authed(dana.access_token) });
+      assert.strictEqual(close.status, 200, 'the issue author may close, without owning the repo');
+    });
+
+    it('issue list pagination shape: state, page, perPage, hasMore', async () => {
+      const p1 = await (await fetch(`${apiBase}/issues`)).json();
+      assert.strictEqual(p1.state, 'open');
+      assert.strictEqual(p1.page, 1);
+      assert.strictEqual(p1.perPage, 25);
+      assert.strictEqual(p1.hasMore, false);
+      const p9 = await (await fetch(`${apiBase}/issues?page=9`)).json();
+      assert.deepStrictEqual(p9.issues, []);
+      assert.strictEqual(p9.hasMore, false);
+    });
+
+    it('PATCH repo description: owner-only, shown (escaped) on repo home and API', async () => {
+      const forbidden = await fetch(`${base}/forge/api/repos/casey/demo`, {
+        method: 'PATCH',
+        headers: authed(dana.access_token),
+        body: JSON.stringify({ description: 'nope' }),
+      });
+      assert.strictEqual(forbidden.status, 403);
+
+      const res = await fetch(`${base}/forge/api/repos/casey/demo`, {
+        method: 'PATCH',
+        headers: authed(casey.access_token),
+        body: JSON.stringify({ description: 'A demo repo with <angle> brackets' }),
+      });
+      assert.strictEqual(res.status, 200);
+
+      const meta = await (await fetch(`${base}/forge/api/repos/casey/demo`)).json();
+      assert.strictEqual(meta.description, 'A demo repo with <angle> brackets');
+
+      const home = await (await fetch(`${base}/forge/casey/demo`)).text();
+      assert.ok(home.includes('A demo repo with &lt;angle&gt; brackets'), 'description on repo home, escaped');
+      const list = await (await fetch(`${base}/forge/`)).text();
+      assert.ok(list.includes('A demo repo with &lt;angle&gt; brackets'), 'description on the repo list');
+    });
+
+    it('issues/new renders the vanilla-JS client and degrades without JS', async () => {
+      const res = await fetch(`${base}/forge/casey/demo/issues/new`);
+      assert.strictEqual(res.status, 200);
+      const html = await res.text();
+      assert.ok(html.includes('id="f-title"') && html.includes('id="f-body"'), 'form fields');
+      assert.ok(html.includes('<noscript>'), 'graceful no-JS note');
+      assert.ok(html.includes('/idp/credentials'), 'login client targets the credentials endpoint');
+      assert.match(res.headers.get('content-security-policy') ?? '', /connect-src 'self'/,
+        'CSP admits same-origin fetch for the client');
+    });
+  });
+
   // ---------------------------------------------------------- edge cases
 
   it('a repo with no README renders its home page without error', async () => {

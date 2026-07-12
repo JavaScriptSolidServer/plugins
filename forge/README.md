@@ -1,13 +1,16 @@
-# forge — a personal git forge (tier 1: hosting + browsing)
+# forge — a personal git forge (tier 1: hosting + browsing; tier 2: issues)
 
 The useful slice of Gogs/Gitea as a JSS plugin: push a repo over smart
 HTTP, get a GitHub-style (light theme) web UI for it — repo list, file
 table, rendered README, tree/blob/raw views, commit log with pagination,
 green/red unified diffs, branches and tags — plus a clean JSON API over
-the same model. Zero npm dependencies, zero build step, no framework:
-every page is server-rendered HTML with inline CSS, all git work is done
-by the system `git` binary, and the wire protocol is delegated to the
-stock `git-http-backend` CGI (gitscratch's proven plumbing, re-rooted).
+the same model. Tier 2 adds **issues and comments whose bodies live in
+the author's pod** (the forge keeps only a pointer index — see the
+architecture below). Zero npm dependencies, zero build step, no
+framework: every page is server-rendered HTML with inline CSS, all git
+work is done by the system `git` binary, and the wire protocol is
+delegated to the stock `git-http-backend` CGI (gitscratch's proven
+plumbing, re-rooted).
 
 ```js
 plugins: [{ id: 'forge', module: 'forge/plugin.js', prefix: '/forge',
@@ -51,6 +54,9 @@ git -c http.extraHeader="Authorization: Bearer <token>" push forge main
 | `.../commits/<ref>?page=N` | log, 30/page: message, short sha, author, relative time, identicon |
 | `.../commit/<sha>` | full commit with GitHub-style unified diff (collapsible per-file sections, +N/−M counts) |
 | `.../branches`, `.../tags` | ref lists |
+| `.../issues?state=open\|closed&page=N` | issue list: GitHub-style filter tabs, green open / purple closed icons, relative times, comment counts |
+| `.../issues/<n>` | thread: issue body then comments in comment boxes (identicon, author → WebID link, relative time, `owner` badge), markdown bodies |
+| `.../issues/new` | new-issue form (vanilla-JS client, see below) |
 | `<prefix>/<owner>/<name>.git/...` | git smart HTTP (`info/refs`, `git-upload-pack`, `git-receive-pack`) |
 
 Refs may contain `/` (`feature/x`): the tree/blob/raw/commits routes
@@ -86,6 +92,74 @@ Errors are `{ error }` with 4xx. `cloneUrl` is absolute: the origin comes
 from `api.serverInfo` (#601) at request time, with `config.baseUrl` as
 the reverse-proxy override.
 
+## Issues (tier 2): pods hold the words, pluginDir holds the spine
+
+```
+  the AUTHOR's pod (WAC-governed, author-owned)      pluginDir/issues/<owner>/<repo>.json
+  /casey/public/forge/o--r/issue-<uuid>.jsonld       { next: 4, issues: { 1: {
+  /dana/public/forge/o--r/comment-<uuid>.jsonld          number, title, state: open|closed,
+    { type: ForgeIssue|ForgeComment, repo,               author, createdAt,
+      issue, title?, body, published, author }           thread: [{ author, resourceUrl, at }, …] } } }
+```
+
+- **Content in the author's pod.** When casey opens an issue on
+  `melvin/plugins`, the forge loopback-PUTs the JSON-LD document to
+  `<casey's pod>/public/forge/<owner>--<repo>/issue-<uuid>.jsonld` —
+  **with casey's own forwarded Bearer**, so real WAC governs the write
+  and the resource is casey's property, not the forge's. Comments work
+  identically into the *commenter's* pod (`comment-<uuid>.jsonld`).
+- **Index + state in pluginDir** (atomic tmp+rename writes, one writer
+  per repo): next issue number, denormalized title, open/closed state,
+  author WebID, createdAt, and the thread as an ordered list of
+  `{author, resourceUrl, at}` pointers. The index **never** copies body
+  text — bodies are re-fetched from the pods at read time over loopback
+  (public read; 8-way bounded parallelism, 8 s per-fetch timeout,
+  500-entry thread cap, 64 KiB body cap).
+- **The honest consequence (feature, not bug):** if an author deletes
+  the resource from their own pod, the thread renders that slot as a
+  muted *"content removed by its author"* placeholder — the pointer
+  (who/when) remains, the words are gone everywhere. Test-proven.
+- **State transitions** (close/reopen, title edit) are index operations,
+  allowed for the repo owner OR the issue author, via Bearer-authed
+  routes (`getAgent`). Anonymous writes are 401; a third party closing
+  someone else's issue is 403.
+
+### Issue JSON API
+
+- `GET api/repos/<o>/<n>/issues?state=open|closed&page=N` →
+  `{ state, page, perPage: 25, hasMore, openCount, closedCount,
+     issues: [{ number, title, state, author, createdAt, comments }] }`
+- `GET api/repos/<o>/<n>/issues/<num>` →
+  `{ number, title, state, author, createdAt, thread: [{ author, at,
+     resourceUrl, body|null, removed, html|null }] }` — `html` is the
+  server-side markdown renderer's already-escaped output; `body` is the
+  raw markdown straight from the pod (JSON is the escape); `removed` is
+  true when the author has deleted the pod resource.
+- `POST api/repos/<o>/<n>/issues` `{title, body}` → 201
+  `{ number, url, resourceUrl }` (Bearer required)
+- `POST .../issues/<num>/comments` `{body}` → 201
+  `{ number, comments, resourceUrl }`
+- `POST .../issues/<num>/close` / `.../reopen` → `{ number, state }`
+  (repo owner or issue author)
+- `PATCH .../issues/<num>` `{title}` → `{ number, title }` (owner or author)
+- `PATCH api/repos/<o>/<n>` `{description}` → writes the bare repo's
+  `description` file (repo owner only); shown on the repo home and list.
+
+### The vanilla-JS client (deliberately tiny)
+
+Every issues page embeds one dependency-free inline
+`<script type="module">` (no build, no framework) that:
+
+- offers a login box — username/password → `POST /idp/credentials`,
+  token kept in localStorage, "Signed in as X" + sign-out;
+- drives new-issue/comment/close/reopen through `fetch` + Bearer against
+  the JSON API, then **reloads — the server always renders the truth**;
+- touches the DOM only via `textContent`/`createElement`; fetched
+  strings never meet `innerHTML`.
+
+With JS off the pages stay fully readable and a `<noscript>` note says
+interactive actions need JavaScript and sign-in.
+
 ## The markdown subset (hand-rolled, bounded)
 
 Escape **first**, then transform — the renderer is structurally
@@ -117,8 +191,10 @@ detection is a NUL sniff over the first 8 KB.
   `./`/`\` forms. All git reads use `execFile` argv arrays (no shell),
   NUL-separated `--format`s (never parsed human output), with
   `GIT_CONFIG_NOSYSTEM=1` and no `HOME`.
-- The only client-side JavaScript is the clone-box copy button, which
-  degrades to a selectable input.
+- Client-side JavaScript is the clone-box copy button (degrades to a
+  selectable input) and the issues client above (degrades to read-only
+  pages). The page CSP grants `connect-src 'self'` — exactly enough for
+  the client's same-origin fetches, nothing outbound.
 
 ## Deliberate cuts
 
@@ -126,7 +202,8 @@ detection is a NUL sniff over the first 8 KB.
   bundle came from. A `<pre>` with line numbers covers tier-1 browsing;
   highlighting is a candidate for a later wave *if* it can be done
   server-side and dependency-free.
-- **No search, no issues/PRs/webhooks** — later tiers (see Findings 3).
+- **No search, no PRs/webhooks** — later tiers (see Findings 3). Issues
+  arrived in tier 2; PRs want the same pod-native treatment.
 - **No browser-git** — every byte of git logic is the system binary;
   server-side rendering made the old client bundle unnecessary.
 
@@ -166,11 +243,12 @@ bodies through Fastify — `api.mountApp` (#583) was not needed here.
   `api.events` (#603). The post-receive hook is where the fact is known;
   today it can only fix HEAD, not notify anyone.
 - **Repo metadata as pod resources** — description, topics, default
-  branch override should live in the owner's pod (tier-2 plan) so they
-  are WAC-governed and portable; today description is derived (git's
-  `description` file or README first line) because there is no clean
-  write path from a plugin into a pod except loopback-with-the-user's-
-  token, and browsing is anonymous.
+  branch override should live in the owner's pod so they are
+  WAC-governed and portable. Tier 2 added `PATCH api/repos/<o>/<n>`
+  (owner-authed) writing git's `description` file — a forge-owned file,
+  deliberately, because *repo* metadata is coordination state like the
+  issue index (Finding 6), not the owner's speech. The README-first-line
+  fallback remains for repos that never set one.
 - **Identity mapping is convention, not contract** — owner = first
   WebID path segment (podFromWebid) works for this host's pods but is a
   heuristic; did:nostr agents have no pod namespace at all and therefore
@@ -199,3 +277,47 @@ richer client, not a rewrite hook.
 - No `api.events` also means no push-time cache invalidation, so
   everything is computed read-time — consistent with the sparql//rss/
   finding that read-time walks are the only option today.
+
+### 6. Content ownership with a plugin-owned index (the tier-2 pattern)
+
+An issue body or comment is a JSON-LD resource **the author owns**: the
+forge loopback-PUTs it into the author's own pod with the author's own
+forwarded Bearer, so the pod's real WAC decides the write and the
+resource remains the author's property. The forge keeps only the
+*spine* — number allocation, title, open/closed state, and an ordered
+list of `{author, resourceUrl, at}` pointers — and re-fetches the words
+at read time. The split is exact: everything that is *coordination*
+(numbering, state, ordering) is plugin state; everything that is
+*speech* is pod data. The killer beat, test-proven: when the commenter
+DELETEs her resource from her own pod (a plain LDP DELETE the forge
+never sees), the thread renders "content removed by its author" — real
+deletion with no forge cooperation required, GDPR-shaped for free, and
+the pointer preserves the thread's who/when integrity.
+
+### 7. The moderation gap is `api.authorize`'s issuer-authority case, named
+
+The flip side of Finding 6: the repo owner **cannot edit or delete the
+words** in a commenter's pod — melvin can close the issue or retitle it
+(index operations), but a spam comment's body sits in the spammer's pod
+under the spammer's WAC, where melvin has no write bit. All the forge
+could do today is drop the pointer (hiding, not deleting — the resource
+survives at a public URL). Real moderation needs a third authority
+level: "this *forge* rules this *thread*", i.e. the plugin asserting
+authority over content it indexes but does not store — exactly the
+`api.authorize` (#604) issuer-authority case. Until that seam exists,
+moderation here is honest about being curation of pointers.
+
+### 8. Read-time fan-out is the price of not copying (the api.events/cache case)
+
+A thread with N entries costs N loopback GETs on every render, because
+the index refuses to cache body text (a cache would resurrect deleted
+content — the one thing the architecture promises not to do). Bounded
+here: 8-way parallelism, 8 s per-fetch timeout, 500-entry thread cap,
+64 KiB body cap; a full 500-entry thread is ~63 sequential rounds of 8.
+That is fine at plugin scale and wrong at any bigger scale — the correct
+fix is an invalidation signal, not a TTL: `api.events` (#603) firing on
+pod resource change would let the forge cache bodies *and* evict on
+delete, keeping the removal semantics exact. One more real discovery:
+once a page carries a JSON-driven client, CSP needs `connect-src 'self'`
+— tier 1's `default-src 'none'` silently blocks every `fetch()`, which
+is invisible until the first interactive page exists.

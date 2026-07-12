@@ -1,10 +1,11 @@
-// forge — a personal git forge (tier 1: hosting + browsing) as a #206
-// loader plugin. The useful slice of Gogs/Gitea: push a repo, get a
-// GitHub-style web UI for it — with the constraints that killed the last
-// attempt made absolute: zero npm dependencies, zero build step, every page
-// server-rendered HTML with inline CSS, all git work done by the system
-// `git` binary. The only JavaScript on any page is the 3-line clone-URL
-// copy button, and it degrades to a selectable input.
+// forge — a personal git forge (tier 1: hosting + browsing; tier 2: issues
+// + comments) as a #206 loader plugin. The useful slice of Gogs/Gitea: push
+// a repo, get a GitHub-style web UI for it — with the constraints that
+// killed the last attempt made absolute: zero npm dependencies, zero build
+// step, every page server-rendered HTML with inline CSS, all git work done
+// by the system `git` binary. Client JavaScript is the 3-line clone-URL
+// copy button plus one dependency-free inline module on the issues pages
+// (login + fetch against the JSON API; the server always renders the truth).
 //
 //   plugins: [{ id: 'forge', module: 'forge/plugin.js', prefix: '/forge',
 //               config: { privateRepos: false } }]
@@ -20,6 +21,17 @@
 //   commits       <prefix>/<owner>/<name>/commits/<ref>?page=N
 //   commit        <prefix>/<owner>/<name>/commit/<sha>
 //   refs          <prefix>/<owner>/<name>/{branches,tags}
+//   issues        <prefix>/<owner>/<name>/issues[?state=|/new|/<n>]
+//
+// TIER 2 — issues and comments, pod-native (see README Findings):
+// the WORDS live in the author's pod (loopback PUT of a JSON-LD resource
+// under <author's pod>/public/forge/<owner>--<repo>/ with the author's own
+// forwarded Bearer, so real WAC governs the write and the resource is the
+// author's property); the SPINE lives in pluginDir/issues/<owner>/<repo>.json
+// (next number, per-issue title/state/author + an ordered thread of
+// {author, resourceUrl, at} pointers — never body text). Bodies are
+// re-fetched from the pods at read time; a deleted resource renders as
+// "content removed by its author".
 //
 // Ownership: owner = the pod username derived from the pusher's WebID
 // (mastodon/'s podFromWebid rule). Push-to-create: an authenticated agent
@@ -78,6 +90,17 @@ const BAD_SEG = /^\.|\.\.|[\\\x00-\x1f]|%2e|%2f|%5c/i;
 const RENDER_CAP = 512 * 1024; // blobs/READMEs above this: "view raw"
 const PER_PAGE = 30;
 const MAX_EXEC_BUFFER = 64 * 1024 * 1024;
+
+// Tier-2 bounds: caps first, so a hostile client cannot balloon the index
+// or make read-time thread resolution unbounded.
+const ISSUES_PER_PAGE = 25;
+const ISSUE_TITLE_CAP = 256;
+const ISSUE_BODY_CAP = 64 * 1024;       // markdown source, per issue/comment
+const DESCRIPTION_CAP = 512;
+const THREAD_CAP = 500;                 // entries per issue (1 body + comments)
+const THREAD_FETCH_CONCURRENCY = 8;     // parallel loopback GETs at read time
+const THREAD_FETCH_TIMEOUT_MS = 8000;
+const ISSUE_NUM_RE = /^[1-9][0-9]{0,8}$/;
 
 // ---------------------------------------------------------------- helpers
 
@@ -149,6 +172,9 @@ const ICON_FILE = '<svg class="icon" width="16" height="16" viewBox="0 0 16 16" 
 const ICON_REPO = '<svg class="icon" width="16" height="16" viewBox="0 0 16 16" fill="#59636e" aria-hidden="true"><path d="M2 2.5A2.5 2.5 0 0 1 4.5 0h8.75a.75.75 0 0 1 .75.75v12.5a.75.75 0 0 1-.75.75h-2.5a.75.75 0 0 1 0-1.5h1.75v-2h-8a1 1 0 0 0-.714 1.7.75.75 0 1 1-1.072 1.05A2.495 2.495 0 0 1 2 11.5Zm10.5-1h-8a1 1 0 0 0-1 1v6.708A2.486 2.486 0 0 1 4.5 9h8ZM5 12.25a.25.25 0 0 1 .25-.25h3.5a.25.25 0 0 1 .25.25v3.25a.25.25 0 0 1-.4.2l-1.45-1.087a.249.249 0 0 0-.3 0L5.4 15.7a.25.25 0 0 1-.4-.2Z"/></svg>';
 const ICON_BRANCH = '<svg class="icon" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.493 2.493 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25Zm-6 0a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Zm8.25-.75a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5ZM4.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z"/></svg>';
 const ICON_TAG = '<svg class="icon" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M1 7.775V2.75C1 1.784 1.784 1 2.75 1h5.025c.464 0 .91.184 1.238.513l6.25 6.25a1.75 1.75 0 0 1 0 2.474l-5.026 5.026a1.75 1.75 0 0 1-2.474 0l-6.25-6.25A1.752 1.752 0 0 1 1 7.775Zm1.5 0c0 .066.026.13.073.177l6.25 6.25a.25.25 0 0 0 .354 0l5.025-5.025a.25.25 0 0 0 0-.354l-6.25-6.25a.25.25 0 0 0-.177-.073H2.75a.25.25 0 0 0-.25.25ZM6 5a1 1 0 1 1 0 2 1 1 0 0 1 0-2Z"/></svg>';
+// GitHub's issue-opened (green circle-dot) and issue-closed (purple check).
+const ICON_ISSUE_OPEN = '<svg class="icon" width="16" height="16" viewBox="0 0 16 16" fill="#1a7f37" aria-hidden="true"><path d="M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"/><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Z"/></svg>';
+const ICON_ISSUE_CLOSED = '<svg class="icon" width="16" height="16" viewBox="0 0 16 16" fill="#8250df" aria-hidden="true"><path d="M11.28 6.78a.75.75 0 0 0-1.06-1.06L7.25 8.69 5.78 7.22a.75.75 0 0 0-1.06 1.06l2 2a.75.75 0 0 0 1.06 0l3.5-3.5Z"/><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0Zm-1.5 0a6.5 6.5 0 1 0-13 0 6.5 6.5 0 0 0 13 0Z"/></svg>';
 
 /** WebID -> pod username (mastodon/'s podFromWebid rule), or null. */
 function ownerFromAgent(agent) {
@@ -159,6 +185,53 @@ function ownerFromAgent(agent) {
   const segs = u.pathname.split('/').filter(Boolean);
   const name = (segs.length >= 2 && segs[0] !== 'profile') ? segs[0] : (u.hostname.split('.')[0] || null);
   return name && OWNER_NAME.test(name) && !name.includes('..') ? name : null;
+}
+
+/** WebID -> pod root path ('/casey/' or '/'), mastodon/'s podFromWebid rule. */
+function podPathFromAgent(agent) {
+  if (!agent) return null;
+  let u;
+  try { u = new URL(agent); } catch { return null; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+  const segs = u.pathname.split('/').filter(Boolean);
+  if (segs.length >= 2 && segs[0] !== 'profile') {
+    return OWNER_NAME.test(segs[0]) ? `/${segs[0]}/` : null;
+  }
+  return '/';
+}
+
+/**
+ * Collect a streamed JSON body (the forge scope's wildcard parser hands the
+ * raw stream through for the git CGI lane, so API writes read it here).
+ * Returns the parsed object, or null when missing/oversized/unparseable.
+ */
+async function readJsonBody(request, cap = ISSUE_BODY_CAP + 8192) {
+  let body = request.body;
+  if (body == null) return null;
+  if (typeof body === 'object' && !Buffer.isBuffer(body) && typeof body.pipe !== 'function'
+      && !(body instanceof Uint8Array) && !(Symbol.asyncIterator in body)) {
+    return body; // already parsed (not the case in this scope, but harmless)
+  }
+  let buf;
+  if (Buffer.isBuffer(body)) buf = body;
+  else if (typeof body === 'string') buf = Buffer.from(body);
+  else {
+    const chunks = [];
+    let total = 0;
+    try {
+      for await (const chunk of body) {
+        total += chunk.length;
+        if (total > cap) return null;
+        chunks.push(chunk);
+      }
+    } catch { return null; }
+    buf = Buffer.concat(chunks);
+  }
+  if (buf.length > cap) return null;
+  try {
+    const parsed = JSON.parse(buf.toString('utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch { return null; }
 }
 
 // ------------------------------------------------------ markdown (bounded)
@@ -417,9 +490,33 @@ h1.page{font-size:24px;margin:0 0 16px}
 .cmeta{display:flex;align-items:center;gap:8px;background:#f6f8fa;border:1px solid #d0d7de;
   border-radius:8px;padding:10px 16px;margin:12px 0 20px;font-size:13px}
 .sha{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#59636e}
+.state-pill{display:inline-block;padding:5px 14px;border-radius:999px;color:#ffffff;font-size:14px;font-weight:500}
+.state-open{background:#1f883d}
+.state-closed{background:#8250df}
+.fstate{display:flex;gap:16px;padding:12px 16px;background:#f6f8fa;border-bottom:1px solid #d0d7de;font-size:14px}
+.fstate a{color:#59636e}
+.fstate a.active{color:#1f2328;font-weight:600}
+.ititle{color:#1f2328;font-weight:600;font-size:16px}
+.ititle:hover{color:#0969da}
+.cbox{border:1px solid #d0d7de;border-radius:8px;margin-bottom:16px;overflow:hidden}
+.chead{display:flex;align-items:center;gap:8px;background:#f6f8fa;border-bottom:1px solid #d0d7de;
+  padding:8px 16px;font-size:13px}
+.chead a{color:#1f2328}
+.cbox .markdown-body{font-size:14px;padding:16px}
+.removed{padding:16px;color:#59636e;font-style:italic;background:#f6f8fa}
+.authbox{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:16px;padding:8px 12px;
+  border:1px solid #d0d7de;border-radius:8px;background:#f6f8fa;font-size:13px}
+.authbox input{padding:5px 12px;border:1px solid #d0d7de;border-radius:6px;font-size:13px}
+.issueform input[type="text"],.issueform textarea{width:100%;padding:8px 12px;border:1px solid #d0d7de;
+  border-radius:6px;font-size:14px;font-family:inherit;margin-bottom:8px;background:#ffffff}
+.issueform textarea{min-height:140px;line-height:1.5;resize:vertical}
+.formmsg{color:#cf222e;font-size:13px}
 `;
 
-const CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' https: data:; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'";
+// connect-src 'self' is load-bearing for tier 2: the issues client drives
+// the JSON API and /idp/credentials with fetch(), which CSP counts as
+// connect-src — under `default-src 'none'` alone every fetch is blocked.
+const CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' https: data:; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'";
 
 // ---------------------------------------------------------------- activate
 
@@ -449,6 +546,25 @@ export async function activate(api) {
     try { return String(api.serverInfo().baseUrl).replace(/\/$/, ''); } catch { return ''; }
   }
   const cloneUrlOf = (owner, name) => `${publicOrigin()}${prefix}/${owner}/${name}.git`;
+
+  // Loopback origin (gallery/'s pattern): pod reads/writes go through the
+  // host's own HTTP surface, never the filesystem — LDP and WAC stay in
+  // charge. Resolved lazily (port 0 boots have no real port at activate).
+  function loopbackOrigin() {
+    if (api.config.loopbackUrl) return String(api.config.loopbackUrl).replace(/\/$/, '');
+    const { protocol, host, port } = api.serverInfo();
+    const h = host.includes(':') ? `[${host}]` : host;
+    return `${protocol}://${h}:${port}`;
+  }
+
+  /** Loopback fetch, forwarding the caller's Authorization when present. */
+  const lb = (p, { method = 'GET', headers = {}, auth, body, signal } = {}) => fetch(loopbackOrigin() + p, {
+    method,
+    redirect: 'manual',
+    headers: { ...headers, ...(auth ? { authorization: auth } : {}) },
+    ...(body !== undefined ? { body } : {}),
+    ...(signal ? { signal } : {}),
+  });
 
   // Hermetic server-side git: no ~/.gitconfig (no HOME), no /etc/gitconfig.
   const gitEnv = { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1' };
@@ -597,6 +713,142 @@ export async function activate(api) {
     return { owner, name, description, lastPush };
   }
 
+  /** The bare repo's `description` file, only if explicitly customized. */
+  function repoDescription(owner, name) {
+    try {
+      const d = fs.readFileSync(path.join(repoDirOf(owner, name), 'description'), 'utf8').trim();
+      if (d && !d.startsWith('Unnamed repository')) return d;
+    } catch { /* no description file */ }
+    return '';
+  }
+
+  // ------------------------------------------------------------ issues model
+  // Content in the AUTHOR's pod, index + state in pluginDir:
+  //
+  //   pods hold the WORDS                    pluginDir holds the SPINE
+  //   /casey/public/forge/o--r/issue-<uuid>.jsonld    issues/<owner>/<repo>.json:
+  //   /dana/public/forge/o--r/comment-<uuid>.jsonld     { next, issues: { <n>:
+  //     { type: ForgeIssue|ForgeComment, repo,            { number, title, state,
+  //       issue, title?, body, published, author }          author, createdAt,
+  //                                                         thread: [{author,
+  //                                                          resourceUrl, at}] } } }
+  //
+  // The index NEVER copies body text; bodies are re-fetched from the pods at
+  // read time over loopback (public read), bounded. If an author deletes the
+  // resource from their pod, the pointer stays and the slot renders as
+  // "content removed by its author" — see README Findings.
+
+  const issuesDir = path.join(api.storage.pluginDir(), 'issues');
+  fs.mkdirSync(issuesDir, { recursive: true });
+  const indexPathOf = (owner, name) => path.join(issuesDir, owner, `${name}.json`);
+
+  function loadIssueIndex(owner, name) {
+    try {
+      const idx = JSON.parse(fs.readFileSync(indexPathOf(owner, name), 'utf8'));
+      if (idx && Number.isInteger(idx.next) && idx.next >= 1 && idx.issues && typeof idx.issues === 'object') {
+        return idx;
+      }
+    } catch { /* no issues yet */ }
+    return { next: 1, issues: {} };
+  }
+  function saveIssueIndex(owner, name, idx) {
+    const file = indexPathOf(owner, name);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${crypto.randomUUID()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(idx)); // atomic: tmp + rename
+    fs.renameSync(tmp, file);
+  }
+  function openIssueCount(owner, name) {
+    return Object.values(loadIssueIndex(owner, name).issues).filter((i) => i.state === 'open').length;
+  }
+
+  // One writer at a time per repo index — number allocation must not race.
+  const issueLocks = new Map();
+  function withIssueLock(owner, name, fn) {
+    const key = `${owner}/${name}`;
+    const prev = issueLocks.get(key) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    issueLocks.set(key, run.then(() => {}, () => {}));
+    return run;
+  }
+
+  /**
+   * Loopback-PUT an issue/comment document into the AUTHOR's pod with the
+   * author's own forwarded Bearer: real WAC governs the write and the
+   * resource is the author's property, not the forge's.
+   */
+  async function storeAuthored(request, podPath, owner, name, doc, filename) {
+    const resourcePath = `${podPath}public/forge/${owner}--${name}/${filename}`;
+    let put;
+    try {
+      put = await lb(resourcePath, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/ld+json' },
+        body: JSON.stringify(doc),
+        auth: request.headers.authorization,
+        signal: AbortSignal.timeout(10000),
+      });
+    } catch (err) {
+      return { status: 502, error: `pod write failed: ${err.message}` };
+    }
+    try { await put.body?.cancel(); } catch { /* drained */ }
+    if (put.status === 401 || put.status === 403) return { status: 403, error: 'your pod refused the write' };
+    if (!(put.ok || put.status === 204)) return { status: 502, error: `pod write failed (${put.status})` };
+    return { url: `${publicOrigin()}${resourcePath}` };
+  }
+
+  /** Loopback path of a stored resource URL (absolute or path form). */
+  function resourcePathOf(resourceUrl) {
+    if (typeof resourceUrl !== 'string') return null;
+    if (resourceUrl.startsWith('/')) return resourceUrl;
+    try { return new URL(resourceUrl).pathname; } catch { return null; }
+  }
+
+  /** One thread slot, re-fetched from its author's pod. Deleted => removed. */
+  async function resolveEntry(e) {
+    const slot = { author: e.author, at: e.at, resourceUrl: e.resourceUrl };
+    const p = resourcePathOf(e.resourceUrl);
+    if (!p) return { ...slot, body: null, removed: true };
+    try {
+      const res = await lb(p, {
+        headers: { accept: 'application/ld+json' },
+        signal: AbortSignal.timeout(THREAD_FETCH_TIMEOUT_MS),
+      });
+      if (!res.ok) {
+        try { await res.body?.cancel(); } catch { /* drained */ }
+        return { ...slot, body: null, removed: true };
+      }
+      const doc = await res.json();
+      if (typeof doc?.body !== 'string') return { ...slot, body: null, removed: true };
+      return { ...slot, body: doc.body.slice(0, ISSUE_BODY_CAP), removed: false };
+    } catch { return { ...slot, body: null, removed: true }; }
+  }
+
+  /**
+   * Resolve a whole thread: N pointers -> N loopback GETs, bounded to
+   * THREAD_FETCH_CONCURRENCY in flight (the read-time fan-out cost of
+   * keeping bodies in pods — measured and written down in README Findings).
+   */
+  async function resolveThread(thread) {
+    const out = new Array(thread.length);
+    let next = 0;
+    const worker = async () => {
+      while (next < thread.length) {
+        const i = next;
+        next += 1;
+        out[i] = await resolveEntry(thread[i]);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(THREAD_FETCH_CONCURRENCY, thread.length) }, worker));
+    return out;
+  }
+
+  const displayName = (webid) => ownerFromAgent(webid) ?? String(webid);
+  const issueMdCtx = (owner, name) => ({
+    rawBase: `${prefix}/${owner}/${name}/raw/HEAD`,
+    blobBase: `${prefix}/${owner}/${name}/blob/HEAD`,
+  });
+
   // ------------------------------------------------------------ materialize
 
   const POST_RECEIVE_HOOK = [
@@ -735,8 +987,10 @@ ${body}
 
   function repoStrip(owner, name, tab, branch) {
     const base = `${prefix}/${owner}/${name}`;
+    const open = openIssueCount(owner, name);
     const tabs = [
       ['code', 'Code', base],
+      ['issues', `Issues${open ? ` <span class="badge">${open}</span>` : ''}`, `${base}/issues`],
       ['commits', 'Commits', `${base}/commits/${branch}`],
       ['branches', 'Branches', `${base}/branches`],
       ['tags', 'Tags', `${base}/tags`],
@@ -872,7 +1126,9 @@ git push -u forge ${esc(branch)}</pre></div></div></main>`;
     const entries = await lsTree(dir, branch, '');
     const tip = await lastCommit(dir, branch, '');
     const readme = await findReadme(dir, branch, entries);
+    const description = repoDescription(owner, name);
     const body = `${repoStrip(owner, name, 'code', branch)}<main><div class="container">
+${description ? `<p class="muted" style="margin:0 0 16px">${esc(description)}</p>` : ''}
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
 ${branchSelector(owner, name, 'tree', branch, branches, tags, '')}
 ${cloneBox(owner, name)}
@@ -1049,6 +1305,190 @@ ${kind === 'branches' && r.name === branch ? '<span class="badge">default</span>
     return sendHtml(reply, 200, page(`${kind} · ${owner}/${name}`, body));
   }
 
+  // ------------------------------------------------------------ issues pages
+  // Server-rendered like everything else; the ONLY interactive layer is one
+  // inline dependency-free module (below) that logs in against
+  // /idp/credentials, drives writes through the JSON API with a Bearer, and
+  // reloads — the server always renders the truth. DOM writes go through
+  // textContent/createElement only; fetched strings never meet innerHTML.
+
+  function issuesScript(cfg) {
+    // cfg values are validated owner/repo names and numbers — JSON.stringify
+    // of them cannot contain quotes, angle brackets, or a </script> breaker.
+    return `<script type="module">
+const CFG=${JSON.stringify(cfg)};
+const T=()=>localStorage.getItem('forgeToken');
+const U=()=>localStorage.getItem('forgeUser');
+function el(tag,props){const e=document.createElement(tag);Object.assign(e,props||{});
+  for(let i=2;i<arguments.length;i++)e.append(arguments[i]);return e}
+function setMsg(text){const m=document.getElementById('form-msg');if(m)m.textContent=text}
+function wireForms(){for(const id of ['submit-issue','submit-comment','toggle-state']){
+  const b=document.getElementById(id);if(b)b.disabled=!T()}}
+function renderAuth(){
+  const box=document.getElementById('forge-auth');if(!box)return;
+  box.textContent='';
+  if(T()){
+    box.append('Signed in as ',el('b',{},U()||'?'),' ',
+      el('button',{className:'btn',type:'button',onclick:function(){
+        localStorage.removeItem('forgeToken');localStorage.removeItem('forgeUser');
+        renderAuth();wireForms();}},'Sign out'));
+  }else{
+    const u=el('input',{placeholder:'username',autocomplete:'username'});
+    const p=el('input',{type:'password',placeholder:'password',autocomplete:'current-password'});
+    const msg=el('span',{className:'formmsg'});
+    box.append('Sign in to participate: ',u,p,
+      el('button',{className:'btn',type:'button',onclick:async function(){
+        msg.textContent='';
+        try{
+          const res=await fetch('/idp/credentials',{method:'POST',
+            headers:{'content-type':'application/json'},
+            body:JSON.stringify({username:u.value,password:p.value})});
+          const j=await res.json();
+          if(!j.access_token)throw new Error(j.error||'sign-in failed');
+          localStorage.setItem('forgeToken',j.access_token);
+          localStorage.setItem('forgeUser',u.value);
+          renderAuth();wireForms();
+        }catch(e){msg.textContent=String(e&&e.message||e)}
+      }},'Sign in'),msg);
+  }
+}
+async function call(path,body,method){
+  const res=await fetch(CFG.api+path,{method:method||'POST',
+    headers:{'content-type':'application/json',authorization:'Bearer '+T()},
+    body:JSON.stringify(body||{})});
+  let j=null;try{j=await res.json()}catch(e){}
+  if(!res.ok)throw new Error((j&&j.error)||('HTTP '+res.status));
+  return j||{};
+}
+const si=document.getElementById('submit-issue');
+if(si)si.onclick=async function(){
+  setMsg('');
+  try{
+    const r=await call('/issues',{title:document.getElementById('f-title').value,
+      body:document.getElementById('f-body').value});
+    location.href=CFG.base+'/issues/'+r.number;
+  }catch(e){setMsg(String(e.message||e))}
+};
+const sc=document.getElementById('submit-comment');
+if(sc)sc.onclick=async function(){
+  setMsg('');
+  try{
+    await call('/issues/'+CFG.issue+'/comments',{body:document.getElementById('f-body').value});
+    location.reload();
+  }catch(e){setMsg(String(e.message||e))}
+};
+const ts=document.getElementById('toggle-state');
+if(ts)ts.onclick=async function(){
+  setMsg('');
+  try{
+    await call('/issues/'+CFG.issue+'/'+(CFG.state==='open'?'close':'reopen'),{});
+    location.reload();
+  }catch(e){setMsg(String(e.message||e))}
+};
+renderAuth();wireForms();
+</script>`;
+  }
+
+  const authBox = (verb) => `<div id="forge-auth" class="authbox">`
+    + `<noscript>${verb} needs JavaScript and sign-in; without it this page is read-only.</noscript></div>`;
+
+  async function issuesListPage(reply, owner, name, query) {
+    const branch = await defaultBranch(repoDirOf(owner, name));
+    const idx = loadIssueIndex(owner, name);
+    const all = Object.values(idx.issues).sort((a, b) => b.number - a.number);
+    const openCount = all.filter((i) => i.state === 'open').length;
+    const closedCount = all.length - openCount;
+    const state = query?.state === 'closed' ? 'closed' : 'open';
+    const pageNo = Math.max(1, Math.min(10000, parseInt(query?.page, 10) || 1));
+    const filtered = all.filter((i) => i.state === state);
+    const slice = filtered.slice((pageNo - 1) * ISSUES_PER_PAGE, pageNo * ISSUES_PER_PAGE);
+    const base = `${prefix}/${owner}/${name}`;
+    const rows = slice.map((i) => {
+      const n = i.thread.length - 1;
+      return `<div class="row">${i.state === 'open' ? ICON_ISSUE_OPEN : ICON_ISSUE_CLOSED}
+<div class="grow"><a class="ititle" href="${base}/issues/${i.number}">${esc(i.title)}</a>
+<div class="muted" style="font-size:12px">#${i.number} opened ${relTime(i.createdAt)} by <a href="${esc(i.author)}">${esc(displayName(i.author))}</a></div></div>
+${n ? `<span class="muted" style="font-size:12px">${n} comment${n === 1 ? '' : 's'}</span>` : ''}</div>`;
+    }).join('\n');
+    const filterTabs = `<div class="fstate">
+<a class="${state === 'open' ? 'active' : ''}" href="${base}/issues?state=open">${ICON_ISSUE_OPEN} ${openCount} Open</a>
+<a class="${state === 'closed' ? 'active' : ''}" href="${base}/issues?state=closed">${ICON_ISSUE_CLOSED} ${closedCount} Closed</a>
+</div>`;
+    const pager = `<div class="pager">
+${pageNo > 1 ? `<a class="btn" href="${base}/issues?state=${state}&page=${pageNo - 1}">&larr; Newer</a>` : ''}
+${filtered.length > pageNo * ISSUES_PER_PAGE ? `<a class="btn" href="${base}/issues?state=${state}&page=${pageNo + 1}">Older &rarr;</a>` : ''}
+</div>`;
+    const body = `${repoStrip(owner, name, 'issues', branch)}<main><div class="container">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+<h1 class="page" style="margin:0">Issues</h1>
+<a class="btn btn-primary" href="${base}/issues/new">New issue</a>
+</div>
+<div class="list">${filterTabs}${rows || `<div class="row muted">No ${state} issues.</div>`}</div>
+${pager}
+</div></main>`;
+    return sendHtml(reply, 200, page(`Issues · ${owner}/${name}`, body));
+  }
+
+  async function issueThreadPage(reply, owner, name, number) {
+    const idx = loadIssueIndex(owner, name);
+    const issue = idx.issues[number];
+    if (!issue) return notFound(reply);
+    const branch = await defaultBranch(repoDirOf(owner, name));
+    const entries = await resolveThread(issue.thread);
+    const ctx = issueMdCtx(owner, name);
+    const base = `${prefix}/${owner}/${name}`;
+    const boxes = entries.map((e, i) => {
+      const who = displayName(e.author);
+      const ownerBadge = ownerFromAgent(e.author) === owner ? ' <span class="badge">owner</span>' : '';
+      const head = `${identicon(who)} <a href="${esc(e.author)}"><b>${esc(who)}</b></a>${ownerBadge}
+<span class="muted">${i === 0 ? 'opened this issue' : 'commented'} ${relTime(e.at)}</span>`;
+      const slot = e.removed
+        ? '<div class="removed">content removed by its author</div>'
+        : `<div class="markdown-body">${renderMarkdown(e.body, ctx)}</div>`;
+      return `<div class="cbox"><div class="chead">${head}</div>${slot}</div>`;
+    }).join('\n');
+    const open = issue.state === 'open';
+    const nComments = issue.thread.length - 1;
+    const body = `${repoStrip(owner, name, 'issues', branch)}<main><div class="container">
+<h1 class="page" style="margin-bottom:8px">${esc(issue.title)} <span class="muted" style="font-weight:400">#${issue.number}</span></h1>
+<div style="display:flex;align-items:center;gap:10px;margin-bottom:20px">
+<span class="state-pill ${open ? 'state-open' : 'state-closed'}">${open ? 'Open' : 'Closed'}</span>
+<span class="muted"><b>${esc(displayName(issue.author))}</b> opened this issue ${relTime(issue.createdAt)} &middot; ${nComments} comment${nComments === 1 ? '' : 's'}</span>
+</div>
+${boxes}
+${authBox('Commenting, closing, or reopening')}
+<div class="cbox issueform"><div class="chead"><b>Add a comment</b> <span class="muted">(stored in YOUR pod, markdown supported)</span></div>
+<div style="padding:16px">
+<textarea id="f-body" placeholder="Leave a comment"></textarea>
+<div style="display:flex;justify-content:flex-end;align-items:center;gap:8px">
+<span id="form-msg" class="formmsg"></span>
+<button id="toggle-state" class="btn" type="button" disabled>${open ? 'Close issue' : 'Reopen issue'}</button>
+<button id="submit-comment" class="btn btn-primary" type="button" disabled>Comment</button>
+</div></div></div>
+</div></main>
+${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: issue.number, state: issue.state })}`;
+    return sendHtml(reply, 200, page(`${issue.title} · #${issue.number} · ${owner}/${name}`, body));
+  }
+
+  async function newIssuePage(reply, owner, name) {
+    const branch = await defaultBranch(repoDirOf(owner, name));
+    const base = `${prefix}/${owner}/${name}`;
+    const body = `${repoStrip(owner, name, 'issues', branch)}<main><div class="container">
+<h1 class="page">New issue</h1>
+${authBox('Opening an issue')}
+<div class="cbox issueform"><div class="chead"><b>Describe the issue</b> <span class="muted">(the body is stored in YOUR pod, markdown supported)</span></div>
+<div style="padding:16px">
+<input type="text" id="f-title" placeholder="Title">
+<textarea id="f-body" placeholder="Steps, expectations, versions&hellip;"></textarea>
+<div style="display:flex;justify-content:flex-end;align-items:center;gap:8px">
+<span id="form-msg" class="formmsg"></span>
+<button id="submit-issue" class="btn btn-primary" type="button" disabled>Submit new issue</button>
+</div></div></div>
+</div></main>
+${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, base, issue: null, state: null })}`;
+    return sendHtml(reply, 200, page(`New issue · ${owner}/${name}`, body));
+  }
+
   function notFound(reply) {
     return sendHtml(reply, 404, page('Not found · Forge',
       '<main><div class="container"><h1 class="page">404</h1><p class="muted">This is not the repository you are looking for.</p></div></main>'));
@@ -1178,9 +1618,206 @@ ${kind === 'branches' && r.name === branch ? '<span class="badge">default</span>
     });
   }
 
+  // ---- tier 2: issue endpoints (writes are Bearer-authed via getAgent) ----
+
+  /** getAgent or a JSON 401 (with WWW-Authenticate). Returns null after replying. */
+  async function apiAgent(request, reply) {
+    const agent = await api.auth.getAgent(request);
+    if (!agent) {
+      reply.header('WWW-Authenticate', 'Bearer realm="jss-forge"');
+      await apiErr(reply, 401, 'authentication required');
+      return null;
+    }
+    return agent;
+  }
+
+  function apiIssueList(reply, owner, name, query) {
+    const idx = loadIssueIndex(owner, name);
+    const all = Object.values(idx.issues).sort((a, b) => b.number - a.number);
+    const openCount = all.filter((i) => i.state === 'open').length;
+    const state = query?.state === 'closed' ? 'closed' : 'open';
+    const pageNo = Math.max(1, Math.min(10000, parseInt(query?.page, 10) || 1));
+    const filtered = all.filter((i) => i.state === state);
+    return sendJson(reply, 200, {
+      state,
+      page: pageNo,
+      perPage: ISSUES_PER_PAGE,
+      hasMore: filtered.length > pageNo * ISSUES_PER_PAGE,
+      openCount,
+      closedCount: all.length - openCount,
+      issues: filtered.slice((pageNo - 1) * ISSUES_PER_PAGE, pageNo * ISSUES_PER_PAGE).map((i) => ({
+        number: i.number,
+        title: i.title,
+        state: i.state,
+        author: i.author,
+        createdAt: i.createdAt,
+        comments: i.thread.length - 1,
+      })),
+    });
+  }
+
+  async function apiIssueGet(reply, owner, name, number) {
+    const issue = loadIssueIndex(owner, name).issues[number];
+    if (!issue) return apiErr(reply, 404, 'not found');
+    const resolved = await resolveThread(issue.thread);
+    const ctx = issueMdCtx(owner, name);
+    return sendJson(reply, 200, {
+      number: issue.number,
+      title: issue.title,
+      state: issue.state,
+      author: issue.author,
+      createdAt: issue.createdAt,
+      thread: resolved.map((e) => ({ ...e, html: e.removed ? null : renderMarkdown(e.body, ctx) })),
+    });
+  }
+
+  async function apiIssueCreate(request, reply, owner, name) {
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    const podPath = podPathFromAgent(agent);
+    if (!podPath) return apiErr(reply, 403, 'no pod namespace for this agent');
+    const p = await readJsonBody(request);
+    if (!p) return apiErr(reply, 400, 'invalid JSON body');
+    const title = typeof p.title === 'string' ? p.title.trim() : '';
+    const bodyText = typeof p.body === 'string' ? p.body : '';
+    if (!title || title.length > ISSUE_TITLE_CAP) return apiErr(reply, 422, `title required (1-${ISSUE_TITLE_CAP} chars)`);
+    if (bodyText.length > ISSUE_BODY_CAP) return apiErr(reply, 422, 'body too large');
+    return withIssueLock(owner, name, async () => {
+      const idx = loadIssueIndex(owner, name);
+      const number = idx.next;
+      const stored = await storeAuthored(request, podPath, owner, name, {
+        type: 'ForgeIssue',
+        repo: `${owner}/${name}`,
+        issue: number,
+        title,
+        body: bodyText,
+        published: new Date().toISOString(),
+        author: agent,
+      }, `issue-${crypto.randomUUID()}.jsonld`);
+      if (stored.error) return apiErr(reply, stored.status, stored.error);
+      const at = Math.floor(Date.now() / 1000);
+      idx.next = number + 1;
+      idx.issues[number] = {
+        number,
+        title,
+        state: 'open',
+        author: agent,
+        createdAt: at,
+        thread: [{ author: agent, resourceUrl: stored.url, at }],
+      };
+      saveIssueIndex(owner, name, idx);
+      return sendJson(reply, 201, {
+        number,
+        url: `${prefix}/${owner}/${name}/issues/${number}`,
+        resourceUrl: stored.url,
+      });
+    });
+  }
+
+  async function apiIssueComment(request, reply, owner, name, number) {
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    const podPath = podPathFromAgent(agent);
+    if (!podPath) return apiErr(reply, 403, 'no pod namespace for this agent');
+    const p = await readJsonBody(request);
+    if (!p) return apiErr(reply, 400, 'invalid JSON body');
+    const bodyText = typeof p.body === 'string' ? p.body : '';
+    if (!bodyText.trim()) return apiErr(reply, 422, 'body required');
+    if (bodyText.length > ISSUE_BODY_CAP) return apiErr(reply, 422, 'body too large');
+    return withIssueLock(owner, name, async () => {
+      const idx = loadIssueIndex(owner, name);
+      const issue = idx.issues[number];
+      if (!issue) return apiErr(reply, 404, 'not found');
+      if (issue.thread.length >= THREAD_CAP) return apiErr(reply, 422, 'thread is full');
+      const stored = await storeAuthored(request, podPath, owner, name, {
+        type: 'ForgeComment',
+        repo: `${owner}/${name}`,
+        issue: number,
+        body: bodyText,
+        published: new Date().toISOString(),
+        author: agent,
+      }, `comment-${crypto.randomUUID()}.jsonld`);
+      if (stored.error) return apiErr(reply, stored.status, stored.error);
+      issue.thread.push({ author: agent, resourceUrl: stored.url, at: Math.floor(Date.now() / 1000) });
+      saveIssueIndex(owner, name, idx);
+      return sendJson(reply, 201, { number, comments: issue.thread.length - 1, resourceUrl: stored.url });
+    });
+  }
+
+  /** close/reopen/retitle: index-only operations, repo owner OR issue author. */
+  const mayModerate = (agent, owner, issue) => ownerFromAgent(agent) === owner || agent === issue.author;
+
+  async function apiIssueState(request, reply, owner, name, number, state) {
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    return withIssueLock(owner, name, async () => {
+      const idx = loadIssueIndex(owner, name);
+      const issue = idx.issues[number];
+      if (!issue) return apiErr(reply, 404, 'not found');
+      if (!mayModerate(agent, owner, issue)) return apiErr(reply, 403, 'only the repo owner or the issue author may do that');
+      issue.state = state;
+      saveIssueIndex(owner, name, idx);
+      return sendJson(reply, 200, { number, state });
+    });
+  }
+
+  async function apiIssueRetitle(request, reply, owner, name, number) {
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    const p = await readJsonBody(request);
+    if (!p) return apiErr(reply, 400, 'invalid JSON body');
+    const title = typeof p.title === 'string' ? p.title.trim() : '';
+    if (!title || title.length > ISSUE_TITLE_CAP) return apiErr(reply, 422, `title required (1-${ISSUE_TITLE_CAP} chars)`);
+    return withIssueLock(owner, name, async () => {
+      const idx = loadIssueIndex(owner, name);
+      const issue = idx.issues[number];
+      if (!issue) return apiErr(reply, 404, 'not found');
+      if (!mayModerate(agent, owner, issue)) return apiErr(reply, 403, 'only the repo owner or the issue author may do that');
+      issue.title = title;
+      saveIssueIndex(owner, name, idx);
+      return sendJson(reply, 200, { number, title });
+    });
+  }
+
+  async function apiRepoPatch(request, reply, owner, name) {
+    const agent = await apiAgent(request, reply);
+    if (!agent) return reply;
+    if (ownerFromAgent(agent) !== owner) return apiErr(reply, 403, 'only the repo owner may edit the repo');
+    const p = await readJsonBody(request);
+    if (!p) return apiErr(reply, 400, 'invalid JSON body');
+    const description = typeof p.description === 'string' ? p.description.trim() : null;
+    if (description === null || description.length > DESCRIPTION_CAP) {
+      return apiErr(reply, 422, `description must be a string (max ${DESCRIPTION_CAP} chars)`);
+    }
+    fs.writeFileSync(path.join(repoDirOf(owner, name), 'description'), `${description}\n`);
+    return sendJson(reply, 200, { owner, name, description });
+  }
+
+  async function apiIssuesHandler(request, reply, owner, name, tail) {
+    const method = request.method;
+    if (tail.length === 0) {
+      if (method === 'POST') return apiIssueCreate(request, reply, owner, name);
+      if (method === 'GET' || method === 'HEAD') return apiIssueList(reply, owner, name, request.query);
+      return apiErr(reply, 405, 'method not allowed');
+    }
+    if (!ISSUE_NUM_RE.test(tail[0])) return apiErr(reply, 404, 'not found');
+    const number = +tail[0];
+    if (tail.length === 1) {
+      if (method === 'GET' || method === 'HEAD') return apiIssueGet(reply, owner, name, number);
+      if (method === 'PATCH') return apiIssueRetitle(request, reply, owner, name, number);
+      return apiErr(reply, 405, 'method not allowed');
+    }
+    if (tail.length === 2 && ['comments', 'close', 'reopen'].includes(tail[1])) {
+      if (method !== 'POST') return apiErr(reply, 405, 'method not allowed');
+      if (tail[1] === 'comments') return apiIssueComment(request, reply, owner, name, number);
+      return apiIssueState(request, reply, owner, name, number, tail[1] === 'close' ? 'closed' : 'open');
+    }
+    return apiErr(reply, 404, 'not found');
+  }
+
   /** Dispatch <prefix>/api/... (segs excludes the leading 'api'). */
   async function apiHandler(request, reply, segs) {
-    if (request.method !== 'GET' && request.method !== 'HEAD') return apiErr(reply, 405, 'method not allowed');
+    if (!['GET', 'HEAD', 'POST', 'PATCH'].includes(request.method)) return apiErr(reply, 405, 'method not allowed');
     if (segs[0] !== 'repos') return apiErr(reply, 404, 'not found');
     const rest = segs.slice(1);
 
@@ -1195,22 +1832,32 @@ ${kind === 'branches' && r.name === branch ? '<span class="badge">default</span>
       if (!agentOwner) return apiErr(reply, 403, 'no pod namespace for this agent');
     }
 
-    if (rest.length === 0) return apiRepoList(reply, privateRepos ? [agentOwner] : listOwners());
+    const isRead = request.method === 'GET' || request.method === 'HEAD';
+    if (rest.length === 0) {
+      return isRead ? apiRepoList(reply, privateRepos ? [agentOwner] : listOwners()) : apiErr(reply, 405, 'method not allowed');
+    }
 
     const owner = rest[0];
     if (!OWNER_NAME.test(owner) || owner.includes('..')) return apiErr(reply, 404, 'not found');
     if (privateRepos && owner !== agentOwner) return apiErr(reply, 403, 'private forge');
-    if (rest.length === 1) return apiRepoList(reply, [owner]);
+    if (rest.length === 1) {
+      return isRead ? apiRepoList(reply, [owner]) : apiErr(reply, 405, 'method not allowed');
+    }
 
     const name = rest[1];
     if (!REPO_NAME.test(name) || name.includes('..') || name.endsWith('.git')) return apiErr(reply, 404, 'not found');
     if (!repoExists(owner, name)) return apiErr(reply, 404, 'not found');
-    if (rest.length === 2) return apiRepoMeta(reply, owner, name);
+    if (rest.length === 2) {
+      if (request.method === 'PATCH') return apiRepoPatch(request, reply, owner, name);
+      return isRead ? apiRepoMeta(reply, owner, name) : apiErr(reply, 405, 'method not allowed');
+    }
 
     const action = rest[2];
     const tail = rest.slice(3);
+    if (action !== 'issues' && !isRead) return apiErr(reply, 405, 'method not allowed');
     try {
       switch (action) {
+        case 'issues': return await apiIssuesHandler(request, reply, owner, name, tail);
         case 'tree': return tail.length ? await apiTree(reply, owner, name, tail) : apiErr(reply, 404, 'not found');
         case 'blob': return tail.length >= 2 ? await apiBlob(reply, owner, name, tail) : apiErr(reply, 404, 'not found');
         case 'commits': return tail.length ? await apiCommits(reply, owner, name, tail, request.query) : apiErr(reply, 404, 'not found');
@@ -1331,6 +1978,12 @@ ${kind === 'branches' && r.name === branch ? '<span class="badge">default</span>
           case 'commit': return tail.length === 1 ? await commitPage(reply, owner, name, tail[0]) : notFound(reply);
           case 'branches': return tail.length === 0 ? await refsPage(reply, owner, name, 'branches') : notFound(reply);
           case 'tags': return tail.length === 0 ? await refsPage(reply, owner, name, 'tags') : notFound(reply);
+          case 'issues': {
+            if (tail.length === 0) return await issuesListPage(reply, owner, name, request.query);
+            if (tail.length === 1 && tail[0] === 'new') return await newIssuePage(reply, owner, name);
+            if (tail.length === 1 && ISSUE_NUM_RE.test(tail[0])) return await issueThreadPage(reply, owner, name, +tail[0]);
+            return notFound(reply);
+          }
           default: return notFound(reply);
         }
       } catch (err) {
@@ -1339,12 +1992,13 @@ ${kind === 'branches' && r.name === branch ? '<span class="badge">default</span>
       }
     };
 
-    scope.route({ method: ['GET', 'POST'], url: prefix || '/', handler });
-    scope.route({ method: ['GET', 'POST'], url: `${prefix}/*`, handler });
+    scope.route({ method: ['GET', 'POST', 'PATCH'], url: prefix || '/', handler });
+    scope.route({ method: ['GET', 'POST', 'PATCH'], url: `${prefix}/*`, handler });
   });
 
   api.log.info(
-    `forge: repos at ${prefix}/<owner>/<name>.git, UI at ${prefix}/ (backend ${backend}, reads ${privateRepos ? 'owner-only' : 'public'})`,
+    `forge: repos at ${prefix}/<owner>/<name>.git, UI at ${prefix}/, issues at ${prefix}/<owner>/<name>/issues `
+    + `(backend ${backend}, reads ${privateRepos ? 'owner-only' : 'public'})`,
   );
 
   return { deactivate() { /* nothing persistent to tear down */ } };
