@@ -21,9 +21,11 @@
 // routes to its prefix, and each `/xrpc/<nsid>` static route outranks core's
 // LDP `GET /*` wildcard on Fastify's route-specificity ordering. That the
 // whole XRPC surface lives at ONE fixed root OUTSIDE the plugin's own prefix
-// — which the plugin cannot WAC-exempt itself — is the headline finding
+// — which the plugin could not WAC-exempt itself — was the headline finding
 // (README "Findings"): a SECOND independent confirmation of mastodon's
-// reserved-path/multi-prefix seam.
+// reserved-path/multi-prefix seam. As of JSS 0.0.219 the plugin claims +
+// WAC-exempts that root itself via api.reservePath (#602), so the operator
+// no longer touches appPaths.
 //
 // --------------------------------------------------------- the token bridge
 //
@@ -295,6 +297,15 @@ export async function activate(api) {
 
   // =================================================================== routes
 
+  // Claim + WAC-exempt the one fixed XRPC root (#602, JSS 0.0.219). A
+  // literal reservation exempts the whole /xrpc subtree but is READ-ONLY
+  // by default, so widen to POST — the only write verb any route below
+  // implements (createSession, createRecord: XRPC procedures are POSTs).
+  // PUT/DELETE/PATCH stay gated on purpose: exempting a verb no route
+  // implements would let it fall through to core's LDP write wildcards
+  // as an unauthenticated storage write.
+  api.reservePath('/xrpc', { methods: ['GET', 'HEAD', 'OPTIONS', 'POST'] });
+
   // Preflight for the whole XRPC surface.
   api.fastify.options('/xrpc/*', (request, reply) => cors(reply).code(204).send());
 
@@ -420,12 +431,7 @@ export async function activate(api) {
   });
 
   api.log.info(`bluesky: XRPC shim at /xrpc/* → pods via ${loopback} (issue #211 Phase 1)`);
-  // The load-bearing caveat (see README "Findings"): these absolute /xrpc
-  // routes register fine, but they are only reachable if the operator has
-  // WAC-exempted /xrpc. A plugin gets ONE prefix pushed to appPaths and this
-  // fixed protocol root is not it, so the plugin cannot self-exempt — the
-  // operator must pass `appPaths: ['/xrpc']` to createServer. This is the
-  // SECOND independent confirmation of mastodon's reserved-path seam.
-  api.log.warn('bluesky: /xrpc must be in appPaths or WAC will 401 every client '
-    + 'request — the one-prefix plugin model cannot self-exempt a fixed protocol root');
+  // The former load-bearing caveat is closed: /xrpc is self-reserved above
+  // via api.reservePath (#602), so no operator appPaths are needed since
+  // JSS 0.0.219 (see README "Findings").
 }

@@ -22,15 +22,9 @@ plugins: [{
 }]
 ```
 
-…**and** — the load-bearing caveat — the operator must WAC-exempt the fixed
-`/xrpc` root, because a plugin cannot do it itself (see [Findings](#findings)):
-
-```
-createServer({
-  appPaths: ['/xrpc'],   // REQUIRED: or WAC 401s every client call
-  plugins: [ … ],
-})
-```
+No `appPaths` needed: since JSS 0.0.219 the plugin claims and WAC-exempts
+its one fixed root itself at activate time via `api.reservePath('/xrpc')`
+(#602) — see [Findings](#findings) for the gap this closed.
 
 ## The vertical slice
 
@@ -123,38 +117,52 @@ mints no token of its own, keeps no session store:
 
 ### 1. SECOND independent confirmation of the reserved-path / multi-prefix seam
 
-**Headline.** This is the same wall [`mastodon/`](../mastodon/) hit, reached
+**Headline.** This was the same wall [`mastodon/`](../mastodon/) hit, reached
 from a completely different external protocol — which is exactly what makes it
 a *confirmation* rather than a repeat. An AT-Protocol client hits **fixed
 absolute paths** under one root, `/xrpc/<nsid>`, that no client will let you
-relocate under a plugin `prefix`. Two things follow, identically to mastodon:
+relocate under a plugin `prefix`. Two things followed, identically to mastodon:
 
 - **Routing works.** Like mastodon's `/api` + `/oauth` and nip05's
   `/.well-known/nostr.json`, the loader does not confine a plugin's routes to
   its prefix (`api.fastify` is the real scoped instance), and each
   `/xrpc/<nsid>` static route outranks core's LDP `GET /*` wildcard on
   Fastify's specificity ordering. Registration is fine.
-- **Authorization does not.** `/xrpc` is an ordinary pod path as far as WAC is
+- **Authorization did not.** `/xrpc` is an ordinary pod path as far as WAC is
   concerned. The WAC hook skips only paths in `appPaths` (`server.js`), and
   the loader pushes a plugin's **single `prefix`** there (`plugins.js` — `if
   (prefix) ctx.appPaths.push(prefix)`). This shim's surface lives at a **fixed
-  protocol root that is not its prefix**, and a plugin has no
+  protocol root that is not its prefix**, and a plugin had no
   `api.appPaths.add()` / `api.reservePath()` to push it. So the plugin
-  **cannot self-exempt its own surface**, and every unexempted `/xrpc` call is
-  401'd by WAC before the handler runs.
+  **could not self-exempt its own surface**, and every unexempted `/xrpc` call
+  was 401'd by WAC before the handler ran.
 
-The honest consequence, verbatim from mastodon: this shim is only usable if
-the **operator** widens `appPaths` by hand (`appPaths: ['/xrpc']`). Note the
-sharpening over mastodon: mastodon needed *two* roots and blamed the
-"one-prefix" model; bluesky needs only *one* root and **still can't reach it**,
-because the exempt path is tied to the plugin's *own* prefix, not to the paths
-it actually serves. The seam is not "a plugin should get more than one
-prefix" — it is "**a plugin must be able to declare the paths it owns**,
+The honest consequence *was*, verbatim from mastodon: this shim was only
+usable if the **operator** widened `appPaths` by hand (`appPaths: ['/xrpc']`).
+Note the sharpening over mastodon: mastodon needed *two* roots and blamed the
+"one-prefix" model; bluesky needed only *one* root and **still couldn't reach
+it**, because the exempt path was tied to the plugin's *own* prefix, not to
+the paths it actually serves. The seam is not "a plugin should get more than
+one prefix" — it is "**a plugin must be able to declare the paths it owns**,
 independently of its mount prefix" (`paths: ['/xrpc']` on the entry, or an
 `api.reservePath()` surface, with collision detection). This is the seam **all
 API-shim plugins** (mastodon, bluesky, and any future ActivityPub / gateway)
-structurally require; it now has **two independent consumers** and belongs
+structurally require; it got **two independent consumers** and belongs
 above mastodon-alone in NOTES.md's ranking of the reserved-path seam.
+
+**Closed — JSS 0.0.219 shipped `api.reservePath(path, opts)` (#602) and this
+plugin consumes it.** At activate time it reserves the literal root `/xrpc`;
+a literal reservation WAC-exempts the whole subtree, and a second plugin
+claiming the same root fails the boot loudly instead of silently losing.
+Reservations are **read-only by default** (GET/HEAD/OPTIONS), so the root is
+widened with `{ methods: ['GET', 'HEAD', 'OPTIONS', 'POST'] }` — POST is the
+only write verb the shim implements (`POST createSession`,
+`POST createRecord`: XRPC procedures are POSTs). PUT/DELETE/PATCH are
+deliberately **not** exempted: no route implements them, and an exemption on
+an unimplemented verb would fall through to core's LDP write wildcards as an
+unauthenticated storage write. Registering the routes is still the plugin's
+job; the reservation only settles claim + WAC. The operator config shrinks to
+just `plugins:` — the test suite passing without any `appPaths` is the proof.
 
 ### 2. The loopback → `/idp/credentials` token bridge generalizes cleanly
 

@@ -50,11 +50,11 @@ describe('bluesky plugin', () => {
     jss = await startJss({
       port,
       idp: true,
-      // The finding in action: AT-Protocol's fixed `/xrpc/*` root is an
-      // absolute path no single plugin `prefix` can own, so the plugin can't
-      // self-exempt it from WAC — the operator widens appPaths by hand. This
-      // re-proves mastodon's multi-prefix seam (a SECOND time). See README.
-      appPaths: ['/xrpc'],
+      // The finding, closed: AT-Protocol's fixed `/xrpc/*` root — one root,
+      // once unreachable without the operator widening appPaths by hand —
+      // is self-reserved via api.reservePath (#602), consumed as of JSS
+      // 0.0.219. No appPaths here, and the suite passing without them is
+      // the proof. See README "Findings".
       plugins: [{ module: module_, config: { baseUrl: base } }],
     });
     const reg = await fetch(`${base}/idp/register`, {
