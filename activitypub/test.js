@@ -198,10 +198,11 @@ describe('activitypub plugin', () => {
 
   // ---- SECURITY REGRESSIONS -------------------------------------------------
 
-  // Path to the per-actor state file. No explicit `id` is passed for the entry,
-  // so the loader derives it from the module basename → 'plugin'; pluginDir is
-  // <root>/.plugins/<id>/ (see plugins.js), state lives under state/<user>.json.
-  const statePath = () => path.join(jss.root, '.plugins', 'plugin', 'state', `${USER}.json`);
+  // Path to the per-actor state file. No explicit `id` is passed for the entry;
+  // since JSS 0.0.219 (#596 fix) the loader derives the id from the parent dir
+  // of a generic basename → 'activitypub'; pluginDir is <root>/.plugins/<id>/
+  // (see plugins.js), state lives under state/<user>.json.
+  const statePath = () => path.join(jss.root, '.plugins', 'activitypub', 'state', `${USER}.json`);
   const readState = () => JSON.parse(fs.readFileSync(statePath(), 'utf8'));
 
   it('SSRF: a Follow with a private/loopback actor URL is refused delivery (default config)', async () => {
