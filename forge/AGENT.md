@@ -192,6 +192,18 @@ by subscribing to the same ephemeral channel (intercept the current-value fetch,
 re-render) — appended at deploy time by the subscriber's `postSync`, so the
 origin's own copy stays untouched.
 
+**The mirror trap — an app built for the origin storms a static mirror.** If the
+app expects server endpoints the origin provides but a plain static mirror does
+not (an aggregate route, a notification socket), it will *degrade badly*: fall
+back to fetching every item individually on a fast poll, most of them 404 — a
+real request storm. The same injection that adds real-time must therefore also
+**serve those fetches from a client-side cache** (fetch the committed items once,
+answer subsequent reads from memory, patch the live one from the ephemeral
+channel). Two footguns: the injection is appended *after* the app's init, so
+reset any "endpoint absent" flag the app already latched; and **read the server
+log before theorizing** — a request storm is obvious in one `tail`, and a
+relay/latency rabbit-hole is not where the fix lives.
+
 ## Known walls / upstream
 
 - **Core `--git` shadows plugin-owned git paths.** A server that also runs core
