@@ -2348,7 +2348,8 @@ function el(tag,props){const e=document.createElement(tag);Object.assign(e,props
 function setMsg(text){const m=document.getElementById('form-msg');if(m)m.textContent=text}
 function shortId(id){return id.length>28?id.slice(0,16)+'…'+id.slice(-6):id}
 function wireForms(){for(const id of ['submit-issue','submit-comment','toggle-state','submit-pull','do-merge','do-enable','submit-txo']){
-  const b=document.getElementById(id);if(b)b.disabled=!(T()||X())}}
+  const b=document.getElementById(id);if(b)b.disabled=!(T()||X())}
+  document.querySelectorAll('.del-entry').forEach(function(b){b.disabled=!(T()||X())})}
 function renderAuth(){
   const box=document.getElementById('forge-auth');if(!box)return;
   box.textContent='';
@@ -2499,6 +2500,18 @@ if(tx)tx.onclick=async function(){
     location.reload();
   }catch(e){setMsg(String(e.message||e))}
 };
+document.querySelectorAll('.del-entry').forEach(function(b){b.onclick=async function(){
+  const url=b.getAttribute('data-del');if(!url)return;
+  if(!confirm('Delete this content? It will show as “content removed by its author.”'))return;
+  const was=b.disabled;b.disabled=true;setMsg('Deleting…');
+  try{
+    let res;
+    if(X()){res=await window.xlogin.authFetch(url,{method:'DELETE'})}
+    else{res=await fetch(url,{method:'DELETE',headers:{authorization:'Bearer '+T()}})}
+    if(!(res.ok||res.status===204||res.status===404))throw new Error(res.status===403?'only the author can delete this':'HTTP '+res.status);
+    location.reload();
+  }catch(e){setMsg(String(e&&e.message||e));b.disabled=was}
+}});
 document.addEventListener('xlogin',function(){renderAuth();wireForms()});
 document.addEventListener('xlogout',function(){renderAuth();wireForms()});
 if(window.xlogin&&window.xlogin.ready)window.xlogin.ready.then(function(){renderAuth();wireForms()});
@@ -2558,7 +2571,12 @@ ${pager}
       const ownerBadge = ownerFromAgent(e.author) === owner ? ' <span class="badge">owner</span>' : '';
       // Podless authors: their words live in pluginDir, not a pod — say so.
       const hostedTag = e.hosted ? ' <span class="badge">hosted by the forge</span>' : '';
-      const head = `${identicon(who)} <a href="${esc(authorHref(e.author))}"><b>${esc(who)}</b></a>${ownerBadge}${hostedTag}
+      // Author-only Delete (server-enforced: pod WAC on the body, or the hosted
+      // DELETE endpoint — a non-author's request 403s). Shown to any signed-in
+      // user like the close/reopen button; deleting shows the existing tombstone.
+      const del = (e.removed || !e.resourceUrl) ? ''
+        : `<button class="btn del-entry" type="button" data-del="${esc(e.resourceUrl)}" disabled title="Delete (author only)" style="float:right;margin:6px;padding:2px 8px;font-size:12px">Delete</button>`;
+      const head = `${del}${identicon(who)} <a href="${esc(authorHref(e.author))}"><b>${esc(who)}</b></a>${ownerBadge}${hostedTag}
 <span class="muted">${i === 0 ? openVerb : 'commented'} ${relTime(e.at)}</span>`;
       const slot = e.removed
         ? '<div class="removed">content removed by its author</div>'

@@ -1019,6 +1019,7 @@ describe('forge plugin', () => {
       assert.ok(!html.includes(`>${pkA}<`), 'raw hex never rendered as a display name');
       assert.ok(html.includes(`/.well-known/did/nostr/${pkA}`), "author links to core's DID-document route");
       assert.ok(html.includes('>owner</span>'), 'hex-namespace owner badge still works');
+      assert.match(html, /class="btn del-entry"[^>]*data-del="[^"]*\/api\/hosted\//, 'per-entry Delete button renders pointing at the resource URL');
     });
 
     it("another agent cannot delete someone else's hosted content (403)", async () => {
