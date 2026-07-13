@@ -2115,6 +2115,20 @@ describe('forge plugin', () => {
       assert.ok(pitch.includes('Anchoring is not enabled'));
     });
 
+    it('the marks page summarises the settled frontier, tip balance and pending count', async () => {
+      // fixture here: 3 marks — #0 marked (250000 sats @ tip0), #1 and #2 pending.
+      const html = await (await fetch(`${base}/forge/casey/trail/marks`)).text();
+      assert.ok(html.includes('Settled frontier'), 'frontier stat card present');
+      assert.ok(html.includes('Balance at tip'), 'balance stat card present');
+      // frontier = the last MARKED mark (#0), linking its commit
+      assert.match(html, /Settled frontier<\/div>\s*<div class="v">#0 <a class="sha" href="[^"]*\/commit\/[^"]*">/,
+        'frontier reads as mark #0 with its commit link');
+      // live tip balance = that mark's output amount, thousands-grouped
+      assert.ok(html.includes('250,000 <span class="unit">sat</span>'), 'tip balance in grouped sats');
+      // two derived-but-unfunded marks sit ahead of the settled frontier
+      assert.ok(html.includes('2 <span class="unit">marks</span>'), 'pending count = marks ahead of the frontier');
+    });
+
     it('a mainnet chain without allowMainnet refuses to activate, loudly', async () => {
       // activate() is called directly rather than through a second
       // startJss: booting another JSS in-process regenerates the

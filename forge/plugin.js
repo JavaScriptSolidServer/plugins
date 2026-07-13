@@ -543,6 +543,12 @@ table.marks{width:100%;border-spacing:0;font-size:13px}
 table.marks th,table.marks td{padding:8px 12px;border-top:1px solid #d0d7de;text-align:left;vertical-align:top}
 table.marks th{border-top:0;background:#f6f8fa;font-size:12px;color:#59636e;font-weight:600}
 table.marks code{font-size:12px;word-break:break-all}
+.markstats{display:flex;flex-wrap:wrap;gap:12px;margin:0 0 16px}
+.mstat{flex:1 1 160px;border:1px solid #d0d7de;border-radius:8px;padding:12px 14px;background:#f6f8fa}
+.mstat .k{font-size:12px;color:#59636e;text-transform:uppercase;letter-spacing:.03em}
+.mstat .v{font-size:20px;font-weight:600;margin-top:3px;line-height:1.2}
+.mstat .v .unit{font-size:13px;font-weight:400;color:#59636e}
+.mstat .s{font-size:12px;color:#59636e;margin-top:3px}
 .fundbox{border:1px solid #d4a72c66;background:#fff8c5;border-radius:8px;padding:12px 16px;margin-top:16px}
 .fundbox pre{background:#ffffffaa;border-radius:6px;padding:12px;overflow-x:auto;font-size:12px}
 @media (max-width:640px){
@@ -3049,6 +3055,29 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
     // in order — the trail is a linear spend chain).
     const firstPending = trail.marks.find((m) => m.status !== 'marked') ?? null;
     const latest = trail.marks.at(-1);
+    // Settled frontier: marks are a linear spend chain, so the 'marked' ones
+    // form a prefix and the highest of them is the on-chain tip. Its output is
+    // the live (unspent) UTXO — the trail's current funded balance. Everything
+    // after it is derived-but-unfunded (pending), i.e. how far HEAD is ahead
+    // of what Bitcoin has settled. All from trail data — no explorer call.
+    const markedList = trail.marks.filter((m) => m.status === 'marked');
+    const frontier = markedList.at(-1) ?? null;
+    const pendingCount = trail.marks.length - markedList.length;
+    const groupSats = (n) => String(Math.max(0, Math.floor(Number(n) || 0))).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    const tipSats = frontier ? groupSats(frontier.amount) : null;
+    const statStrip = `<div class="markstats">
+<div class="mstat"><div class="k">Settled frontier</div>
+<div class="v">${frontier
+      ? `#${frontier.index} <a class="sha" href="${base}/commit/${esc(frontier.state.commit)}">${esc(frontier.state.commit.slice(0, 7))}</a>`
+      : '<span class="muted">none yet</span>'}</div>
+<div class="s">${frontier ? `on-chain tip &middot; ${esc(frontier.state.branch)}` : 'genesis not yet funded'}</div></div>
+<div class="mstat"><div class="k">Balance at tip</div>
+<div class="v">${tipSats !== null ? `${tipSats} <span class="unit">sat</span>` : '<span class="muted">—</span>'}</div>
+<div class="s">${frontier ? `live ${esc(trail.chain)} output` : 'unfunded'}</div></div>
+<div class="mstat"><div class="k">Pending</div>
+<div class="v">${pendingCount === 0 ? 'settled &#10003;' : `${pendingCount} <span class="unit">mark${pendingCount === 1 ? '' : 's'}</span>`}</div>
+<div class="s">${pendingCount === 0 ? 'trail matches HEAD on-chain' : 'ahead of the settled frontier'}</div></div>
+</div>`;
     const fundBox = latest && latest.status !== 'marked' ? `<div class="fundbox">
 <h3 style="margin:0 0 4px">Fund this mark <span class="chip chip-pending">pending</span></h3>
 <p class="muted" style="margin:4px 0 8px">Mark #${firstPending.index} is waiting for its on-chain output. Send ${esc(chain)}
@@ -3086,6 +3115,7 @@ ${authBox('Recording a transaction')}
 <p class="muted" style="margin:4px 0 16px">Trail key <code>${esc(trail.pubkeyBase.slice(0, 10))}…</code> (forge-held, ${esc(trail.chain)}) &middot;
 ${trail.marks.length} mark${trail.marks.length === 1 ? '' : 's'} &middot; the server derives and records; verification runs
 <b>client-side</b> in the hosted verifier against the chain.</p>
+${statStrip}
 <div class="box"><table class="marks">
 <tr><th>mark</th><th>commit</th><th>state hash</th><th>derived address</th><th>status</th><th>tx</th></tr>
 ${rows}
