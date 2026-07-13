@@ -408,9 +408,10 @@ code,pre,.mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,
 .crumb a{color:#0969da}
 .badge{display:inline-block;border:1px solid #d0d7de;color:#59636e;border-radius:999px;
   padding:0 7px;font-size:12px;font-weight:500;line-height:18px;vertical-align:middle}
-.tabs{display:flex;gap:8px;margin-top:12px}
+.tabs{display:flex;gap:8px;margin-top:12px;overflow-x:auto;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
 .tab{display:inline-flex;align-items:center;gap:6px;padding:8px 14px 10px;color:#1f2328;
-  border-bottom:2px solid transparent;font-size:14px}
+  border-bottom:2px solid transparent;font-size:14px;flex:none;white-space:nowrap}
 .tab:hover{text-decoration:none;border-bottom-color:#d0d7de}
 .tab.active{font-weight:600;border-bottom-color:#fd8c73}
 main{padding:24px 0}
@@ -544,6 +545,16 @@ table.marks th{border-top:0;background:#f6f8fa;font-size:12px;color:#59636e;font
 table.marks code{font-size:12px;word-break:break-all}
 .fundbox{border:1px solid #d4a72c66;background:#fff8c5;border-radius:8px;padding:12px 16px;margin-top:16px}
 .fundbox pre{background:#ffffffaa;border-radius:6px;padding:12px;overflow-x:auto;font-size:12px}
+@media (max-width:640px){
+  .container{padding:0 14px}
+  .crumb{font-size:17px}
+  .tabs{margin-top:8px}
+  .tab{padding:8px 10px 10px}
+  .topbar .container{flex-wrap:wrap;row-gap:6px}
+  main{padding:16px 0}
+  .markdown-body{padding:12px 16px}
+  .issueform input,.issueform textarea{min-width:0}
+}
 `;
 
 // connect-src 'self' is load-bearing for tier 2: the issues client drives
