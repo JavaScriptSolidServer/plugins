@@ -611,6 +611,12 @@ export async function activate(api) {
   // of how many commits landed since. Lets a fast commit cadence (fresh mirrors)
   // coexist with a slow mark cadence (one super-commit per period). See recordTip.
   const sparseMarks = api.config.sparseMarks === true;
+  // Discoverability: by default the Anchors tab only appears once a repo has
+  // anchoring enabled — which hides the feature (you'd have to know the /marks
+  // URL to turn it on). A Bitcoin-forge sets anchoringUi:true to show the tab on
+  // EVERY repo (the page carries the Enable pitch when off); a plain forge that
+  // doesn't want Bitcoin UI leaves it off and stays clean.
+  const anchoringUi = api.config.anchoringUi === true;
 
   // Tier 3.5: anchoring chain, testnet4 by default. Checked FIRST, before
   // any other activation work. Mainnet is REFUSED at
@@ -1940,9 +1946,10 @@ ${body}
       ['commits', 'Commits', `${base}/commits/${branch}`],
       ['branches', 'Branches', `${base}/branches`],
       ['tags', 'Tags', `${base}/tags`],
-      // Anchors only surfaces once the owner enabled anchoring (the marks
-      // page itself always exists — it carries the Enable pitch).
-      ...(marksEnabled(owner, name) ? [['anchors', 'Anchors', `${base}/marks`]] : []),
+      // Anchors: always shown when config.anchoringUi is on (discoverable — the
+      // marks page carries the Enable pitch when off); otherwise legacy behavior,
+      // surfacing only once the owner has enabled anchoring on this repo.
+      ...((anchoringUi || marksEnabled(owner, name)) ? [['anchors', 'Anchors', `${base}/marks`]] : []),
     ].map(([id, label, href]) => `<a class="tab${tab === id ? ' active' : ''}" href="${href}">${label}</a>`).join('');
     return `<div class="repo-strip"><div class="container">
 <div class="crumb">${ICON_REPO} <a href="${prefix}/${owner}">${esc(dispOwner(owner))}</a><span class="muted">/</span><a href="${base}"><b>${esc(name)}</b></a>

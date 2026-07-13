@@ -2450,6 +2450,30 @@ describe('forge plugin', () => {
 // ---------------------------------------------------------------------------
 // Sparse marking (config.sparseMarks): the trailing UNFUNDED mark is re-targeted
 // at each new tip instead of stacked, so anchoring HEAD is one tx per period.
+describe('forge anchoringUi — the Anchors tab is discoverable when enabled', () => {
+  let jss; let base; let owner;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-anchui-'));
+  const g = (args, opts = {}) => git(args, { ...opts, env: { HOME: tmp, ...(opts.env ?? {}) } });
+  before(async () => {
+    fs.writeFileSync(path.join(tmp, '.gitconfig'), '[user]\n\temail = a@e.org\n\tname = A\n[init]\n\tdefaultBranch = main\n');
+    jss = await startJss({ idp: true, plugins: [{ id: 'forge', module: module_, prefix: '/forge', config: { anchoringUi: true } }] });
+    base = jss.base;
+    owner = await registerAndMint(base, 'anchy');
+    const w = path.join(tmp, 'r'); fs.mkdirSync(w, { recursive: true });
+    fs.writeFileSync(path.join(w, 'a.txt'), '1\n');
+    await g(['init', '--quiet'], { cwd: w }); await g(['add', '-A'], { cwd: w }); await g(['commit', '--quiet', '-m', 'c1'], { cwd: w });
+    await g([...authFlag(owner.access_token), 'push', `${base}/forge/anchy/r.git`, 'main'], { cwd: w });
+  });
+  after(async () => { if (jss) await jss.close(); fs.rmSync(tmp, { recursive: true, force: true }); });
+
+  it('shows the Anchors tab on a repo that has NOT enabled anchoring (page carries the Enable pitch)', async () => {
+    const html = await (await fetch(`${base}/forge/anchy/r`)).text();
+    assert.match(html, /class="tab[^"]*" href="\/forge\/anchy\/r\/marks">Anchors<\/a>/, 'Anchors tab present with anchoringUi on');
+    const marks = await (await fetch(`${base}/forge/anchy/r/marks`)).text();
+    assert.match(marks, /Anchoring is not enabled/, 'the marks page shows the enable pitch');
+  });
+});
+
 describe('forge sparse marking (config.sparseMarks re-targets, does not stack)', () => {
   let jss; let base; let owner; let wdir;
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sparse-'));

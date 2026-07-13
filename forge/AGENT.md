@@ -140,6 +140,12 @@ Key properties:
   commit cadence — the "rolling mark" that lets fast commits (fresh mirrors)
   coexist with slow, cheap anchoring. Default off (each commit is its own
   candidate state).
+- `anchoringUi` — when true, the repo **Anchors** tab is shown on every repo (the
+  marks page carries the Enable pitch when a repo hasn't enabled anchoring yet).
+  Default off, where the tab only appears once a repo has anchoring enabled —
+  which hides the feature (you'd have to know the `/marks` URL to turn it on). A
+  Bitcoin-forge turns this on so anchoring is discoverable; a plain forge leaves
+  it off and shows no Bitcoin UI.
 - `cspConnect: [origin, …]` — extra `connect-src` origins for a login widget
   that talks to external identity providers.
 - `pushTokenTtl`, `gitHttpBackend` — see `README.md`.
