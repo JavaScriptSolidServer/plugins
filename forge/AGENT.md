@@ -155,6 +155,43 @@ Key properties:
 - **CD fan-out:** many subscribers can watch the same repo and each run their
   own `postSync` (deploy to different edges, run different builds).
 
+## Live data on a cheaply-anchored mesh — the two-channel pattern
+
+A frequently-changing app (a tracker, a dashboard, a game board) wants two
+things that pull against each other: **mirrors fresh in real-time** and **cheap,
+sparse Bitcoin anchoring**. Run them as two channels over the same repo:
+
+- **Ephemeral channel (real-time).** On every change, emit a NIP-01 *ephemeral*
+  event (kind in 20000–29999) carrying the new value — the forge's `/preview`
+  endpoint does this (kind 21617), or any signer can. Subscribers (the status
+  page, and the mirror app itself) render it live. **No commit, no mark, no
+  cost.** Relays don't store ephemeral events, so add a slow heartbeat re-emit
+  (~30s) so a freshly-loaded page catches the current value. Source the change
+  from an *event*, not a poll: subscribe to the app's own push stream (or LDP
+  notifications) rather than watching the filesystem — `fs.watch` dies with
+  `EMFILE` on a large directory, and polling is the wrong tool when the server
+  already emits change events.
+- **Super-commit channel (durable + anchored).** A periodic *sync* commits the
+  accumulated state; with **`sparseMarks`** those commits collapse into one
+  re-targeted pending mark, so the periodic anchor is a single tx per period.
+  *The sync becomes the next super-commit.* Frequent commits (fresh git mirrors)
+  and one cheap mark per period now coexist.
+
+**Latency is the relay you choose, not the design.** Route the ephemeral channel
+through a relay **you control and co-locate with the consumers**, not a shared
+public relay — a public relay can add unpredictable seconds; a local one is
+sub-second. *Measure each hop before tuning anything else* (stream → emit → each
+relay → render); the slow link is almost always the public relay, not your code.
+Emit fire-and-forget so a slow relay's ACK never blocks the next event.
+
+**Mirrors stay verifiable and can go live too.** Ship a `marks.json` snapshot
+*inside the repo* (all public data — txids, addresses, commits) so every mirror
+carries its own provable mark state and renders the marked tier straight from
+Bitcoin, with no reach back to the origin. A static mirror app becomes real-time
+by subscribing to the same ephemeral channel (intercept the current-value fetch,
+re-render) — appended at deploy time by the subscriber's `postSync`, so the
+origin's own copy stays untouched.
+
 ## Known walls / upstream
 
 - **Core `--git` shadows plugin-owned git paths.** A server that also runs core
