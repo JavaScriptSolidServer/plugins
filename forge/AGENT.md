@@ -134,6 +134,12 @@ Key properties:
   and persisted in `pluginDir`).
 - `chain` — Blocktrails chain (default a testnet); mainnet requires
   `allowMainnet: true`.
+- `sparseMarks` — when true, a new tip RE-TARGETS the trailing unfunded mark
+  instead of stacking one pending mark per commit. The chain then gains a link
+  only per *funded* mark, so anchoring HEAD is one tx per period regardless of
+  commit cadence — the "rolling mark" that lets fast commits (fresh mirrors)
+  coexist with slow, cheap anchoring. Default off (each commit is its own
+  candidate state).
 - `cspConnect: [origin, …]` — extra `connect-src` origins for a login widget
   that talks to external identity providers.
 - `pushTokenTtl`, `gitHttpBackend` — see `README.md`.

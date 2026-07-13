@@ -885,6 +885,13 @@ export async function activate(api) {
       + '(no owner signature required). DEMO ONLY; never enable on a real forge.');
   }
 
+  // Sparse marking (opt-in): instead of stacking one pending mark per commit,
+  // RE-TARGET the trailing UNFUNDED mark at each new tip — so the chain gains a
+  // link only per actual (funded) mark and anchoring HEAD is ONE tx regardless
+  // of how many commits landed since. Lets a fast commit cadence (fresh mirrors)
+  // coexist with a slow mark cadence (one super-commit per period). See recordTip.
+  const sparseMarks = api.config.sparseMarks === true;
+
   // Tier 3.5: anchoring chain, testnet4 by default. Checked FIRST, before
   // any other activation work. Mainnet is REFUSED at
   // activate unless the operator opts in explicitly — this plugin derives
@@ -1510,6 +1517,24 @@ export async function activate(api) {
       if (!trail) return;
       const last = trail.marks.at(-1);
       if (last && last.state.commit === tip && last.state.branch === branch) return; // tip unchanged
+      if (sparseMarks && last && last.status === 'pending') {
+        // sparse: the trailing mark is unfunded, so RE-TARGET it at the new tip
+        // (re-derive its program/address chaining the same MARKED prefix) rather
+        // than stacking. The chain gains a link only when a mark is actually
+        // funded, so anchoring HEAD stays one tx however many commits landed.
+        const state = { commit: tip, repo: `${owner}/${name}`, branch };
+        const stateHash = markStateHash(state);
+        const hashes = [...trail.marks.slice(0, -1).map((m) => m.stateHash), stateHash];
+        const program = trailProgram(trail.pubkeyBase, hashes);
+        last.state = state;
+        last.stateHash = stateHash;
+        last.program = program;
+        last.address = p2trAddressEncode(chainHrp, Buffer.from(program, 'hex'));
+        last.at = Math.floor(Date.now() / 1000);
+        saveTrail(owner, name, trail);
+        api.log.info(`forge: mark #${last.index} re-targeted (sparse) for ${owner}/${name}@${branch} (${tip.slice(0, 7)}) -> ${last.address}`);
+        return;
+      }
       if (trail.marks.length >= MARKS_CAP) {
         api.log.warn(`forge: ${owner}/${name} hit the ${MARKS_CAP}-mark cap — not recording ${tip.slice(0, 7)}`);
         return;

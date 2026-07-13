@@ -2423,6 +2423,57 @@ describe('forge plugin', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Sparse marking (config.sparseMarks): the trailing UNFUNDED mark is re-targeted
+// at each new tip instead of stacked, so anchoring HEAD is one tx per period.
+describe('forge sparse marking (config.sparseMarks re-targets, does not stack)', () => {
+  let jss; let base; let owner; let wdir;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sparse-'));
+  const g = (args, opts = {}) => git(args, { ...opts, env: { HOME: tmp, ...(opts.env ?? {}) } });
+  const authed = () => ({ 'content-type': 'application/json', authorization: `Bearer ${owner.access_token}` });
+  const marksApi = () => `${base}/forge/api/repos/sparsey/r/marks`;
+  const marksOf = async () => (await fetch(marksApi())).json();
+  const until = async (fn, what, ms = 5000) => {
+    const t0 = Date.now();
+    for (;;) { const v = await fn(); if (v) return v; if (Date.now() - t0 > ms) throw new Error(`timed out: ${what}`); await new Promise((r) => { setTimeout(r, 50); }); }
+  };
+  const pushChange = async (content, msg) => {
+    fs.writeFileSync(path.join(wdir, 'a.txt'), content);
+    await g(['commit', '-aqm', msg], { cwd: wdir });
+    await g([...authFlag(owner.access_token), 'push', `${base}/forge/sparsey/r.git`, 'main'], { cwd: wdir });
+    return (await g(['rev-parse', 'HEAD'], { cwd: wdir })).stdout.trim();
+  };
+
+  before(async () => {
+    fs.writeFileSync(path.join(tmp, '.gitconfig'), '[user]\n\temail = s@e.org\n\tname = S\n[init]\n\tdefaultBranch = main\n');
+    jss = await startJss({ idp: true, plugins: [{ id: 'forge', module: module_, prefix: '/forge', config: { sparseMarks: true } }] });
+    base = jss.base;
+    owner = await registerAndMint(base, 'sparsey');
+    wdir = path.join(tmp, 'r'); fs.mkdirSync(wdir, { recursive: true });
+    fs.writeFileSync(path.join(wdir, 'a.txt'), '1\n');
+    await g(['init', '--quiet'], { cwd: wdir }); await g(['add', '-A'], { cwd: wdir }); await g(['commit', '--quiet', '-m', 'c1'], { cwd: wdir });
+    await g([...authFlag(owner.access_token), 'push', `${base}/forge/sparsey/r.git`, 'main'], { cwd: wdir });
+  });
+  after(async () => { if (jss) await jss.close(); fs.rmSync(tmp, { recursive: true, force: true }); });
+
+  it('after a funded genesis, repeated pushes re-target ONE pending mark (length stays 2)', async () => {
+    // enable + fund genesis so the mark to re-target is #1 (genesis #0 is marked)
+    assert.strictEqual((await fetch(`${marksApi()}/enable`, { method: 'POST', headers: authed(), body: '{}' })).status, 201);
+    await fetch(`${marksApi()}/0/txo`, { method: 'POST', headers: authed(), body: JSON.stringify({ txid: 'a'.repeat(64), vout: 0, amount: 100000 }) });
+    const c2 = await pushChange('2\n', 'c2');
+    let m = await until(async () => { const x = await marksOf(); return x.marks.length === 2 && x.marks[1].state.commit === c2 ? x : null; }, 'pending #1 for c2');
+    const addr1 = m.marks[1].address;
+    assert.strictEqual(m.marks[1].status, 'pending');
+
+    const c3 = await pushChange('3\n', 'c3');
+    m = await until(async () => { const x = await marksOf(); return x.marks[1].state.commit === c3 ? x : null; }, 'pending #1 re-targeted to c3');
+    assert.strictEqual(m.marks.length, 2, 'still genesis + ONE pending — re-targeted, not stacked');
+    assert.notStrictEqual(m.marks[1].address, addr1, 'the pending mark address moved to match the new tip');
+    assert.strictEqual(m.marks[1].status, 'pending');
+    assert.strictEqual(m.marks[0].status, 'marked', 'the funded genesis is untouched');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // NIP-34 emission against a LIVE relay — an in-process ws relay that accepts
 // one EVENT and replies OK. Its own JSS instance (config.announceRelays set)
 // keeps it isolated: booting a JSS regenerates the process-global IdP keys, so
