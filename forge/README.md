@@ -42,6 +42,7 @@ plugins: [{ id: 'forge', module: 'forge/plugin.js', prefix: '/forge',
               allowMainnet: false,      // … unless this is explicitly true (see Finding 18)
               announceRelays: [],       // NIP-34 relays (opt-in); empty => emission OFF
               announceKey: undefined,   // optional 32-byte hex nostr privkey; else generated once
+              openEdit: false,          // DEMO ONLY: anonymous web edits (see caveat below) — never a default
             } }]
 ```
 
@@ -168,6 +169,17 @@ Tier 3a (additive):
   (stale `expectedBase`, or a race caught by update-ref's old-value
   guard); 501 naming the git version when `merge-tree --write-tree` is
   missing (needs git ≥ 2.38).
+- `POST .../edit` `{path, content, message?, branch?}` (owner-signed;
+  `config.openEdit` relaxes to anonymous DEMO) → 200 `{ ok, commit,
+  changed, url? }`; 400 (bad path / non-string content), 413 (over the
+  1 MiB cap), 401/403 (auth), 404 (no repo), 500 (git failure). CORS-open
+  with an `OPTIONS` preflight — see **Web edit** below.
+- `POST .../preview` `{path, content, branch?}` (same auth as `/edit`) — the
+  **unstaged** tier: publishes a NIP-01 ephemeral event (kind 21617) with the
+  file content, making NO commit and writing nothing. → 200 `{ ok, published,
+  kind, id, path, relays }`, or `{ ok, published:false }` with no relays
+  configured. Only currently-connected subscribers see it; relays don't store
+  it. Same 400/401/403/413 surface as `/edit`. CORS-open + preflight.
 
 Polish wave (additive):
 
@@ -413,6 +425,71 @@ stdout** to the response (attachment disposition, no buffering); the ref
 is validated (`okRef`/sha) and resolved with `rev-parse` *before* any
 header goes out, so a bogus ref is a clean 404. Any resolvable ref works
 — tags, branches, shas — which is exactly GitHub's archive behavior.
+
+## Web edit (tier 3.7): commit one file over HTTP
+
+`POST <prefix>/api/repos/<owner>/<name>/edit` is the **GitHub-web-editor
+equivalent**: a browser edits one file and the change lands as a real
+commit, then rides the forge's existing NIP-34 emission out to relays. No
+server-side index surgery — the commit is made in a **disposable local
+clone** and pushed back to the bare repo.
+
+Body (`application/json`): `{ path, content, message?, branch? }`.
+
+- **`path`** — repo-relative, validated hard: a non-empty string ≤ 1024
+  chars, no leading `/`, no `..`, no backslash, no control chars; every
+  `/`-separated segment matches `[A-Za-z0-9._-]+`; a `.git` segment is
+  refused anywhere and a **leading-dot file at the repo root** (`.acl`,
+  `.htaccess`, …) is refused to avoid surprises. Anything else → **400**.
+- **`content`** — a string, capped at **1 MiB**; over the cap → **413**
+  (a wildly oversized wire body is a **400** — the reader caps it before
+  parse).
+- **`message`** — optional; control chars stripped, capped at 1000 chars;
+  defaults to `web edit: <path>`.
+- **`branch`** — optional (`REF_RE`, no `..`); defaults to the repo's
+  default branch (`symbolic-ref`). A branch that does not exist yet is
+  created off the current HEAD.
+
+**Auth — owner-signed by default (the principled mode).** Resolve the
+agent (any scheme the git lane accepts, NIP-98 included), map it to a
+namespace, and require it equals `<owner>`: anonymous → **401**, wrong
+owner → **403** — the same gate as marks/enable and announce. The
+principled browser upgrade is a **NIP-07 / browser-signature** path (sign
+a NIP-98 event in the page, or exchange one for a push token at
+`POST <prefix>/api/token`) so the edit carries the editor's own identity.
+
+**`config.openEdit: true` relaxes this to anonymous edits (DEMO ONLY).**
+It is **never a default**; the plugin logs a one-time loud warning at
+activate when it is on. ⚠️ **Spam/abuse caveat:** with `openEdit` on,
+*anyone on the internet can rewrite any file in any repo on the
+instance* — reserve it for **throwaway testnet-demo repos** you are happy
+to see vandalized, never a real forge. There is no rate limit and no
+per-file authorization; the honest posture is owner-signed.
+
+Behavior & responses (all CORS-readable — the demo page is cross-origin,
+so success **and** error replies carry `Access-Control-Allow-Origin: *`
+and an `OPTIONS` preflight is answered):
+
+- Unknown repo → **404**.
+- Identical content → **no commit** is made: `200 { ok:true,
+  commit:<currentHead>, changed:false }` (`git diff --cached --quiet`
+  decides — no empty commits).
+- A real change → clone → `checkout <branch>` → write (parents made) →
+  `git add` → `git -c user.name='forge web edit' -c
+  user.email=forge@forge.invalid commit` → `git push <bare>
+  HEAD:refs/heads/<branch>` → `200 { ok:true, commit:<full sha>,
+  changed:true, url:<repo web url> }`. The author of record is the
+  authenticated agent (or `anonymous` in demo mode); the committer is the
+  forge. The temp clone is always removed (`finally`).
+- Git failure → **500** with a generic message (the tmp path and raw git
+  stderr are never leaked).
+
+Because the push moves the tip, a web edit triggers the **same
+downstream beats as a `git push`**: any Blocktrails anchor advances
+(`recordTip`) and the NIP-34 **30617 + 30618** go out
+(`announceRepoSafe`, fire-and-forget, a no-op with no relays). Every git
+spawn runs hermetic — `GIT_CONFIG_NOSYSTEM=1`, no `HOME`, `execFile`
+(never a shell).
 
 ## Anchors (tier 3.5): git-mark anchoring via Blocktrails
 

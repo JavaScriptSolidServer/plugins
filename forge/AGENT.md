@@ -35,6 +35,23 @@ CD) is any Nostr subscriber — e.g. a git-sync daemon.
   matching **JSON API** under `<prefix>/api/...`. Zero deps, zero build.
 - **Forks & PRs** — `git clone --local` forks, cross-fork compare, and real
   merges (`git merge-tree` → `commit-tree` → compare-and-swap `update-ref`).
+- **Web edit** — `POST <prefix>/api/repos/<o>/<n>/edit {path, content,
+  message?, branch?}` commits ONE file over HTTP (GitHub's web editor) in a
+  disposable local clone pushed back to the bare, then rides the same
+  push→anchor→NIP-34 beats. Owner-signed by default; `config.openEdit` relaxes
+  to anonymous edits for **throwaway demo repos only** (never a default — the
+  edit surface is otherwise an open-vandalism vector). CORS-open + preflight.
+- **Unstaged preview** — `POST <prefix>/api/repos/<o>/<n>/preview {path,
+  content, branch?}` is the tier *below* a commit: it publishes a NIP-01
+  **ephemeral** event (kind 21617, the 20000–29999 range relays SHOULD NOT
+  store) carrying the file content, and touches neither git nor disk nor
+  Bitcoin. Only currently-connected subscribers receive it — a live, throwaway
+  draft that vanishes the moment nobody's looking. Same auth as `/edit`. This
+  surfaces git's own three states as three tiers of permanence: **unstaged**
+  (ephemeral event) → **committed** (a commit + 30618) → **marked** (a
+  Bitcoin-anchored checkpoint). A subscriber picks which tier it reacts to, so
+  preview-vs-production (and `requireAnchor` = staging-vs-settled) falls out of
+  the layering rather than being wired.
 - **Issues & PRs as data you own** — an issue/comment body is a JSON-LD
   resource in the **author's own pod** (WAC-governed); the forge stores only a
   validated pointer in its index. Delete the resource from your pod and the

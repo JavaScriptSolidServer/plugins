@@ -43,6 +43,8 @@
 //   nostr         POST api/repos/<o>/<n>/announce    (owner: publish NIP-34 30617 + 30618 to relays)
 //                 GET  api/repos/<o>/<n>/nostr        (the signed 30617 + 30618 that WOULD be published)
 //   fork          POST <prefix>/api/repos/<o>/<n>/fork
+//   web edit      POST api/repos/<o>/<n>/edit  {path,content,message?,branch?}
+//                 (owner-signed by default; config.openEdit => anon DEMO; CORS+preflight)
 //   push tokens   <prefix>/api/token                 (POST, any getAgent credential)
 //   hosted words  <prefix>/api/hosted/<hex>/<uuid>   (GET public, DELETE author-only)
 //   xlogin        <prefix>/xlogin.js                 (vendored widget, byte-identical)
@@ -123,6 +125,7 @@
 import { spawn, execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
@@ -146,6 +149,21 @@ const SHA_RE = /^[0-9a-f]{4,64}$/;
 // Path segments: reject empties, traversal, backslash, control chars and
 // percent-encoded dot/slash/backslash (belt and braces if decoding varies).
 const BAD_SEG = /^\.|\.\.|[\\\x00-\x1f]|%2e|%2f|%5c/i;
+
+// Web-edit (tier 3.7): a single repo-relative file path the browser edits.
+// One segment = a conservative filename charset (no spaces, no exotica —
+// the demo edits ordinary files); '..', '.git' and a leading-dot root are
+// refused explicitly below. Content is capped so one edit cannot balloon.
+const EDIT_SEG = /^[A-Za-z0-9._-]+$/;
+const EDIT_CONTENT_CAP = 1024 * 1024; // 1 MiB of file content per edit
+const EDIT_MSG_CAP = 1000;            // commit-message chars
+const EDIT_PATH_CAP = 1024;           // whole path chars
+// The UNSTAGED tier: a preview edit rides a NIP-01 EPHEMERAL event (kind in
+// 20000..29999 — relays SHOULD NOT store it), carrying the file content but
+// touching neither git nor Bitcoin. Every currently-connected viewer applies
+// it and throws it away; nothing is persisted anywhere. Promotion to the
+// committed tier is the /edit endpoint; to the marked tier, an anchor.
+const EPHEMERAL_PREVIEW_KIND = 21617;
 
 // Tier-2.5: nostr identity. A did:nostr agent's namespace is its 64-hex
 // pubkey — unambiguous in practice (pod names are human-chosen; a pod
@@ -846,6 +864,15 @@ async function findBackend(config) {
 export async function activate(api) {
   const prefix = api.prefix || '/forge';
   const privateRepos = api.config.privateRepos ?? false;
+  // Web-edit DEMO relaxation (tier 3.7): when true, the single-file edit
+  // endpoint accepts ANONYMOUS edits (no owner signature). This is never a
+  // default and exists only for throwaway testnet-demo repos — see README's
+  // spam/abuse caveat. Warn ONCE, loudly, at activate.
+  const openEdit = api.config.openEdit === true;
+  if (openEdit) {
+    api.log.warn('forge: config.openEdit is ON — anyone can edit repos via the web-edit endpoint '
+      + '(no owner signature required). DEMO ONLY; never enable on a real forge.');
+  }
 
   // Tier 3.5: anchoring chain, testnet4 by default. Checked FIRST, before
   // any other activation work. Mainnet is REFUSED at
@@ -3248,6 +3275,24 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
   }
   const apiErr = (reply, status, error) => sendJson(reply, status, { error });
 
+  // CORS for the web-edit lane: the demo edit page runs on another origin and
+  // must be able to read the JSON reply (success AND error). Same permissive
+  // grant as blocktrails.json — the edit endpoint is auth-gated (or explicitly
+  // openEdit), so the CORS header widens reach, not authority. The matching
+  // OPTIONS preflight is answered generically in the routing scope.
+  const CORS_HEADERS = {
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'POST, OPTIONS',
+    'access-control-allow-headers': 'content-type, authorization',
+    'access-control-max-age': '600',
+  };
+  function withCors(reply) {
+    for (const [k, v] of Object.entries(CORS_HEADERS)) reply.header(k, v);
+    return reply;
+  }
+  const corsJson = (reply, status, obj) => sendJson(withCors(reply), status, obj);
+  const corsErr = (reply, status, error) => corsJson(reply, status, { error });
+
   async function apiRepoList(reply, owners) {
     const repos = [];
     for (const owner of owners) {
@@ -3817,6 +3862,175 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
       url: `${prefix}/${caller}/${target}`,
       cloneUrl: cloneUrlOf(caller, target),
     });
+  }
+
+  // ---- tier 3.7: web-edit — commit one file over HTTP (GitHub's web editor)
+
+  /**
+   * Validate a repo-relative edit path. Returns the clean path or null.
+   * Rejects: non-strings, empties, a leading '/', '..', backslashes, control
+   * chars, empty/oversized segments, any '.git' segment, and a leading-dot
+   * path at the repo ROOT (.acl / .htaccess surprises). Each segment must
+   * match EDIT_SEG. Kept deliberately strict — the demo edits ordinary files.
+   */
+  function cleanEditPath(p) {
+    if (typeof p !== 'string' || p.length === 0 || p.length > EDIT_PATH_CAP) return null;
+    if (p[0] === '/' || p.includes('\\') || /[\x00-\x1f]/.test(p)) return null;
+    const segs = p.split('/');
+    for (const s of segs) {
+      if (s === '' || s === '..' || s === '.git' || !EDIT_SEG.test(s)) return null;
+    }
+    if (segs[0].startsWith('.')) return null; // no dotfile at the repo root
+    return segs.join('/');
+  }
+
+  /**
+   * POST api/repos/<o>/<n>/preview { path, content, branch? } — the UNSTAGED
+   * tier. Publishes an EPHEMERAL Nostr event (kind 21617) carrying the file
+   * content; makes NO commit, no push, no anchor, writes nothing to disk.
+   * Relays don't store ephemeral events, so only currently-connected viewers
+   * receive it — a live, throwaway preview that vanishes the moment you stop
+   * looking. Same auth as /edit (owner-signed unless config.openEdit). Returns
+   * {ok, published, kind, id, path, relays}; {published:false} if no relays.
+   */
+  async function apiRepoPreview(request, reply, owner, name) {
+    const p = await readJsonBody(request, EDIT_CONTENT_CAP + 128 * 1024);
+    const agent = await requestAgent(request);
+    const authedOwner = agent ? ownerFromAgent(agent) : null;
+    if (!openEdit) {
+      if (!agent) {
+        reply.header('WWW-Authenticate', 'Bearer realm="jss-forge"');
+        return corsErr(reply, 401, 'authentication required');
+      }
+      if (authedOwner !== owner) return corsErr(reply, 403, 'only the repo owner may preview this repository');
+    }
+    if (!p || typeof p !== 'object') return corsErr(reply, 400, 'invalid JSON body');
+    const relPath = cleanEditPath(p.path);
+    if (!relPath) return corsErr(reply, 400, 'invalid path');
+    if (typeof p.content !== 'string') return corsErr(reply, 400, 'content must be a string');
+    if (Buffer.byteLength(p.content, 'utf8') > EDIT_CONTENT_CAP) {
+      return corsErr(reply, 413, `content exceeds the ${EDIT_CONTENT_CAP}-byte cap`);
+    }
+    if (!repoExists(owner, name)) return corsErr(reply, 404, 'not found');
+    let branch;
+    if (p.branch !== undefined) {
+      if (typeof p.branch !== 'string' || !REF_RE.test(p.branch) || p.branch.includes('..')) {
+        return corsErr(reply, 400, 'invalid branch');
+      }
+      branch = p.branch;
+    } else {
+      branch = await defaultBranch(repoDirOf(owner, name));
+    }
+    if (!announceRelays.length) {
+      return corsJson(reply, 200, { ok: true, published: false, reason: 'no relays configured (set config.announceRelays)' });
+    }
+    const ev = signAnnounceEvent({
+      kind: EPHEMERAL_PREVIEW_KIND,
+      tags: [['d', `${owner}/${name}`], ['f', relPath], ['branch', branch]],
+      content: p.content,
+    });
+    const relays = await publishEvent(ev);
+    return corsJson(reply, 200, { ok: true, published: true, kind: ev.kind, id: ev.id, path: relPath, relays });
+  }
+
+  /**
+   * POST api/repos/<o>/<n>/edit { path, content, message?, branch? } — the
+   * GitHub-web-editor equivalent: commit ONE file change over HTTP, then let
+   * the change ride the forge's NIP-34 emission. Owner-signed by default
+   * (401 anon / 403 wrong owner); config.openEdit relaxes to anonymous for a
+   * throwaway demo. The commit is made in a disposable local clone (a temp
+   * working tree) and pushed back to the bare — no server-side index games.
+   * A no-op edit (identical content) makes NO commit ({changed:false}).
+   */
+  async function apiRepoEdit(request, reply, owner, name) {
+    // Body BEFORE auth: a NIP-98 payload tag hashes the wire bytes.
+    const p = await readJsonBody(request, EDIT_CONTENT_CAP + 128 * 1024);
+    const agent = await requestAgent(request);
+    const authedOwner = agent ? ownerFromAgent(agent) : null;
+    if (!openEdit) {
+      if (!agent) {
+        reply.header('WWW-Authenticate', 'Bearer realm="jss-forge"');
+        return corsErr(reply, 401, 'authentication required');
+      }
+      if (authedOwner !== owner) return corsErr(reply, 403, 'only the repo owner may edit this repository');
+    }
+    if (!p || typeof p !== 'object') return corsErr(reply, 400, 'invalid JSON body');
+
+    const relPath = cleanEditPath(p.path);
+    if (!relPath) return corsErr(reply, 400, 'invalid path');
+    if (typeof p.content !== 'string') return corsErr(reply, 400, 'content must be a string');
+    if (Buffer.byteLength(p.content, 'utf8') > EDIT_CONTENT_CAP) {
+      return corsErr(reply, 413, `content exceeds the ${EDIT_CONTENT_CAP}-byte cap`);
+    }
+    let message = typeof p.message === 'string' ? p.message.replace(/[\x00-\x1f]+/g, ' ').trim() : '';
+    if (message.length > EDIT_MSG_CAP) message = message.slice(0, EDIT_MSG_CAP);
+    if (!message) message = `web edit: ${relPath}`;
+
+    const bareDir = repoDirOf(owner, name);
+    if (!repoExists(owner, name)) return corsErr(reply, 404, 'not found');
+    let branch;
+    if (p.branch !== undefined) {
+      if (typeof p.branch !== 'string' || !REF_RE.test(p.branch) || p.branch.includes('..')) {
+        return corsErr(reply, 400, 'invalid branch');
+      }
+      branch = p.branch;
+    } else {
+      branch = await defaultBranch(bareDir);
+    }
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-edit-'));
+    const gitTmp = (args) => execFileP('git', ['-C', tmpDir, ...args], { env: gitEnv, maxBuffer: MAX_EXEC_BUFFER });
+    try {
+      // Disposable local clone (fast, hard-linked), then land on the branch —
+      // creating it off the current HEAD if it does not exist yet.
+      await execFileP('git', ['clone', '--local', '--quiet', bareDir, tmpDir], { env: gitEnv, maxBuffer: MAX_EXEC_BUFFER });
+      await gitTmp(['checkout', branch]).catch(() => gitTmp(['checkout', '-b', branch]));
+
+      // Write the file (parents made), stage it, and detect a real change.
+      const abs = path.join(tmpDir, relPath);
+      const resolved = path.resolve(abs);
+      if (resolved !== path.resolve(tmpDir) && !resolved.startsWith(path.resolve(tmpDir) + path.sep)) {
+        return corsErr(reply, 400, 'invalid path'); // defense in depth; cleanEditPath already blocks this
+      }
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, p.content);
+      await gitTmp(['add', '--', relPath]);
+
+      let changed = true;
+      try { await gitTmp(['diff', '--cached', '--quiet']); changed = false; } catch { changed = true; }
+      if (!changed) {
+        const head = (await gitTmp(['rev-parse', 'HEAD']).then((r) => r.stdout.trim()).catch(() => '')) || null;
+        return corsJson(reply, 200, { ok: true, commit: head, changed: false });
+      }
+
+      // Committer identity is forced via -c (no HOME, GIT_CONFIG_NOSYSTEM):
+      // the author of record is whoever authenticated (or 'anonymous' in
+      // openEdit demo mode); the committer is the forge itself.
+      const who = authedOwner || 'anonymous';
+      const env = {
+        ...gitEnv,
+        GIT_AUTHOR_NAME: who,
+        GIT_AUTHOR_EMAIL: `${who}@forge.invalid`,
+      };
+      await execFileP('git', ['-C', tmpDir,
+        '-c', 'user.name=forge web edit', '-c', 'user.email=forge@forge.invalid',
+        'commit', '--quiet', '-m', message], { env, maxBuffer: MAX_EXEC_BUFFER });
+      await gitTmp(['push', '--quiet', bareDir, `HEAD:refs/heads/${branch}`]);
+      const commit = (await gitTmp(['rev-parse', 'HEAD'])).stdout.trim();
+
+      api.log.info(`forge: web edit ${owner}/${name}@${branch} ${relPath} -> ${commit.slice(0, 7)} by ${agent ?? 'anonymous'}`);
+      // The tip moved: advance any Blocktrails anchor exactly as a push would,
+      // then fire the NIP-34 emission (fire-and-forget; a no-op with no relays).
+      await recordTipSafe(owner, name);
+      announceRepoSafe(owner, name);
+      return corsJson(reply, 200, { ok: true, commit, changed: true, url: `${prefix}/${owner}/${name}` });
+    } catch (err) {
+      // Never leak the tmp path or raw git stderr.
+      api.log.warn(`forge: web edit ${owner}/${name} failed: ${err.message}`);
+      return corsErr(reply, 500, 'edit failed');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   }
 
   async function apiCompare(reply, owner, name, spec) {
@@ -4457,7 +4671,7 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
 
     const action = rest[2];
     const tail = rest.slice(3);
-    if (!['issues', 'pulls', 'fork', 'labels', 'marks', 'announce'].includes(action) && !isRead) return apiErr(reply, 405, 'method not allowed');
+    if (!['issues', 'pulls', 'fork', 'labels', 'marks', 'announce', 'edit', 'preview'].includes(action) && !isRead) return apiErr(reply, 405, 'method not allowed');
     try {
       switch (action) {
         case 'issues': return await apiIssuesHandler(request, reply, owner, name, tail);
@@ -4468,6 +4682,14 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
           if (tail.length !== 0) return apiErr(reply, 404, 'not found');
           if (request.method !== 'POST') return apiErr(reply, 405, 'method not allowed');
           return await apiAnnounce(request, reply, owner, name);
+        case 'edit':
+          if (tail.length !== 0) return apiErr(reply, 404, 'not found');
+          if (request.method !== 'POST') return apiErr(reply, 405, 'method not allowed');
+          return await apiRepoEdit(request, reply, owner, name);
+        case 'preview':
+          if (tail.length !== 0) return apiErr(reply, 404, 'not found');
+          if (request.method !== 'POST') return apiErr(reply, 405, 'method not allowed');
+          return await apiRepoPreview(request, reply, owner, name);
         case 'nostr': return tail.length === 0 && isRead ? await apiNostr(reply, owner, name) : apiErr(reply, 404, 'not found');
         case 'search': return tail.length === 0 ? await apiSearch(reply, owner, name, request.query) : apiErr(reply, 404, 'not found');
         case 'releases': return tail.length === 0 ? await apiReleases(reply, owner, name) : apiErr(reply, 404, 'not found');
@@ -4499,6 +4721,11 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
     scope.addContentTypeParser('*', (req, payload, done) => done(null, payload));
 
     const handler = async (request, reply) => {
+      // CORS preflight: the cross-origin web-edit page sends OPTIONS before the
+      // POST. Answer generically (the actual grant rides on the JSON reply).
+      if (request.method === 'OPTIONS') {
+        return withCors(reply).code(204).send();
+      }
       const rest = request.params['*'] ?? '';
       if (rest.includes('%')) {
         // Percent-forms of . / \ never name a real object here; refuse
@@ -4648,8 +4875,8 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
       }
     };
 
-    scope.route({ method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], url: prefix || '/', handler });
-    scope.route({ method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], url: `${prefix}/*`, handler });
+    scope.route({ method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], url: prefix || '/', handler });
+    scope.route({ method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], url: `${prefix}/*`, handler });
   });
 
   api.log.info(

@@ -2262,6 +2262,124 @@ describe('forge plugin', () => {
     assert.strictEqual(res.headers.get('location'), '/forge/casey/demo');
   });
 
+  describe('web-edit endpoint (single-file commit over HTTP, tier 3.7)', () => {
+    let editApi;      // .../api/repos/casey/editme/edit
+    let editRepoUrl;  // web home
+    const editHeaders = (token) => ({ 'content-type': 'application/json', authorization: `Bearer ${token}` });
+
+    before(async () => {
+      // A dedicated repo so edits do not perturb casey/demo (used elsewhere).
+      const ework = path.join(tmp, 'editwork');
+      fs.mkdirSync(ework, { recursive: true });
+      fs.writeFileSync(path.join(ework, 'index.html'), '<h1>original</h1>\n');
+      await git(['init', '--quiet'], { cwd: ework });
+      await git(['add', '-A'], { cwd: ework });
+      await git(['commit', '--quiet', '-m', 'seed'], { cwd: ework });
+      await git([...authFlag(casey.access_token), 'push', `${base}/forge/casey/editme.git`, 'main'], { cwd: ework });
+      editApi = `${base}/forge/api/repos/casey/editme/edit`;
+      editRepoUrl = `${base}/forge/casey/editme`;
+    });
+
+    const headOf = async () => (await git(['ls-remote', `${base}/forge/casey/editme.git`, 'refs/heads/main']))
+      .stdout.trim().split('\t')[0];
+
+    it('owner edits index.html -> 200 changed:true and the new content renders', async () => {
+      const before = await headOf();
+      const res = await fetch(editApi, {
+        method: 'POST',
+        headers: editHeaders(casey.access_token),
+        body: JSON.stringify({ path: 'index.html', content: '<h1>edited via web</h1>\n', message: 'web tweak' }),
+      });
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(res.headers.get('access-control-allow-origin'), '*', 'edit reply is CORS-readable');
+      const j = await res.json();
+      assert.strictEqual(j.ok, true);
+      assert.strictEqual(j.changed, true);
+      assert.match(j.commit, /^[0-9a-f]{40}$/, 'a full sha for the new commit');
+      assert.strictEqual(j.url, '/forge/casey/editme');
+      assert.notStrictEqual(j.commit, before, 'HEAD advanced');
+      // the blob the commit points at carries the new content
+      const raw = await fetch(`${editRepoUrl}/raw/main/index.html`).then((r) => r.text());
+      assert.match(raw, /edited via web/, 'raw serves the edited bytes');
+      // and the rendered home reflects it too
+      const home = await fetch(editRepoUrl).then((r) => r.text());
+      assert.ok(home.includes('index.html'), 'file still listed after edit');
+    });
+
+    it('editing to the SAME content makes no commit (changed:false, HEAD unchanged)', async () => {
+      const before = await headOf();
+      const res = await fetch(editApi, {
+        method: 'POST',
+        headers: editHeaders(casey.access_token),
+        body: JSON.stringify({ path: 'index.html', content: '<h1>edited via web</h1>\n' }),
+      });
+      assert.strictEqual(res.status, 200);
+      const j = await res.json();
+      assert.strictEqual(j.changed, false, 'identical content is a no-op');
+      assert.strictEqual(j.commit, before, 'HEAD did not move');
+      assert.strictEqual(await headOf(), before, 'ref unchanged on the bare repo');
+    });
+
+    it('a subdir path creates the file with parent dirs made', async () => {
+      const res = await fetch(editApi, {
+        method: 'POST',
+        headers: editHeaders(casey.access_token),
+        body: JSON.stringify({ path: 'docs/guide.md', content: '# Guide\n\nhello\n' }),
+      });
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual((await res.json()).changed, true);
+      const raw = await fetch(`${editRepoUrl}/raw/main/docs/guide.md`).then((r) => r.text());
+      assert.match(raw, /hello/, 'nested file created');
+    });
+
+    it('path traversal and unsafe paths are 400', async () => {
+      const bad = ['../x', '/etc/x', 'a/../../b', '.git/x', 'a\\b', '.acl', ''];
+      for (const bp of bad) {
+        const res = await fetch(editApi, {
+          method: 'POST',
+          headers: editHeaders(casey.access_token),
+          body: JSON.stringify({ path: bp, content: 'x' }),
+        });
+        assert.strictEqual(res.status, 400, `path ${JSON.stringify(bp)} must be 400`);
+      }
+    });
+
+    it('oversized content is rejected', async () => {
+      const res = await fetch(editApi, {
+        method: 'POST',
+        headers: editHeaders(casey.access_token),
+        body: JSON.stringify({ path: 'big.txt', content: 'a'.repeat(1024 * 1024 + 1) }),
+      });
+      assert.ok([400, 413].includes(res.status), `oversized content rejected, got ${res.status}`);
+    });
+
+    it('anonymous edit is 401 and a non-owner is 403 (openEdit unset)', async () => {
+      const anon = await fetch(editApi, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: 'index.html', content: 'nope\n' }),
+      });
+      assert.strictEqual(anon.status, 401);
+      assert.strictEqual(anon.headers.get('access-control-allow-origin'), '*', 'even the 401 is CORS-readable');
+      const other = await fetch(editApi, {
+        method: 'POST',
+        headers: editHeaders(rival.access_token),
+        body: JSON.stringify({ path: 'index.html', content: 'nope\n' }),
+      });
+      assert.strictEqual(other.status, 403);
+    });
+
+    it('OPTIONS preflight is answered with the CORS grant', async () => {
+      const res = await fetch(editApi, {
+        method: 'OPTIONS',
+        headers: { origin: 'https://demo.example', 'access-control-request-method': 'POST' },
+      });
+      assert.ok([200, 204].includes(res.status), `preflight ok, got ${res.status}`);
+      assert.strictEqual(res.headers.get('access-control-allow-origin'), '*');
+      assert.match(res.headers.get('access-control-allow-methods') || '', /POST/);
+    });
+  });
+
   it('privateRepos: true flips every read (git, HTML, JSON) to owner-only', async () => {
     const priv = await startJss({
       idp: true,
@@ -2404,6 +2522,58 @@ describe('forge NIP-34 emission to a live relay (in-process ws)', () => {
     assert.ok(st.tags.some((t) => t[0] === 'refs/heads/main' && /^[0-9a-f]{40}$/.test(t[1])), 'default-branch ref carries a full sha');
   });
 
+  it('a web edit auto-announces: the 30618 rides out carrying the new commit', async () => {
+    const before = received.length;
+    const editRes = await fetch(`${base}/forge/api/repos/mira/proj/edit`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${owner.access_token}` },
+      body: JSON.stringify({ path: 'NOTES.md', content: 'a note added over HTTP\n', message: 'web edit note' }),
+    });
+    assert.strictEqual(editRes.status, 200);
+    const ej = await editRes.json();
+    assert.strictEqual(ej.changed, true, 'a real commit was made');
+    assert.match(ej.commit, /^[0-9a-f]{40}$/);
+    // fire-and-forget announce: wait for a 30618 whose default-branch ref is
+    // the commit the edit just produced — proof the edit flows through NIP-34.
+    const st = await until(
+      () => received.slice(before).find((e) => e.kind === 30618
+        && e.tags.some((t) => t[0] === 'refs/heads/main' && t[1] === ej.commit)),
+      'the post-edit 30618 carrying the new commit',
+    );
+    assert.ok(schnorr.verify(st.sig, st.id, st.pubkey), 'the delivered state event is validly signed');
+  });
+
+  it('POST /preview emits an EPHEMERAL 21617 carrying the content and makes NO commit (unstaged tier)', async () => {
+    const headOf = async () => (await g(['ls-remote', `${base}/forge/mira/proj.git`, 'refs/heads/main'])).stdout.trim().split('\t')[0];
+    const head0 = await headOf();
+    const before = received.length;
+    const res = await fetch(`${base}/forge/api/repos/mira/proj/preview`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${owner.access_token}` },
+      body: JSON.stringify({ path: 'index.html', content: '<h1>ephemeral draft</h1>\n' }),
+    });
+    assert.strictEqual(res.status, 200);
+    const j = await res.json();
+    assert.strictEqual(j.published, true, 'relays configured => published');
+    assert.strictEqual(j.kind, 21617, 'ephemeral preview kind');
+    assert.strictEqual(j.relays[0].ok, true, 'the forge parsed the relay OK true');
+    const ev = await until(() => received.slice(before).find((e) => e.id === j.id), 'the ephemeral preview event at the relay');
+    assert.ok(ev.kind >= 20000 && ev.kind < 30000, 'kind is in the NIP-01 ephemeral range (relays do not store it)');
+    assert.ok(schnorr.verify(ev.sig, ev.id, ev.pubkey), 'the delivered ephemeral event is validly signed');
+    assert.strictEqual(ev.content, '<h1>ephemeral draft</h1>\n', 'the file content rides in the event content');
+    assert.deepStrictEqual((ev.tags.find((t) => t[0] === 'd') || []).slice(1), ['mira/proj'], 'd = repo id');
+    assert.deepStrictEqual((ev.tags.find((t) => t[0] === 'f') || []).slice(1), ['index.html'], 'f = the previewed path');
+    assert.ok(ev.tags.some((t) => t[0] === 'branch' && t[1] === 'main'), 'branch tag names the target branch');
+    // the crucial property of the unstaged tier: nothing was committed
+    assert.strictEqual(await headOf(), head0, 'HEAD is UNCHANGED — preview makes no commit');
+    // same auth surface as /edit: anonymous is rejected when openEdit is unset
+    const anon = await fetch(`${base}/forge/api/repos/mira/proj/preview`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: 'index.html', content: 'x' }),
+    });
+    assert.strictEqual(anon.status, 401, 'anonymous preview is 401 when openEdit is unset');
+  });
+
   it('recording a mark txo auto-announces the repo WITH its anchor tags', async () => {
     const marksApi = `${base}/forge/api/repos/mira/proj/marks`;
     const authed = { 'content-type': 'application/json', authorization: `Bearer ${owner.access_token}` };
@@ -2421,5 +2591,63 @@ describe('forge NIP-34 emission to a live relay (in-process ws)', () => {
       'anchor tag = [chain, the genesis txid just recorded]');
     assert.ok(anchored.tags.some((t) => t[0] === 'r' && t[1] === `${base}/forge/mira/proj/blocktrails.json`),
       'r tag hands off to blocktrails.json');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// openEdit DEMO mode — anonymous web edits allowed. Its own JSS (config
+// flips the relaxation), booted LAST so regenerating the process-global IdP
+// keys cannot disturb any earlier suite (same isolation rule as the others).
+describe('forge web-edit openEdit demo (anonymous edits)', () => {
+  let jss;
+  let base;
+  let owner;
+  const tmp3 = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-openedit-'));
+  const g = (args, opts = {}) => git(args, { ...opts, env: { HOME: tmp3, ...(opts.env ?? {}) } });
+
+  before(async () => {
+    fs.writeFileSync(path.join(tmp3, '.gitconfig'),
+      '[user]\n\temail = dora@example.org\n\tname = Dora\n[init]\n\tdefaultBranch = main\n');
+    jss = await startJss({
+      idp: true,
+      plugins: [{ id: 'forge', module: module_, prefix: '/forge', config: { openEdit: true } }],
+    });
+    base = jss.base;
+    owner = await registerAndMint(base, 'dora');
+    const wdir = path.join(tmp3, 'proj');
+    fs.mkdirSync(wdir, { recursive: true });
+    fs.writeFileSync(path.join(wdir, 'index.html'), '<h1>demo</h1>\n');
+    await g(['init', '--quiet'], { cwd: wdir });
+    await g(['add', '-A'], { cwd: wdir });
+    await g(['commit', '--quiet', '-m', 'seed'], { cwd: wdir });
+    await g([...authFlag(owner.access_token), 'push', `${base}/forge/dora/site.git`, 'main'], { cwd: wdir });
+  });
+
+  after(async () => {
+    if (jss) await jss.close();
+    fs.rmSync(tmp3, { recursive: true, force: true });
+  });
+
+  it('an anonymous edit succeeds (200, changed:true) and commits', async () => {
+    const res = await fetch(`${base}/forge/api/repos/dora/site/edit`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' }, // no Authorization
+      body: JSON.stringify({ path: 'index.html', content: '<h1>edited anonymously</h1>\n' }),
+    });
+    assert.strictEqual(res.status, 200, 'openEdit lets an anonymous edit through');
+    const j = await res.json();
+    assert.strictEqual(j.changed, true);
+    assert.match(j.commit, /^[0-9a-f]{40}$/, 'a real commit landed');
+    const raw = await fetch(`${base}/forge/dora/site/raw/main/index.html`).then((r) => r.text());
+    assert.match(raw, /edited anonymously/, 'the anonymous edit is committed and served');
+  });
+
+  it('bad paths are still 400 even under openEdit', async () => {
+    const res = await fetch(`${base}/forge/api/repos/dora/site/edit`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: '../escape', content: 'x' }),
+    });
+    assert.strictEqual(res.status, 400);
   });
 });
