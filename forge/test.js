@@ -21,6 +21,7 @@ import { promisify } from 'node:util';
 import { schnorr } from '@noble/curves/secp256k1';
 import { startJss } from '../helpers.js';
 import { markStateHash, npubEncode, trailAddress, trailProgram } from './plugin.js';
+import { renderMarkdown } from './lib/markdown.js';
 
 const execFileP = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(new URL(import.meta.url)));
@@ -126,6 +127,30 @@ const README_MD = [
 ].join('\n');
 
 const BINARY = Buffer.from([0x00, 0x01, 0x02, 0x03, 0x00, 0xff, 0xfe, 0x00, 0x89, 0x50]);
+
+describe('markdown GFM tables (lib/markdown.js)', () => {
+  const ctx = { rawBase: '/raw', blobBase: '/blob' };
+  it('renders a table with header row, per-column alignment, and inline cells', () => {
+    const md = ['| Name | Score |', '| :--- | ---: |', '| **a** | `9` |', '| b | 10 |'].join('\n');
+    const html = renderMarkdown(md, ctx);
+    assert.match(html, /<table><thead>/);
+    assert.match(html, /<th style="text-align:left">Name<\/th>/);
+    assert.match(html, /<th style="text-align:right">Score<\/th>/);
+    assert.match(html, /<td style="text-align:left"><strong>a<\/strong><\/td>/);
+    assert.match(html, /<td style="text-align:right"><code>9<\/code><\/td>/);
+    assert.match(html, /<td style="text-align:right">10<\/td>/);
+    assert.ok(!html.includes('<p>| Name'), 'the header row is a table, not a paragraph');
+  });
+  it('is escape-first: HTML in a cell is neutralized', () => {
+    const html = renderMarkdown('| x |\n| - |\n| <img src=x onerror=alert(1)> |', ctx);
+    assert.match(html, /&lt;img src=x/);
+    assert.ok(!/<img src=x/.test(html), 'no raw <img> tag survives');
+  });
+  it('honors escaped pipes inside cells', () => {
+    const html = renderMarkdown('| a | b |\n| - | - |\n| x \\| y | z |', ctx);
+    assert.match(html, /<td[^>]*>x \| y<\/td>/);
+  });
+});
 
 describe('forge plugin', () => {
   let jss;

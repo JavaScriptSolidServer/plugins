@@ -142,6 +142,7 @@ import {
   ICON_DIR, ICON_FILE, ICON_REPO, ICON_BRANCH, ICON_TAG, ICON_ISSUE_OPEN, ICON_ISSUE_CLOSED,
   ICON_PR_OPEN, ICON_PR_TAB, ICON_PR_MERGED, ICON_PR_CLOSED,
 } from './lib/helpers.js';
+import { renderMarkdown } from './lib/markdown.js';
 
 const execFileP = promisify(execFile);
 
@@ -317,91 +318,8 @@ async function readJsonBody(request, cap = ISSUE_BODY_CAP + 8192) {
   } catch { return null; }
 }
 
-// ------------------------------------------------------ markdown (bounded)
-// Grammar (deliberately small; escape-first, so it is structurally
-// XSS-proof — raw text is HTML-escaped BEFORE any tag is introduced):
-//   blocks:  # h1..###### h6 | ``` fenced code | > blockquote |
-//            -/* unordered list | 1. ordered list | paragraphs (blank-line
-//            separated). No nesting, no tables, no HTML passthrough.
-//   inline:  `code` | **bold** | *em* / _em_ | [text](href) |
-//            ![alt](src). hrefs: http(s) or relative only (no other
-//            schemes, no scheme-relative //); relative images are routed
-//            through the raw endpoint, relative links through blob view.
-
-function safeHref(url, base) {
-  if (/^https?:\/\//i.test(url)) return url;
-  if (url.startsWith('#')) return url;
-  if (url.startsWith('//')) return null;
-  if (/^[a-z][a-z0-9+.-]*:/i.test(url)) return null; // javascript:, data:, …
-  let rel = url.replace(/^\.\//, '');
-  if (rel.startsWith('/') || rel.split('/').some((s) => s === '..' || s === '')) return null;
-  return `${base}/${rel}`;
-}
-
-function mdInline(escaped, { rawBase, blobBase }) {
-  const codes = [];
-  let s = escaped.replace(/`([^`]+)`/g, (m, c) => { codes.push(c); return `\x01${codes.length - 1}\x01`; });
-  s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (m, alt, url) => {
-    const href = safeHref(url, rawBase);
-    return href ? `<img src="${href}" alt="${alt}">` : m;
-  });
-  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, text, url) => {
-    const href = safeHref(url, blobBase);
-    return href ? `<a href="${href}">${text}</a>` : m;
-  });
-  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  s = s.replace(/\*([^*\s][^*]*)\*/g, '<em>$1</em>');
-  s = s.replace(/(^|\s)_([^_]+)_(?=\s|$)/g, '$1<em>$2</em>');
-  return s.replace(/\x01(\d+)\x01/g, (m, i) => `<code>${codes[i] ?? ''}</code>`);
-}
-
-function renderMarkdown(src, ctx) {
-  const lines = String(src).replace(/[\x00\x01]/g, '').replace(/\r\n?/g, '\n').split('\n');
-  const out = [];
-  let para = [];
-  let list = null; // { tag, items }
-  let quote = [];
-  const flushPara = () => { if (para.length) { out.push(`<p>${mdInline(esc(para.join(' ')), ctx)}</p>`); para = []; } };
-  const flushList = () => { if (list) { out.push(`<${list.tag}>${list.items.map((i) => `<li>${i}</li>`).join('')}</${list.tag}>`); list = null; } };
-  const flushQuote = () => { if (quote.length) { out.push(`<blockquote><p>${mdInline(esc(quote.join(' ')), ctx)}</p></blockquote>`); quote = []; } };
-  const flushAll = () => { flushPara(); flushList(); flushQuote(); };
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const fence = /^```/.exec(line);
-    if (fence) {
-      flushAll();
-      const code = [];
-      i += 1;
-      while (i < lines.length && !/^```/.test(lines[i])) { code.push(lines[i]); i += 1; }
-      out.push(`<pre><code>${esc(code.join('\n'))}</code></pre>`);
-      continue;
-    }
-    const h = /^(#{1,6})\s+(.*)$/.exec(line);
-    if (h) { flushAll(); out.push(`<h${h[1].length}>${mdInline(esc(h[2].trim()), ctx)}</h${h[1].length}>`); continue; }
-    const q = /^>\s?(.*)$/.exec(line);
-    if (q) { flushPara(); flushList(); quote.push(q[1]); continue; }
-    const ul = /^\s*[-*]\s+(.*)$/.exec(line);
-    if (ul) {
-      flushPara(); flushQuote();
-      if (!list || list.tag !== 'ul') { flushList(); list = { tag: 'ul', items: [] }; }
-      list.items.push(mdInline(esc(ul[1]), ctx));
-      continue;
-    }
-    const ol = /^\s*\d+\.\s+(.*)$/.exec(line);
-    if (ol) {
-      flushPara(); flushQuote();
-      if (!list || list.tag !== 'ol') { flushList(); list = { tag: 'ol', items: [] }; }
-      list.items.push(mdInline(esc(ol[1]), ctx));
-      continue;
-    }
-    if (/^\s*$/.test(line)) { flushAll(); continue; }
-    flushList(); flushQuote();
-    para.push(line.trim());
-  }
-  flushAll();
-  return out.join('\n');
-}
+// markdown renderer (escape-first grammar + GFM tables) moved to
+// ./lib/markdown.js — renderMarkdown imported above.
 
 // ------------------------------------------------------------- diff parse
 // ONE structured parse feeds both the HTML renderer and the JSON API's
@@ -524,6 +442,10 @@ table.files td.age{color:#59636e;text-align:right;white-space:nowrap}
 .markdown-body code{background:rgba(129,139,152,0.12);border-radius:6px;padding:.2em .4em;font-size:85%}
 .markdown-body pre{background:#f6f8fa;border-radius:6px;padding:16px;overflow:auto;font-size:85%;line-height:1.45}
 .markdown-body pre code{background:transparent;padding:0;font-size:100%}
+.markdown-body table{border-collapse:collapse;margin:0 0 16px;display:block;width:max-content;max-width:100%;overflow-x:auto}
+.markdown-body th,.markdown-body td{border:1px solid #d0d7de;padding:6px 13px}
+.markdown-body th{background:#f6f8fa;font-weight:600}
+.markdown-body tr:nth-child(2n) td{background:#f6f8fa}
 .markdown-body blockquote{margin:0 0 16px;padding:0 1em;color:#59636e;border-left:.25em solid #d0d7de}
 .markdown-body img{max-width:100%}
 .clonebox{display:flex;gap:8px;align-items:center}
