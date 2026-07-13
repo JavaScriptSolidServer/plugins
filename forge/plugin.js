@@ -863,6 +863,17 @@ async function findBackend(config) {
 
 export async function activate(api) {
   const prefix = api.prefix || '/forge';
+  // CLI --plugin mounts (jspod, `jss --plugin module@prefix`) pass no per-plugin
+  // config. When FORGE_CONFIG names a JSON file, merge it in as DEFAULTS so a
+  // CLI-mounted forge can still opt into Nostr/marks/etc. Explicit api.config
+  // wins; unset env or unreadable file is a silent no-op (behavior unchanged).
+  if (process.env.FORGE_CONFIG) {
+    try {
+      api.config = api.config || {};
+      const fc = JSON.parse(fs.readFileSync(process.env.FORGE_CONFIG, 'utf8'));
+      for (const k of Object.keys(fc)) if (api.config[k] === undefined) api.config[k] = fc[k];
+    } catch (e) { api.log?.warn?.(`forge: FORGE_CONFIG load failed: ${e.message}`); }
+  }
   const privateRepos = api.config.privateRepos ?? false;
   // Web-edit DEMO relaxation (tier 3.7): when true, the single-file edit
   // endpoint accepts ANONYMOUS edits (no owner signature). This is never a
