@@ -2349,7 +2349,7 @@ function setMsg(text){const m=document.getElementById('form-msg');if(m)m.textCon
 function shortId(id){return id.length>28?id.slice(0,16)+'…'+id.slice(-6):id}
 function wireForms(){for(const id of ['submit-issue','submit-comment','toggle-state','submit-pull','do-merge','do-enable','submit-txo']){
   const b=document.getElementById(id);if(b)b.disabled=!(T()||X())}
-  document.querySelectorAll('.del-entry').forEach(function(b){b.disabled=!(T()||X())})}
+  document.querySelectorAll('.del-entry,.edit-entry').forEach(function(b){b.disabled=!(T()||X())})}
 function renderAuth(){
   const box=document.getElementById('forge-auth');if(!box)return;
   box.textContent='';
@@ -2512,6 +2512,50 @@ document.querySelectorAll('.del-entry').forEach(function(b){b.onclick=async func
     location.reload();
   }catch(e){setMsg(String(e&&e.message||e));b.disabled=was}
 }});
+// Edit: GET the raw doc from its resourceUrl, swap the rendered body for a
+// textarea, PUT the doc back with only its body changed. Author-only,
+// enforced server-side (pod WAC, or the hosted PUT endpoint did:nostr check).
+async function authRead(url){
+  let res;
+  if(X()){res=await window.xlogin.authFetch(url)}
+  else{res=await fetch(url,{headers:{authorization:'Bearer '+T()}})}
+  if(!res.ok)throw new Error('HTTP '+res.status);
+  return res.json();
+}
+document.querySelectorAll('.edit-entry').forEach(function(b){b.onclick=async function(){
+  const url=b.getAttribute('data-edit');if(!url)return;
+  const box=b.closest('.cbox');if(!box)return;
+  const md=box.querySelector('.markdown-body');if(!md||box.querySelector('.edit-wrap'))return;
+  setMsg('');b.disabled=true;
+  let doc;
+  try{doc=await authRead(url)}
+  catch(e){setMsg('Could not load for editing: '+String(e&&e.message||e));b.disabled=false;return}
+  const cur=(doc&&typeof doc.body==='string')?doc.body:'';
+  md.style.display='none';
+  const ta=el('textarea',{value:cur});
+  ta.style.width='100%';ta.style.minHeight='140px';ta.style.boxSizing='border-box';ta.style.fontFamily='inherit';
+  const save=el('button',{className:'btn btn-primary',type:'button'},'Save');
+  const cancel=el('button',{className:'btn',type:'button'},'Cancel');
+  const bar=el('div',{},save,' ',cancel);bar.style.margin='8px 0';
+  const wrap=el('div',{className:'edit-wrap'},ta,bar);
+  md.parentNode.insertBefore(wrap,md.nextSibling);
+  ta.focus();
+  function done(){wrap.remove();md.style.display='';b.disabled=false}
+  cancel.onclick=done;
+  save.onclick=async function(){
+    save.disabled=true;cancel.disabled=true;setMsg('Saving…');
+    try{
+      const isHosted=b.getAttribute('data-hosted')==='1';
+      const next=Object.assign({},doc,{body:ta.value});
+      const ct=isHosted?'application/json':'application/ld+json';
+      let res;
+      if(X()){res=await window.xlogin.authFetch(url,{method:'PUT',headers:{'content-type':ct},body:JSON.stringify(next)})}
+      else{res=await fetch(url,{method:'PUT',headers:{'content-type':ct,authorization:'Bearer '+T()},body:JSON.stringify(next)})}
+      if(!(res.ok||res.status===204))throw new Error(res.status===403?'only the author can edit this':'HTTP '+res.status);
+      location.reload();
+    }catch(e){setMsg(String(e&&e.message||e));save.disabled=false;cancel.disabled=false}
+  };
+}});
 document.addEventListener('xlogin',function(){renderAuth();wireForms()});
 document.addEventListener('xlogout',function(){renderAuth();wireForms()});
 if(window.xlogin&&window.xlogin.ready)window.xlogin.ready.then(function(){renderAuth();wireForms()});
@@ -2576,7 +2620,11 @@ ${pager}
       // user like the close/reopen button; deleting shows the existing tombstone.
       const del = (e.removed || !e.resourceUrl) ? ''
         : `<button class="btn del-entry" type="button" data-del="${esc(e.resourceUrl)}" disabled title="Delete (author only)" style="float:right;margin:6px;padding:2px 8px;font-size:12px">Delete</button>`;
-      const head = `${del}${identicon(who)} <a href="${esc(authorHref(e.author))}"><b>${esc(who)}</b></a>${ownerBadge}${hostedTag}
+      // Author-only Edit: fetch the raw body from resourceUrl, PUT it back
+      // (pod WAC for WebID authors; the hosted PUT endpoint for did:nostr).
+      const edit = (e.removed || !e.resourceUrl) ? ''
+        : `<button class="btn edit-entry" type="button" data-edit="${esc(e.resourceUrl)}" data-hosted="${e.hosted ? '1' : ''}" disabled title="Edit (author only)" style="float:right;margin:6px;padding:2px 8px;font-size:12px">Edit</button>`;
+      const head = `${del}${edit}${identicon(who)} <a href="${esc(authorHref(e.author))}"><b>${esc(who)}</b></a>${ownerBadge}${hostedTag}
 <span class="muted">${i === 0 ? openVerb : 'commented'} ${relTime(e.at)}</span>`;
       const slot = e.removed
         ? '<div class="removed">content removed by its author</div>'
@@ -4394,8 +4442,10 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
 
   /**
    * <prefix>/api/hosted/<hex>/<uuid> — a podless agent's words, hosted by
-   * the forge. GET is public (like a public pod resource); DELETE is the
-   * author-only removal beat (same did:nostr identity that wrote it).
+   * the forge. GET is public (like a public pod resource); PUT (edit) and
+   * DELETE (removal) are author-only — the same did:nostr identity that
+   * wrote it. Editing only ever changes `body`; every other field is kept
+   * from the stored doc, so a signed request can't rewrite authorship.
    */
   async function apiHosted(request, reply, segs) {
     if (segs.length !== 2 || !NOSTR_HEX.test(segs[0]) || !UUID_RE.test(segs[1])) {
@@ -4409,6 +4459,21 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
       }
       const doc = readHosted(hex, id);
       return doc ? sendJson(reply, 200, doc) : apiErr(reply, 404, 'not found');
+    }
+    if (request.method === 'PUT' || request.method === 'PATCH') {
+      const incoming = await readJsonBody(request); // buffer before auth (NIP-98 payload tag)
+      const agent = await apiAgent(request, reply);
+      if (!agent) return reply;
+      if (agent !== `did:nostr:${hex}`) return apiErr(reply, 403, 'only the author may edit hosted content');
+      const existing = readHosted(hex, id);
+      if (!existing) return apiErr(reply, 404, 'not found');
+      const body = incoming && typeof incoming.body === 'string' ? incoming.body : null;
+      if (body === null) return apiErr(reply, 400, 'body (string) required');
+      if (body.length > ISSUE_BODY_CAP) return apiErr(reply, 413, 'body too large');
+      const updated = { ...existing, body, edited: new Date().toISOString() };
+      fs.writeFileSync(hostedPathOf(hex, id), JSON.stringify(updated));
+      api.log.info(`forge: hosted content ${hex}/${id} edited by its author`);
+      return sendJson(reply, 200, { edited: true });
     }
     if (request.method === 'DELETE') {
       const agent = await apiAgent(request, reply);

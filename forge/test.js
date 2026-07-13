@@ -1020,6 +1020,37 @@ describe('forge plugin', () => {
       assert.ok(html.includes(`/.well-known/did/nostr/${pkA}`), "author links to core's DID-document route");
       assert.ok(html.includes('>owner</span>'), 'hex-namespace owner badge still works');
       assert.match(html, /class="btn del-entry"[^>]*data-del="[^"]*\/api\/hosted\//, 'per-entry Delete button renders pointing at the resource URL');
+      assert.match(html, /class="btn edit-entry"[^>]*data-edit="[^"]*\/api\/hosted\//, 'per-entry Edit button renders pointing at the resource URL');
+    });
+
+    it("another agent cannot edit someone else's hosted content (403)", async () => {
+      const putBody = JSON.stringify({ body: 'not my words to change' });
+      const res = await fetch(hostedIssueUrl, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json', authorization: nip98Header(skB, hostedIssueUrl, 'PUT', putBody) },
+        body: putBody,
+      });
+      assert.strictEqual(res.status, 403);
+      const doc = await (await fetch(hostedIssueUrl)).json();
+      assert.ok(doc.body.includes('**schnorr**'), 'original body untouched');
+    });
+
+    it('the author edits their hosted content -> only body changes, edited stamp added', async () => {
+      const putBody = JSON.stringify({ body: 'edited: now with *more* schnorr', author: `did:nostr:${pkB}`, hosted: false });
+      const res = await fetch(hostedIssueUrl, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json', authorization: nip98Header(skA, hostedIssueUrl, 'PUT', putBody) },
+        body: putBody,
+      });
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual((await res.json()).edited, true);
+      const doc = await (await fetch(hostedIssueUrl)).json();
+      assert.strictEqual(doc.body, 'edited: now with *more* schnorr', 'new body persisted');
+      assert.strictEqual(doc.author, didA, 'author NOT rewritten by the incoming payload');
+      assert.strictEqual(doc.hosted, true, 'hosted flag NOT rewritten by the incoming payload');
+      assert.ok(typeof doc.edited === 'string', 'edited timestamp recorded');
+      const t = await (await fetch(`${base}/forge/api/repos/${pkA}/nrepo/issues/1`)).json();
+      assert.ok(t.thread[0].html.includes('<em>more</em>'), 'edited markdown re-renders in the thread');
     });
 
     it("another agent cannot delete someone else's hosted content (403)", async () => {
