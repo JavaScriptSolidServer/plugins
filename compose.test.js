@@ -97,7 +97,7 @@ describe('composition: every plugin on one server', () => {
         // (origin via api.serverInfo, container defaults to the caller's pod).
         { module: at('gallery/plugin.js'), prefix: '/gallery' },
         { module: at('forge/plugin.js'), prefix: '/forge' },
-        { module: at('recordweb/plugin.js'), prefix: '/recordweb' },
+        { module: at('recordweb/plugin.js'), prefix: '/recordweb', config: { baseUrl: base, loopbackUrl: base } },
         {
           module: at('remotestorage/plugin.js'),
           prefix: '/remotestorage',

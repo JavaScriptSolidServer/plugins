@@ -77,7 +77,7 @@ describe('recordweb (RWP) plugin', () => {
   });
 
   // ---- lifecycle -----------------------------------------------------------
-  let did; let uuid; let rootHash; let draftHash; let finalHash;
+  let did; let uuid; let rootHash; let draftHash; let finalHash; let podCopy;
 
   it('refuses an anonymous create (writes need a pod agent)', async () => {
     const res = await postJson(`${base}/recordweb/records`, null, { payload: { hello: 'world' } });
@@ -125,6 +125,27 @@ describe('recordweb (RWP) plugin', () => {
     assert.ok(body.snapshot.signature?.startsWith('z'), 'multibase signature present');
     assert.notStrictEqual(finalHash, draftHash, 'the state change gives a new content hash');
     assert.strictEqual(body.didDocument.currentVersion, finalHash, 'DID doc points at the finalized snapshot');
+    podCopy = body.podCopy;
+    assert.strictEqual(podCopy.delivered, true, `pod delivery: ${JSON.stringify(podCopy)}`);
+    assert.ok(podCopy.snapshot.includes(`/alice/records/${uuid}/`), 'copy lands in the owner\'s pod');
+  });
+
+  it('the pod copy is content-honest — it re-hashes to the same snapshotHash', async () => {
+    // The owner fetches their citizen-controlled copy from their own pod and
+    // recomputes the hash; it must equal the sealed snapshotHash. WAC governs
+    // the read (alice's bearer), proving the write went through the host, not
+    // a plugin backdoor.
+    const metaRes = await fetch(podCopy.snapshot, { headers: { authorization: `Bearer ${alice}` } });
+    assert.strictEqual(metaRes.status, 200, 'owner reads the pod copy');
+    const meta = await metaRes.json();
+    const payload = Buffer.from(await (await fetch(podCopy.payload, { headers: { authorization: `Bearer ${alice}` } })).arrayBuffer());
+    assert.strictEqual(computeSnapshotHash(meta, payload), finalHash, 'pod copy re-hashes to the sealed hash');
+    assert.strictEqual(meta.state, 'finalized');
+  });
+
+  it('a non-owner cannot read another agent\'s pod copy (WAC still governs)', async () => {
+    const res = await fetch(podCopy.snapshot, { headers: { authorization: `Bearer ${bob}` } });
+    assert.ok([401, 403].includes(res.status), `bob is denied alice's pod copy (got ${res.status})`);
   });
 
   it('refuses a second finalize — finalization is one-way (409)', async () => {

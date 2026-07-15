@@ -20,6 +20,8 @@ plugins: [{
   config: {
     namespace: 'bern.ch',            // optional — RWP namespaces are DNS domains; default = host
     baseUrl: 'https://pod.example',  // optional reverse-proxy override; default = api.serverInfo()
+    loopbackUrl: 'http://localhost:3000', // optional — pod delivery target; default = own origin
+    deliverToPod: true,              // optional — write a pod copy on finalize (default true)
   },
 }]
 ```
@@ -93,18 +95,23 @@ Resolution and verification are public, as a DID resolver must be.
   landed seams (0.0.218/0.0.219) close the gap for a *from-scratch* protocol,
   not just for ports of bundled features.
 
-- **`pluginDir` vs. the pod — the immutability/ownership split.** RWC frames
-  Solid pods as *"citizen-controlled copies"*, which suggests storing records
-  **in** the pod over loopback (the `micropub/`/`gallery/` pattern). But RWP's
-  core invariant is that a finalized snapshot is immutable, and a pod resource
-  is mutable by its owner. So this MVP keeps the authoritative,
-  content-addressed snapshots server-private in `pluginDir` (immutability the
-  plugin fully controls) and treats pod delivery as the *distribution* layer,
-  not the *system of record*. **The natural next wave**: on finalize, PUT a
-  read-only copy of the snapshot + DID doc into the owner's pod over loopback
-  with forwarded auth — the citizen-controlled copy RWC describes — while the
-  content hash keeps the pod copy honest. That needs no new api; it is the
-  `micropub/` write pattern pointed at the owner's pod.
+- **`pluginDir` vs. the pod — the immutability/ownership split, resolved by
+  keeping both.** RWC frames Solid pods as *"citizen-controlled copies"*. But
+  RWP's core invariant is that a finalized snapshot is immutable, and a pod
+  resource is mutable by its owner. So the authoritative, content-addressed
+  snapshots stay server-private in `pluginDir` (immutability the plugin fully
+  controls, the *system of record*), and **on finalize the plugin also delivers
+  a read-only copy into the owner's own pod** over loopback — `records/<uuid>/`
+  gets the snapshot metadata, the payload, and the DID document — forwarding the
+  owner's `Authorization` so the host's **WAC** authorizes the write, not the
+  plugin (the `micropub/`/`gallery/` pattern). The content hash keeps the two
+  copies reconciled: the owner (or anyone they grant) can fetch the pod copy and
+  re-hash it to the same `snapshotHash`. This is the RWC citizen-controlled copy,
+  and it needed **no new api** — `getAgent` + loopback + `serverInfo`. Delivery
+  is best-effort (a pod-write refusal never fails the seal; the response's
+  `podCopy` reports what happened) and opt-out via `config.deliverToPod: false`.
+  A `did:nostr` owner has no pod path, so delivery is skipped for it — the one
+  identity shape this wave doesn't cover, and the finding it surfaces.
 
 - **`did:rwp` is not `did:web`, so no well-known collision — but also no free
   WAC exemption.** `didweb/` leans on core blanket-exempting `/.well-known/*`.
@@ -135,9 +142,8 @@ Resolution and verification are public, as a DID resolver must be.
   but not yet wired here; the 404/410 split is the resolver-visible part and
   the hook for the rest.
 
-## Not yet (scoped out of the MVP, no api gap — just work)
+## Not yet (scoped out, no api gap — just work)
 
-- **Pod delivery of finalized copies** (the loopback wave above).
 - **`SchemaRecord`-driven validation** — RWP lets a record type carry a JSON
   Schema + allowed `stateTransitions` + per-state `payloadFormats`; finalize
   would validate the payload against it. The engine is here; the schema
@@ -157,7 +163,9 @@ Resolution and verification are public, as a DID resolver must be.
 node --test --test-concurrency=1 recordweb/test.js
 ```
 
-17 tests: the pure crypto units (JCS, Merkle), the full create→append→finalize
-lifecycle with owner/anon/non-owner gating, the one-way finalize, DID
-resolution (native + universal shim + foreign-namespace 404), snapshot + Case
-verification by independent recompute, and the well-known resolver doc.
+19 tests: the pure crypto units (JCS, Merkle), the full create→append→finalize
+lifecycle with owner/anon/non-owner gating, the one-way finalize, **pod
+delivery** (the sealed copy re-hashes from the owner's pod; a non-owner is
+WAC-denied), DID resolution (native + universal shim + foreign-namespace 404),
+snapshot + Case verification by independent recompute, and the well-known
+resolver doc.

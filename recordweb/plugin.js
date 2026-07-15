@@ -162,6 +162,24 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 const HASH_RE = /^sha256:[0-9a-f]{64}$/;
 const now = () => new Date().toISOString();
 
+/**
+ * Owner's pod root path from a WebID (the podFromWebid mapping gallery/micropub
+ * use). Only http(s) WebIDs map to a pod — a did:nostr owner has no pod path,
+ * so pod delivery is skipped for it (returns null).
+ *   http://host/alice/profile/card#me → /alice/    http://host/profile/card#me → /
+ */
+function podFromWebid(webid) {
+  try {
+    const u = new URL(webid);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    const segs = u.pathname.split('/').filter(Boolean);
+    if (segs.length >= 2 && segs[0] !== 'profile') return `/${segs[0]}/`;
+    return '/';
+  } catch { return null; }
+}
+/** A `sha256:<hex>` → a filename-safe segment (`sha256_<hex>`). */
+const hashFile = (h) => h.replace(':', '_');
+
 export async function activate(api) {
   const prefix = api.prefix || '/recordweb';
   const store = api.storage.pluginDir();
@@ -181,6 +199,53 @@ export async function activate(api) {
     ? String(api.config.namespace)
     : new URL(resolveBaseUrl()).host);
   const didFor = (uuid) => `did:rwp:${resolveNamespace()}:${uuid}`;
+
+  // Loopback origin for pod delivery. config.loopbackUrl overrides; else the
+  // server's own listening origin (serverInfo, #601). Delivery is on by default
+  // and can be turned off with config.deliverToPod === false.
+  const loopbackOrigin = () => {
+    if (api.config.loopbackUrl) return String(api.config.loopbackUrl).replace(/\/$/, '');
+    const { protocol, host, port } = api.serverInfo();
+    const h = host.includes(':') ? `[${host}]` : host;
+    return `${protocol}://${h}:${port}`;
+  };
+  const deliverEnabled = api.config.deliverToPod !== false;
+
+  /**
+   * Best-effort: on finalize, write a read-only copy of the sealed snapshot
+   * (metadata + payload + the record's DID document) into the OWNER's own pod
+   * over loopback, forwarding the owner's Authorization so the host's WAC —
+   * not this plugin — authorizes the write. The content hash keeps the pod copy
+   * honest: a verifier can re-hash it and get the same snapshotHash. This is
+   * RWC's "citizen-controlled copy". Never fails the finalize — pluginDir stays
+   * the system of record; the pod is distribution. Returns a status object.
+   */
+  async function deliverToPod(owner, uuid, meta, payloadBytes, didDoc, auth) {
+    if (!deliverEnabled) return { delivered: false, reason: 'disabled' };
+    if (!auth) return { delivered: false, reason: 'no-authorization-to-forward' };
+    const pod = podFromWebid(owner);
+    if (!pod) return { delivered: false, reason: 'owner has no pod path (non-WebID)' };
+    const origin = loopbackOrigin();
+    const base = `${pod}records/${uuid}/`;
+    const put = (p, body, type) => fetch(origin + p, {
+      method: 'PUT', redirect: 'manual',
+      headers: { authorization: auth, 'content-type': type }, body,
+    });
+    try {
+      const hf = hashFile(meta.snapshotHash);
+      const r1 = await put(`${base}${hf}.json`, JSON.stringify(meta, null, 2), 'application/json');
+      const r2 = await put(`${base}${hf}.bin`, Buffer.from(payloadBytes), meta.payloadFormat || 'application/octet-stream');
+      const r3 = await put(`${base}did.json`, JSON.stringify(didDoc, null, 2), 'application/did+json');
+      const codes = [r1.status, r2.status, r3.status];
+      const ok = codes.every((c) => c >= 200 && c < 300);
+      if (!ok) return { delivered: false, reason: `pod write refused (${codes.join('/')})`, base: `${resolveBaseUrl()}${base}` };
+      const podBase = `${resolveBaseUrl()}${base}`;
+      return { delivered: true, base: podBase,
+        snapshot: `${podBase}${hf}.json`, payload: `${podBase}${hf}.bin`, didDocument: `${podBase}did.json` };
+    } catch (err) {
+      return { delivered: false, reason: `loopback failed: ${err.message}` };
+    }
+  }
 
   // ---- owner signing keys (mint + persist per agent) -----------------------
   const keyFile = (agent) => path.join(keysDir, sha256hex(Buffer.from(agent, 'utf8')) + '.json');
@@ -401,8 +466,13 @@ export async function activate(api) {
     index.state = 'finalized';
     index.updated = frozenCore.finalized;
     await fsp.writeFile(indexPath(uuid), JSON.stringify(index, null, 2));
-    api.log.info(`recordweb: finalized ${index.did} → ${frozenHash}`);
-    return json(reply, 200, { snapshot: meta, didDocument: buildDidDoc(index) });
+    // Deliver a read-only, content-honest copy into the owner's pod (RWC's
+    // "citizen-controlled copy"), forwarding the owner's own Authorization.
+    const didDoc = buildDidDoc(index);
+    const podCopy = await deliverToPod(agent, uuid, meta, payloadBytes, didDoc, request.headers.authorization);
+    api.log.info(`recordweb: finalized ${index.did} → ${frozenHash}`
+      + (podCopy.delivered ? ` (pod copy at ${podCopy.base})` : ` (pod copy skipped: ${podCopy.reason})`));
+    return json(reply, 200, { snapshot: meta, didDocument: didDoc, podCopy });
   });
 
   // ---- read a Record (metadata + version graph) ----------------------------
