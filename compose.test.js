@@ -97,6 +97,7 @@ describe('composition: every plugin on one server', () => {
         // (origin via api.serverInfo, container defaults to the caller's pod).
         { module: at('gallery/plugin.js'), prefix: '/gallery' },
         { module: at('forge/plugin.js'), prefix: '/forge' },
+        { module: at('recordweb/plugin.js'), prefix: '/recordweb' },
         {
           module: at('remotestorage/plugin.js'),
           prefix: '/remotestorage',
@@ -368,6 +369,16 @@ describe('composition: every plugin on one server', () => {
     assert.match(page.headers.get('content-type') || '', /text\/html/);
     const up = await fetch(`${base}/gallery/upload/x.png`, { method: 'POST', body: 'nope' });
     assert.ok([401, 403].includes(up.status), `anon upload: ${up.status}`);
+  });
+
+  it('recordweb: the resolver-discovery doc answers; an anonymous Record create is refused', async () => {
+    const wk = await fetch(`${base}/.well-known/rwp-resolver.json`);
+    assert.strictEqual(wk.status, 200);
+    assert.strictEqual((await wk.json()).v, 'rwp1');
+    const create = await fetch(`${base}/recordweb/records`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ payload: { x: 1 } }),
+    });
+    assert.strictEqual(create.status, 401, `anon create: ${create.status}`);
   });
 
   it('jmap: anonymous session is 401; /.well-known/jmap redirects to it', async () => {

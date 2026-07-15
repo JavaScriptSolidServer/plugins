@@ -93,6 +93,7 @@ README and NOTES.md, ship the closest honest approximation.
 | `admin/` | — | **the capstone**: wp-admin-style operator home; each missing pillar names its seam |
 | `gallery/` | — | pod photo/media gallery — first `api.mountApp` (#583) consumer; zero required config |
 | `forge/` | #322-next | git forge — hosting, GitHub-light UI + JSON API, forks/PRs with real merges, issues as pod resources, did:nostr + xlogin, Bitcoin-anchored history (Blocktrails); zero deps, zero build |
+| `recordweb/` | — | [RecordWeb](https://github.com/recordweb) (RWP) node — institutional Records with `did:rwp`, content-addressed immutable snapshots in a version DAG (RFC 8785 + SHA-256 + Ed25519), one-way finalization, Merkle-rooted Cases; DID resolver + verify; **zero deps, zero seam gaps** — the four landed seams suffice for a from-scratch protocol |
 
 Plus one directory that is a scenario, not a plugin:
 [`federation-demo/`](./federation-demo/) — **two** JSS instances federating
