@@ -106,6 +106,7 @@ const fastify = createServer({
     { module: at('gallery/plugin.js'), prefix: '/gallery' },
     { module: at('forge/plugin.js'), prefix: '/forge' },
     { module: at('recordweb/plugin.js'), prefix: '/recordweb', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://localhost:${PORT}` } },
+    { module: at('ripple/plugin.js'), prefix: '/ripple' },
     // webfinger/ above owns /.well-known/webfinger — the witnessed collision
     // (remotestorage/README.md) — so remotestorage stands down here.
     { module: at('remotestorage/plugin.js'), prefix: '/remotestorage', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://localhost:${PORT}`, claimWellKnown: false } },

@@ -98,6 +98,7 @@ describe('composition: every plugin on one server', () => {
         { module: at('gallery/plugin.js'), prefix: '/gallery' },
         { module: at('forge/plugin.js'), prefix: '/forge' },
         { module: at('recordweb/plugin.js'), prefix: '/recordweb', config: { baseUrl: base, loopbackUrl: base } },
+        { module: at('ripple/plugin.js'), prefix: '/ripple' },
         {
           module: at('remotestorage/plugin.js'),
           prefix: '/remotestorage',
@@ -369,6 +370,17 @@ describe('composition: every plugin on one server', () => {
     assert.match(page.headers.get('content-type') || '', /text\/html/);
     const up = await fetch(`${base}/gallery/upload/x.png`, { method: 'POST', body: 'nope' });
     assert.ok([401, 403].includes(up.status), `anon upload: ${up.status}`);
+  });
+
+  it('ripple: the UI answers; an anonymous trustline is refused', async () => {
+    const page = await fetch(`${base}/ripple`);
+    assert.strictEqual(page.status, 200);
+    assert.match(page.headers.get('content-type') || '', /text\/html/);
+    const tl = await fetch(`${base}/ripple/api/trustlines`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ peer: 'x', currency: 'USD', limit: 1 }),
+    });
+    assert.strictEqual(tl.status, 401, `anon trustline: ${tl.status}`);
   });
 
   it('recordweb: the resolver-discovery doc answers; an anonymous Record create is refused', async () => {
