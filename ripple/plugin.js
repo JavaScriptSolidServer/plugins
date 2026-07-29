@@ -60,6 +60,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { uiPage } from './ui.js';
 
 // ---------------------------------------------------------------- pure model
 // Exported for unit tests: everything below operates on plain state
@@ -108,6 +109,19 @@ export function capacityOf(state, x, y, cur) {
 }
 
 const MAX_HOPS = 8;
+
+/**
+ * One agent, one spelling. getAgent returns the pod WebID in its
+ * `/profile/card.jsonld#me` document form, while pods conventionally
+ * reference `/profile/card#me` — the same agent as two different strings,
+ * which would silently SPLIT the trust graph (a line's debtor never matches
+ * the authenticated sender). Canonicalize the .jsonld document form down to
+ * the fragment form at every id entry point (getAgent results AND
+ * peer/to/agent params). Non-WebID ids (did:nostr, …) pass through.
+ */
+export const normalizeAgent = (id) => (typeof id === 'string'
+  ? id.replace(/\/profile\/card\.jsonld#/, '/profile/card#')
+  : id);
 
 /**
  * BFS shortest path from→to where EVERY hop carries amountMicro.
@@ -226,7 +240,7 @@ export async function activate(api) {
     .send(JSON.stringify(obj, null, 2));
 
   async function requireAgent(request, reply) {
-    const agent = await api.auth.getAgent(request);
+    const agent = normalizeAgent(await api.auth.getAgent(request));
     if (!agent) { json(reply, 401, { error: 'authentication required' }); return null; }
     return agent;
   }
@@ -239,7 +253,7 @@ export async function activate(api) {
 
   // ------------------------------------------------------------------ whoami
   api.fastify.get(`${prefix}/api/whoami`, async (request, reply) => {
-    const agent = await api.auth.getAgent(request);
+    const agent = normalizeAgent(await api.auth.getAgent(request));
     return json(reply, 200, { agent });
   });
 
@@ -263,7 +277,7 @@ export async function activate(api) {
 
   // ---------------------------------------------------------------- balances
   api.fastify.get(`${prefix}/api/balances`, (request, reply) => {
-    const agent = request.query.agent;
+    const agent = normalizeAgent(request.query.agent);
     if (!agent) return json(reply, 400, { error: 'agent query parameter required' });
     const positions = [];
     const net = {}; // currency → micro
@@ -290,7 +304,7 @@ export async function activate(api) {
   api.fastify.post(`${prefix}/api/trustlines`, async (request, reply) => {
     const agent = await requireAgent(request, reply); if (!agent) return reply;
     const body = request.body || {};
-    const peer = typeof body.peer === 'string' ? body.peer : null;
+    const peer = typeof body.peer === 'string' ? normalizeAgent(body.peer) : null;
     const currency = parseCurrency(body.currency);
     const limit = body.limit === 0 ? 0n : toMicro(body.limit);
     if (!peer || peer.includes(SEP)) return json(reply, 400, { error: 'peer (agent id) required' });
@@ -311,7 +325,7 @@ export async function activate(api) {
   api.fastify.post(`${prefix}/api/trustlines/remove`, async (request, reply) => {
     const agent = await requireAgent(request, reply); if (!agent) return reply;
     const body = request.body || {};
-    const peer = typeof body.peer === 'string' ? body.peer : null;
+    const peer = typeof body.peer === 'string' ? normalizeAgent(body.peer) : null;
     const currency = parseCurrency(body.currency);
     if (!peer || !currency) return json(reply, 400, { error: 'peer and currency required' });
     const k = lineKey(agent, peer, currency);
@@ -331,7 +345,7 @@ export async function activate(api) {
     const currency = parseCurrency(q.currency);
     const amount = toMicro(Number(q.amount));
     if (!q.from || !q.to || !currency || amount === null) return null;
-    return { from: q.from, to: q.to, currency, amount };
+    return { from: normalizeAgent(q.from), to: normalizeAgent(q.to), currency, amount };
   }
   api.fastify.get(`${prefix}/api/path`, (request, reply) => {
     const q = pathQuery(request.query);
@@ -345,7 +359,7 @@ export async function activate(api) {
   api.fastify.post(`${prefix}/api/payments`, async (request, reply) => {
     const agent = await requireAgent(request, reply); if (!agent) return reply;
     const body = request.body || {};
-    const to = typeof body.to === 'string' ? body.to : null;
+    const to = typeof body.to === 'string' ? normalizeAgent(body.to) : null;
     const currency = parseCurrency(body.currency);
     const amount = toMicro(body.amount);
     if (!to || to === agent) return json(reply, 400, { error: 'to (another agent id) required' });
@@ -365,7 +379,7 @@ export async function activate(api) {
   api.fastify.post(`${prefix}/api/settle`, async (request, reply) => {
     const agent = await requireAgent(request, reply); if (!agent) return reply;
     const body = request.body || {};
-    const peer = typeof body.peer === 'string' ? body.peer : null;
+    const peer = typeof body.peer === 'string' ? normalizeAgent(body.peer) : null;
     const currency = parseCurrency(body.currency);
     const amount = toMicro(body.amount);
     if (!peer || !currency || amount === null) {
@@ -412,95 +426,3 @@ export async function activate(api) {
 
 const bigMax = (a, b) => (a > b ? a : b);
 
-// --------------------------------------------------------------------- UI page
-// Server-rendered shell + fetch against the JSON api. Auth = a pasted pod
-// bearer kept in localStorage (the forge-style login widget is a later wave).
-function uiPage(prefix) {
-  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ripple — trustlines</title>
-<style>
-:root{--bg:#f6f7f5;--card:#fff;--ink:#1c2422;--soft:#5b6a66;--line:#d8ded9;--acc:#2c6e5a;--warn:#9a6417;--bad:#a6362f;
-font-size:15px}
-@media (prefers-color-scheme:dark){:root{--bg:#101614;--card:#182019;--ink:#e6ebe7;--soft:#93a29b;--line:#2b3630;--acc:#5bbe9c;--warn:#d69a4a;--bad:#e2776e}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,sans-serif}
-.wrap{max-width:880px;margin:0 auto;padding:24px 16px 80px}
-h1{font-family:ui-monospace,monospace;font-size:1.35rem;margin:.2rem 0 .3rem}
-h2{font-size:1rem;margin:0 0 10px}
-p.sub{color:var(--soft);margin:0 0 20px;font-size:.92rem}
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin:0 0 16px}
-label{display:block;font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:var(--soft);margin:8px 0 4px}
-input,select{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--ink);font:13px ui-monospace,monospace}
-button{margin-top:10px;padding:8px 16px;border:1px solid var(--acc);border-radius:7px;background:var(--acc);color:#fff;font:600 13px ui-monospace,monospace;cursor:pointer}
-button.ghost{background:transparent;color:var(--acc)}
-table{width:100%;border-collapse:collapse;font:12.5px ui-monospace,monospace}
-td,th{text-align:left;padding:6px 8px;border-top:1px solid var(--line);word-break:break-all}
-th{color:var(--soft);font-weight:600;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;border-top:0}
-.msg{font:12.5px ui-monospace,monospace;margin-top:10px;color:var(--soft);word-break:break-all}
-.msg.ok{color:var(--acc)}.msg.bad{color:var(--bad)}
-.who{font:12.5px ui-monospace,monospace;color:var(--acc);word-break:break-all}
-.grid{display:grid;gap:16px}@media(min-width:720px){.grid{grid-template-columns:1fr 1fr}}
-</style>
-<div class="wrap">
-<h1>Ripple <span style="color:var(--soft);font-weight:400">· trustlines</span></h1>
-<p class="sub">Fugger-classic mutual credit: extend trust, pay through chains of it, settle out of band.
-Payments route automatically through credit already granted — that's the whole trick.</p>
-
-<div class="card"><h2>Identity</h2>
-<label for="tok">Pod bearer token (POST /idp/credentials)</label>
-<input id="tok" placeholder="paste access_token"><button id="save">Use token</button>
-<div class="who" id="who">anonymous</div></div>
-
-<div class="grid">
-<div class="card"><h2>Extend trust</h2>
-<label for="tpeer">Peer (WebID / did)</label><input id="tpeer">
-<label for="tcur">Currency</label><input id="tcur" value="USD">
-<label for="tlim">Limit (0 = freeze)</label><input id="tlim" value="100">
-<button id="btrust">Set trustline</button><div class="msg" id="mtrust"></div></div>
-
-<div class="card"><h2>Pay</h2>
-<label for="pto">To</label><input id="pto">
-<label for="pcur">Currency</label><input id="pcur" value="USD">
-<label for="pamt">Amount</label><input id="pamt" value="10">
-<button class="ghost" id="bpath">Find route</button> <button id="bpay">Send payment</button>
-<div class="msg" id="mpay"></div></div>
-</div>
-
-<div class="card"><h2>Settle (record repayment received)</h2>
-<label for="speer">Peer who paid you back</label><input id="speer">
-<label for="scur">Currency</label><input id="scur" value="USD">
-<label for="samt">Amount</label><input id="samt" value="10">
-<button id="bsettle">Record settlement</button><div class="msg" id="msettle"></div></div>
-
-<div class="card"><h2>Trust graph</h2><div id="graph">loading…</div></div>
-<div class="card"><h2>Transition log <span id="chain" style="color:var(--soft);font-weight:400"></span></h2><div id="log"></div></div>
-</div>
-<script>
-"use strict";
-const P=${JSON.stringify(prefix)};
-const $=id=>document.getElementById(id);
-const tok=()=>localStorage.getItem('rippleToken')||'';
-const hdrs=()=>tok()?{authorization:'Bearer '+tok(),'content-type':'application/json'}:{'content-type':'application/json'};
-const api=(p,opt)=>fetch(P+'/api'+p,opt).then(async r=>({ok:r.ok,status:r.status,body:await r.json().catch(()=>({}))}));
-const msg=(id,r,okText)=>{const e=$(id);e.className='msg '+(r.ok?'ok':'bad');e.textContent=r.ok?okText:(r.body.error||('error '+r.status))};
-async function who(){const r=await api('/whoami',{headers:hdrs()});$('who').textContent=r.body.agent||'anonymous';}
-async function graph(){const r=await api('/graph');const g=r.body;
- const tl=g.trustlines.map(l=>'<tr><td>'+esc(l.creditor)+'</td><td>'+esc(l.debtor)+'</td><td>'+l.currency+'</td><td>'+l.limit+'</td><td>'+l.debt+'</td><td>'+l.available+'</td></tr>').join('');
- const bl=g.balances.map(b=>'<tr><td>'+esc(b.debtor)+'</td><td>owes</td><td>'+esc(b.creditor)+'</td><td>'+b.amount+' '+b.currency+'</td></tr>').join('');
- $('graph').innerHTML='<table><tr><th>Creditor</th><th>Debtor</th><th>Cur</th><th>Limit</th><th>Debt</th><th>Avail</th></tr>'+(tl||'<tr><td colspan=6 style="color:var(--soft)">no trustlines yet</td></tr>')+'</table>'
-  +(bl?'<h2 style="margin-top:14px">IOUs</h2><table>'+bl+'</table>':'');}
-async function log(){const r=await api('/log?limit=15');const v=await api('/log/verify');
- $('chain').textContent='· seq '+r.body.seq+' · chain '+(v.body.valid?'✓ valid':'✗ BROKEN');
- $('log').innerHTML='<table><tr><th>#</th><th>Actor</th><th>Type</th><th>Params</th></tr>'+r.body.entries.slice().reverse().map(e=>'<tr><td>'+e.seq+'</td><td>'+esc(short(e.actor))+'</td><td>'+e.type+'</td><td>'+esc(JSON.stringify(e.params))+'</td></tr>').join('')+'</table>';}
-const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-const short=s=>s&&s.length>42?s.slice(0,20)+'…'+s.slice(-16):s;
-const refresh=()=>{who();graph();log();};
-$('save').onclick=()=>{localStorage.setItem('rippleToken',$('tok').value.trim());refresh();};
-$('btrust').onclick=async()=>{const r=await api('/trustlines',{method:'POST',headers:hdrs(),body:JSON.stringify({peer:$('tpeer').value.trim(),currency:$('tcur').value.trim(),limit:Number($('tlim').value)})});msg('mtrust',r,'trustline set (seq '+(r.body.entry||{}).seq+')');refresh();};
-$('bpath').onclick=async()=>{const meR=await api('/whoami',{headers:hdrs()});const from=meR.body.agent;if(!from){msg('mpay',{ok:false,body:{error:'set a token first'}});return}
- const r=await api('/path?from='+encodeURIComponent(from)+'&to='+encodeURIComponent($('pto').value.trim())+'&currency='+encodeURIComponent($('pcur').value.trim())+'&amount='+encodeURIComponent($('pamt').value));
- msg('mpay',r,r.ok?('route: '+r.body.path.map(short).join(' → ')):'');};
-$('bpay').onclick=async()=>{const r=await api('/payments',{method:'POST',headers:hdrs(),body:JSON.stringify({to:$('pto').value.trim(),currency:$('pcur').value.trim(),amount:Number($('pamt').value)})});msg('mpay',r,r.ok?('paid via '+r.body.payment.path.length+' node path'):'');refresh();};
-$('bsettle').onclick=async()=>{const r=await api('/settle',{method:'POST',headers:hdrs(),body:JSON.stringify({peer:$('speer').value.trim(),currency:$('scur').value.trim(),amount:Number($('samt').value)})});msg('msettle',r,r.ok?('settled — remaining '+r.body.settled.remaining):'');refresh();};
-$('tok').value=tok();refresh();setInterval(()=>{graph();log();},5000);
-</script>`;
-}

@@ -88,6 +88,18 @@ GET  /ripple/api/log/verify           recompute + check the chain
   settle, then remove. This keeps "you can always withdraw unused credit"
   and "you can never vaporize a debt record" simultaneously true.
 
+- **WebID spelling splits the graph — normalize at every id entry point.**
+  Found live, not in tests: `getAgent` returns the pod WebID in its
+  `/profile/card.jsonld#me` *document* form, while pods conventionally
+  reference `/profile/card#me` — the same agent as two different strings. An
+  identity-keyed graph silently SPLITS on that: a line's debtor never equals
+  the authenticated sender, and routing finds nothing. `normalizeAgent()`
+  canonicalizes the `.jsonld` form down to the fragment form on getAgent
+  results AND every peer/to/agent parameter. Any identity-keyed plugin
+  (shortlink owners, capability issuers, …) has this same edge; arguably
+  `getAgent` itself should return one canonical spelling — a small seam
+  candidate.
+
 - **State-file growth**: every transition rewrites `state.json` including the
   full log — the same O(n) append cost class as plugins#6 (relay). Fine for
   the MVP scale; an NDJSON append-log is the obvious fix when it matters.

@@ -16,7 +16,7 @@ import assert from 'node:assert';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { probePort, startJss } from '../helpers.js';
-import { toMicro, fromMicro, pairKey, debtOf, capacityOf, findPath, entryHash } from './plugin.js';
+import { toMicro, fromMicro, pairKey, debtOf, capacityOf, findPath, entryHash, normalizeAgent } from './plugin.js';
 
 const __dirname = path.dirname(fileURLToPath(new URL(import.meta.url)));
 const PLUGIN = path.join(__dirname, 'plugin.js');
@@ -61,6 +61,24 @@ describe('ripple plugin (Fugger-classic trustlines)', () => {
     const who = async (t) => (await (await fetch(`${api}/whoami`, { headers: { authorization: `Bearer ${t}` } })).json()).agent;
     ALICE = await who(aliceTok); BOB = await who(bobTok); CAROL = await who(carolTok);
     assert.ok(ALICE && BOB && CAROL, 'all three agents resolve');
+  });
+
+  it('agent ids are normalized — card.jsonld#me and card#me are ONE agent', async () => {
+    // The bug the browser run surfaced: getAgent returns the .jsonld document
+    // form while pods conventionally reference card#me; unnormalized, a line's
+    // debtor never matches the authenticated sender and the graph splits.
+    assert.strictEqual(normalizeAgent('http://x/alice/profile/card.jsonld#me'),
+      'http://x/alice/profile/card#me');
+    assert.strictEqual(normalizeAgent('did:nostr:abc123'), 'did:nostr:abc123', 'non-WebIDs pass through');
+    assert.ok(!ALICE.includes('.jsonld'), 'whoami serves the canonical fragment form');
+    // A trustline created with the .jsonld PEER spelling must still route.
+    const r = await post(`${api}/trustlines`, aliceTok,
+      { peer: BOB.replace('/profile/card#', '/profile/card.jsonld#'), currency: 'XNORM', limit: 5 });
+    assert.strictEqual(r.status, 201);
+    assert.strictEqual((await r.json()).trustline.debtor, BOB, 'peer input normalized to the canonical form');
+    const p = await fetch(`${api}/path?from=${encodeURIComponent(BOB)}&to=${encodeURIComponent(ALICE)}&currency=XNORM&amount=5`);
+    assert.strictEqual(p.status, 200, 'the two spellings route as one agent');
+    await post(`${api}/trustlines/remove`, aliceTok, { peer: BOB, currency: 'XNORM' });
   });
 
   // ---- pure model units ----------------------------------------------------
