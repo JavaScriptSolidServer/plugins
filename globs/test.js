@@ -24,7 +24,7 @@ import { startJss, probePort } from '../helpers.js';
 const __dirname = path.dirname(fileURLToPath(new URL(import.meta.url)));
 const entry = {
   id: 'globs', module: path.join(__dirname, 'plugin.js'), prefix: '/globs',
-  config: { aimTimeMs: 200, queueBotFallbackMs: 500 },
+  config: { aimTimeMs: 200, queueBotFallbackMs: 500, interRoundMs: 0 },
 };
 
 function openSock(url, headers) {

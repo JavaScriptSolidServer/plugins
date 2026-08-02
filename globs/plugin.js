@@ -55,10 +55,12 @@ const START_RATING = 1200;
 const K_HUMAN = 32, K_BOT = 16;
 const QUEUE_BOT_FALLBACK_MS = 10_000;
 const RESOLVE_GRACE_MS = 2_000;
+const INTER_ROUND_MS = 4_500;            // let the clients' resolution animation breathe
 
 export async function activate(api) {
   const prefix = api.prefix || '/globs';
   const aimMs = api.config.aimTimeMs ?? AIM_TIME * 1000;
+  const interRoundMs = api.config.interRoundMs ?? INTER_ROUND_MS;
   const dir = api.storage.pluginDir();
   const eloFile = path.join(dir, 'elo.json');
   const logFile = path.join(dir, 'matches.jsonl');
@@ -107,6 +109,7 @@ export async function activate(api) {
       sides: [a, b],
       commits: [null, null],
       timer: null,
+      interRoundMs,
       done: false,
     };
     rooms.set(matchId, room);
@@ -150,7 +153,7 @@ export async function activate(api) {
       if (s.socket) send(s.socket, { type: 'result', round: room.st.round - 1, scorer, score: room.st.score, deaths, state: publicState(room.st) });
     }
     if (end) endRoom(room, room.st.winner, false);
-    else beginPhase(room);
+    else room.timer = setTimeout(() => beginPhase(room), room.interRoundMs);
   }
 
   function endRoom(room, winner, forfeit) {

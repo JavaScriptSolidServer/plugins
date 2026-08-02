@@ -62,7 +62,7 @@ describe('composition: every plugin on one server', () => {
       plugins: [
         { module: at('relay/plugin.js'), prefix: '/relay' },
         { module: at('webrtc/plugin.js'), prefix: '/webrtc' },
-        { module: at('globs/plugin.js'), prefix: '/globs', config: { aimTimeMs: 300 } },
+        { module: at('globs/plugin.js'), prefix: '/globs', config: { aimTimeMs: 300, interRoundMs: 0 } },
         { module: at('terminal/plugin.js'), prefix: '/terminal', config: { token: 'compose-secret' } },
         { module: at('tunnel/plugin.js'), prefix: '/tunnel' },
         {
