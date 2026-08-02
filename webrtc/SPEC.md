@@ -49,7 +49,8 @@ sees payload traffic.
   - Servers MAY accept other schemes carried on the upgrade request
     (DPoP, NIP-98).
 - A successfully authenticated connection is bound to an **agent id**:
-  a WebID URI or a `did:nostr:` DID. Anonymous connections are valid
+  a WebID URI or a [`did:nostr:`](https://did-nostr.com) DID. Anonymous
+  connections are valid
   and may use the content-addressed and tracker dialects only.
 - Every connection is assigned a server-scoped, opaque **peer id**
   (string). It appears as `from` in relayed room frames.
