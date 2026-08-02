@@ -1,4 +1,4 @@
-# Pod Signaling Protocol — Draft 0.1
+# Pod Signaling Protocol — Draft 0.0.1
 
 A WebSocket signaling protocol for WebRTC peers, as implemented by
 JavaScriptSolidServer (`--webrtc`, mounted at `/.webrtc`) and the
@@ -273,7 +273,7 @@ before any UI, before any media.
 
 ---
 
-*Draft 0.1, 2026-08-02. Derived from the behavior of JSS core
+*Draft 0.0.1, 2026-08-02. Derived from the behavior of JSS core
 `--webrtc` (v0.0.219) and the out-of-tree plugin port; where they
 differ (pre-auth buffering), this spec follows the plugin, which is the
 stricter and safer behavior.*
