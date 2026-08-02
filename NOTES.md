@@ -370,3 +370,17 @@ this repo is its proof.
   and no guidance; a design note in the plugin docs would spare every
   author the same deliberation. Eleven plugins now persist in
   `pluginDir` — the most settled seam in the api.
+
+- **Cross-engine float determinism** (globs/): `Math.hypot`, `Math.pow`,
+  and library trig are implementation-defined precision; node 24 and
+  headless Chromium disagreed on 4/20 knife-edge bot-mirror matches when a
+  game sim was replayed on both. Fix in the sim itself: `sqrt(x*x+y*y)`,
+  a pinned pow literal, and range-reduced Taylor trig — then 40/40 matches
+  bit-identical. Any plugin acting as physics authority for a browser
+  client will hit this; not an api seam, but worth knowing before trusting
+  "same JS everywhere".
+- **In-band WS bearer** (globs/): browsers can't set upgrade headers, so
+  the plugin lifts `hello{token}` to an agent via `getAgent` with a
+  synthetic headers-only request — valid for bearers per the auth.js
+  contract, not for DPoP-bound tokens. Third WS plugin to want this;
+  a documented `api.auth.getAgentFromToken(token)` would make it official.

@@ -70,6 +70,7 @@ const fastify = createServer({
   plugins: [
     { module: at('relay/plugin.js'), prefix: '/relay' },
     { module: at('webrtc/plugin.js'), prefix: '/webrtc' },
+    { module: at('globs/plugin.js'), prefix: '/globs' },
     { module: at('terminal/plugin.js'), prefix: '/terminal', config: { token: terminalToken } },
     { module: at('tunnel/plugin.js'), prefix: '/tunnel' },
     {
@@ -164,6 +165,7 @@ console.log(`jss + every plugin up at ${PUBLIC_URL}`);
 console.log(`  pods:           ${PUBLIC_URL}/idp/register`);
 console.log(`  relay:          ws  ${PUBLIC_URL}/relay`);
 console.log(`  webrtc:         ws  ${PUBLIC_URL}/webrtc`);
+console.log(`  globs:          ws  ${PUBLIC_URL}/globs/play  (NEONGLOBS ranked matches)`);
 console.log(`  terminal:       ws  ${PUBLIC_URL}/terminal?token=${terminalToken}`);
 console.log(`  tunnel:         ws  ${PUBLIC_URL}/tunnel`);
 console.log(`  notifications:  ws  ${PUBLIC_URL}/.notifications`);
