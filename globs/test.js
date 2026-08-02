@@ -141,6 +141,40 @@ describe('globs plugin', async () => {
     assert.ok(body.top[0].rating < 1200);
   });
 
+  it('mints an xlogin session over HTTP and ranks through it on the socket', async () => {
+    const USER = 'sessioneer', PASS = 'glob-secret-2';
+    await fetch(`${base}/idp/register`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: USER, password: PASS, confirmPassword: PASS }),
+    });
+    const cred = await fetch(`${base}/idp/credentials`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: USER, password: PASS }),
+    });
+    const token = (await cred.json()).access_token;
+
+    const nope = await fetch(`${base}/globs/session`, { method: 'POST' });
+    assert.strictEqual(nope.status, 401, 'no credential, no session');
+    await nope.text();                                   // drain, or the runner never exits
+
+    const res = await fetch(`${base}/globs/session`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}` },
+    });
+    assert.strictEqual(res.status, 200);
+    const { session, agent } = await res.json();
+    assert.ok(session.startsWith('v1.'), 'macaroon-lite session');
+    assert.ok(agent.includes(USER));
+
+    const socket = await openSock(`${jss.wsBase}/globs/play`);
+    await waitFor(socket, m => m.some(x => x.type === 'welcome'));
+    socket.send(JSON.stringify({ type: 'hello', session }));
+    await waitFor(socket, m => m.some(x => x.type === 'welcome' && x.agent));
+    assert.strictEqual(socket._msgs.find(x => x.type === 'welcome' && x.agent).agent, agent);
+
+    socket.send(JSON.stringify({ type: 'hello', session: 'v1.tampered.nope' }));
+    socket.close();
+  });
+
   it('pairs two humans, clamps an over-speed commit, ships authoritative state', async () => {
     const s1 = await openSock(`${jss.wsBase}/globs/play`);
     const s2 = await openSock(`${jss.wsBase}/globs/play`);

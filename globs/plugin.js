@@ -81,6 +81,35 @@ export async function activate(api) {
     if (won) p.wins++; else p.losses++;
     elo.players[agent] = p;
   }
+  // ---------- sessions (macaroon-lite): xlogin -> POST /session -> WS hello ----------
+  // NIP-98 and DPoP credentials are signed over a method+URL, so they can't ride
+  // an in-band WS hello. Instead they authenticate a REAL http request here, and
+  // get back a short-lived HMAC session the socket can present.
+  const secretFile = path.join(dir, 'session.secret');
+  let secret;
+  try { secret = fs.readFileSync(secretFile); } catch {
+    secret = crypto.randomBytes(32);
+    fs.writeFileSync(secretFile, secret, { mode: 0o600 });
+  }
+  const b64u = b => Buffer.from(b).toString('base64url');
+  function mintSession(agent) {
+    const payload = b64u(JSON.stringify({ a: agent, exp: Date.now() + 24 * 3600 * 1000 }));
+    const mac = b64u(crypto.createHmac('sha256', secret).update(payload).digest());
+    return `v1.${payload}.${mac}`;
+  }
+  function verifySession(token) {
+    if (typeof token !== 'string') return null;
+    const parts = token.split('.');
+    if (parts.length !== 3 || parts[0] !== 'v1') return null;
+    const mac = b64u(crypto.createHmac('sha256', secret).update(parts[1]).digest());
+    if (mac.length !== parts[2].length || !crypto.timingSafeEqual(Buffer.from(mac), Buffer.from(parts[2]))) return null;
+    try {
+      const p = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+      if (!p.a || p.exp < Date.now()) return null;
+      return p.a;
+    } catch { return null; }
+  }
+
   // ---------- match rooms ----------
   const sockets = new Set();
   const waiting = [];                       // [{ socket, ctx, timer }]
@@ -235,6 +264,13 @@ export async function activate(api) {
 
     async function handleMessage(msg) {
       if (msg.type === 'hello') {
+        if (msg.session && !entry.ctx.agent) {
+          const a = verifySession(msg.session);
+          if (a) {
+            entry.ctx.agent = a;
+            entry.ctx.name = a.replace(/^https?:\/\//, '').replace(/\/.*$/, '').slice(0, 40) || a.slice(0, 40);
+          }
+        }
         if (msg.token && !entry.ctx.agent) {
           // bearer verification reads only headers (auth.js contract), so a
           // synthetic request is enough to lift a browser token to an agent
@@ -304,6 +340,13 @@ export async function activate(api) {
       .sort((a, b) => b.rating - a.rating)
       .slice(0, 50);
     return { top, players: Object.keys(elo.players).length, bots: BOTS };
+  });
+
+  // any credential getAgent understands (bearer, DPoP, NIP-98) buys a session
+  api.fastify.post(`${prefix}/session`, async (request, reply) => {
+    const agent = await getAgent(request);
+    if (!agent) return reply.code(401).send({ error: 'no verifiable credential' });
+    return { session: mintSession(agent), agent, rating: ratingOf(agent) };
   });
 
   api.log.info?.(`globs: match server at ws://…${prefix}/play, leaderboard at ${prefix}/leaderboard`);

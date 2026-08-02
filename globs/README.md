@@ -25,11 +25,14 @@ seeds (that took work — see findings).
 
 ## Identity and ranking
 
-`api.auth.getAgent` on the WS upgrade (node clients send `Authorization`),
-or `hello{token}` for browsers — the token is lifted to an agent via
-`getAgent` with a synthetic headers-only request, which the `auth.js`
-contract documents as sufficient for bearer verification. Guests play
-unrated. ELO: start 1200, K=32 vs humans, K=16 vs bots; bots are fixed
+`api.auth.getAgent` on the WS upgrade (node clients send `Authorization`);
+browsers use `POST {prefix}/session` — any credential `getAgent`
+understands (bearer, DPoP, **NIP-98**) authenticates a real HTTP request
+and buys a 24h HMAC macaroon-lite session (pattern #4; secret in
+`pluginDir`) that the socket presents as `hello{session}`. This is how
+[xlogin](https://github.com/melvincarvalho/xlogin) users (Nostr extension /
+guest key / Solid OIDC) get onto the leaderboard. A raw pod bearer still
+works in-band as `hello{token}`. Guests play unrated. ELO: start 1200, K=32 vs humans, K=16 vs bots; bots are fixed
 anchors (EASY 800 / MEDIUM 1100 / HARD 1400) that never move. Both deltas
 are computed from pre-match ratings before either is applied. Disconnect
 mid-match forfeits. State: `elo.json` (atomic tmp+rename) and
@@ -41,11 +44,14 @@ mid-match forfeits. State: `elo.json` (atomic tmp+rename) and
   ranked realtime game server needed nothing beyond the documented surface.
   Zero new seams.
 - **Browser WS auth is the same gap every WS plugin has**: browsers cannot
-  set upgrade headers, so the plugin lifts a bearer sent in-band
-  (`hello{token}`) via `getAgent({ headers: { authorization } , ... })`.
-  Works because bearer verification only reads headers; a DPoP-bound token
-  would not survive this path (documented limitation, same as core's
-  `.webrtc`).
+  set upgrade headers. The bearer-only in-band lift (`hello{token}`) works
+  because bearer verification reads only headers — but DPoP and NIP-98 are
+  signed over a method+URL and cannot ride it. The resolution is the
+  session bridge: authenticate a REAL `POST /session` request (all schemes
+  verify naturally), hand back an HMAC macaroon-lite the socket can
+  present. That combination — pattern #1's "real request" + pattern #4's
+  self-verifying token — is probably the canonical answer for any WS
+  plugin wanting full-scheme auth.
 - **Cross-engine float determinism is real and it bites.** With stock
   `Math.hypot`/`Math.sin`/`Math.cos`/`Math.atan2`/`Math.pow`, node 24 and
   Chromium disagreed on 4 of 20 solver-mirror matches (implementation-
