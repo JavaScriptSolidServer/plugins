@@ -67,6 +67,13 @@ sees payload traffic.
   loop after socket creation — a listener attached after `await open`
   can silently miss the first frame. Browser `WebSocket` queues events
   as tasks and is unaffected.
+- Servers or intermediaries MAY drop idle connections without a close
+  frame (the reference deployment's reverse proxy closes after ~50s of
+  silence, code 1006). Clients that are waiting in a room SHOULD send a
+  keepalive every 20–30 seconds; re-announcing with empty `offers` is
+  the idiomatic keepalive, since announce is an idempotent membership
+  refresh (§6). Discovered in live two-implementation testing,
+  2026-08-03.
 
 ## 3. Dialect dispatch
 
