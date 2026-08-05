@@ -136,6 +136,27 @@ export function renderUi(prefix) {
       <div id="settled" class="hint">nothing settled yet</div>
     </div>
 
+    <div class="card hidden" id="admin-card">
+      <h2>Operator</h2>
+      <p class="hint">Disputes wait here. If nobody adjudicates before the grace period expires the
+         oracle's resolution stands and the disputer forfeits their bond — so an unworked queue
+         is a policy decision, not a pause.</p>
+      <div id="admin-disputes" class="hint">no open disputes</div>
+      <div class="row">
+        <input id="ad-agent" placeholder="Agent WebID" style="flex:1;min-width:12rem" aria-label="Agent WebID">
+        <button class="small" id="ad-lookup">History</button>
+        <button class="small" id="ad-freeze">Freeze</button>
+        <button class="small" id="ad-unfreeze">Unfreeze</button>
+      </div>
+      <div class="row">
+        <input id="ad-credits" type="number" placeholder="± credits" style="width:8rem" aria-label="Credit adjustment">
+        <input id="ad-reason" placeholder="Reason (journalled)" style="flex:1;min-width:10rem" aria-label="Reason">
+        <button class="small" id="ad-adjust">Adjust</button>
+      </div>
+      <div class="msg" id="admin-msg"></div>
+      <pre id="admin-out" class="hint" style="overflow-x:auto;max-height:16rem"></pre>
+    </div>
+
     <details class="card">
       <summary style="cursor:pointer;font-weight:600">Create a market</summary>
       <p class="hint">You escrow b·ln(n) credits as maker liquidity. You get your escrow back
@@ -310,6 +331,8 @@ export function renderUi(prefix) {
       $('auth-card').classList.add('hidden');
       $('me-card').classList.remove('hidden');
       renderMe();
+      $('admin-card').classList.toggle('hidden', !me.isAdmin);
+      if (me.isAdmin) renderDisputes();
       // A settlement that landed since the last poll is the moment that
       // matters most in a betting product — announce it.
       if (prev && me.settlements.length && (!prev.settlements.length
@@ -373,6 +396,47 @@ export function renderUi(prefix) {
   // Cash out a SPECIFIC outcome. Taking "the first outcome with shares"
   // silently sold the wrong leg for anyone holding two sides of a market,
   // so the outcome index is always passed explicitly.
+  // ------------------------------------------------------------ admin
+  async function renderDisputes() {
+    const el = $('admin-disputes');
+    try {
+      const { disputes } = await api('/admin/disputes');
+      if (!disputes.length) { el.innerHTML = '<span class="hint">no open disputes</span>'; return; }
+      el.innerHTML = disputes.map((d) => '<div class="mrow"><b>' + esc(d.title) + '</b>'
+        + '<div class="meta">resolved as <b>' + esc(d.outcomes[d.resolvedOutcome]) + '</b> · '
+        + d.disputeDetail.length + ' dispute(s) · auto-settles ' + new Date(d.autoVoidsAt).toLocaleString()
+        + '</div>'
+        + d.disputeDetail.map((x) => '<div class="meta">· ' + esc(x.agent) + ' (bond ' + cr(x.bond) + '): '
+            + esc(x.reason) + '</div>').join('')
+        + '<div class="row">'
+        + '<button class="small adj-up" data-m="' + esc(d.id) + '">Uphold</button>'
+        + '<select class="adj-out" data-m="' + esc(d.id) + '" aria-label="Re-resolve to">'
+        + d.outcomes.map((o, i) => '<option value="' + i + '">' + esc(o) + '</option>').join('')
+        + '</select>'
+        + '<button class="small adj-re" data-m="' + esc(d.id) + '">Re-resolve</button>'
+        + '<button class="small adj-void" data-m="' + esc(d.id) + '">Void</button>'
+        + '<button class="small adj-hide" data-m="' + esc(d.id) + '">Hide</button>'
+        + '</div></div>').join('');
+      const act2 = async (path, body) => {
+        try { await api(path, { method: 'POST', body: JSON.stringify(body) }); toast('done'); await renderDisputes(); await refreshMe(); }
+        catch (e) { $('admin-msg').textContent = e.message; $('admin-msg').className = 'msg err'; }
+      };
+      el.querySelectorAll('.adj-up').forEach((b) => {
+        b.onclick = () => act2('/admin/adjudicate', { market: b.dataset.m, uphold: true });
+      });
+      el.querySelectorAll('.adj-re').forEach((b) => {
+        const sel = el.querySelector('.adj-out[data-m="' + b.dataset.m + '"]');
+        b.onclick = () => act2('/admin/adjudicate', { market: b.dataset.m, uphold: false, outcome: Number(sel.value) });
+      });
+      el.querySelectorAll('.adj-void').forEach((b) => {
+        b.onclick = () => confirm('Void this market? Nobody wins.') && act2('/admin/adjudicate', { market: b.dataset.m, uphold: false });
+      });
+      el.querySelectorAll('.adj-hide').forEach((b) => {
+        b.onclick = () => act2('/admin/hide', { market: b.dataset.m, hidden: true });
+      });
+    } catch (e) { el.innerHTML = '<span class="hint">' + esc(e.message) + '</span>'; }
+  }
+
   async function cashOut(marketId, outcome) {
     const m = await api('/markets/' + encodeURIComponent(marketId));
     if (!m.position) return;
@@ -619,6 +683,29 @@ export function renderUi(prefix) {
     } catch (e) { $('auth-msg').textContent = e.message; $('auth-msg').className = 'msg err'; }
   };
   $('back').onclick = (e) => { e.preventDefault(); location.hash = ''; };
+  const adminAct = async (fn) => {
+    $('admin-msg').textContent = ''; $('admin-msg').className = 'msg';
+    try { await fn(); await refreshMe(); }
+    catch (e) { $('admin-msg').textContent = e.message; $('admin-msg').className = 'msg err'; }
+  };
+  $('ad-lookup').onclick = () => adminAct(async () => {
+    const h = await api('/admin/agent?agent=' + encodeURIComponent($('ad-agent').value.trim()));
+    $('admin-out').textContent = JSON.stringify(h, null, 1);
+  });
+  $('ad-freeze').onclick = () => adminAct(() => api('/admin/freeze', {
+    method: 'POST', body: JSON.stringify({ agent: $('ad-agent').value.trim(), frozen: true }),
+  }).then(() => toast('frozen')));
+  $('ad-unfreeze').onclick = () => adminAct(() => api('/admin/freeze', {
+    method: 'POST', body: JSON.stringify({ agent: $('ad-agent').value.trim(), frozen: false }),
+  }).then(() => toast('unfrozen')));
+  $('ad-adjust').onclick = () => adminAct(() => api('/admin/adjust', {
+    method: 'POST',
+    body: JSON.stringify({
+      agent: $('ad-agent').value.trim(),
+      credits: Number($('ad-credits').value),
+      reason: $('ad-reason').value,
+    }),
+  }).then(() => toast('adjusted — journalled')));
   $('t-buy').onclick = () => {
     if (!me) {
       $('auth-card').classList.remove('hidden');

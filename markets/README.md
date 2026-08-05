@@ -65,12 +65,18 @@ the first disputer, or defaulting to void made disputing a free refund
 option on any lost bet — paid for out of the winner's payout — so every
 rational loser disputes and correct resolutions never stand.
 
-An operator works the queue at `GET /api/admin/disputes` →
+An operator works the queue in the **Operator panel** (shown in the UI to
+any agent in `config.admins`) or directly at `GET /api/admin/disputes` →
 `POST /api/admin/adjudicate`, which has three verbs: **uphold** (the
 resolution stands), **re-resolve** (`uphold:false` with an `outcome` —
 the oracle was wrong and we know the right answer), and **void**.
 Re-resolution matters because voiding an incorrect resolution refunds the
 loser and wipes out whoever actually backed the correct outcome.
+
+**A deployment with no `admins` cannot adjudicate anything** — every
+dispute expires into the oracle's resolution — so the plugin says so
+loudly at boot rather than letting the advertised check be quietly
+inert.
 
 **A void never pays a holder more than they paid.** Redemption is
 `min(TWAP value, cost basis)` per outcome. The TWAP alone defeats a

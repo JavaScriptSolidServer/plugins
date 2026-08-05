@@ -1316,6 +1316,18 @@ export async function activate(api) {
   const snap = setInterval(() => store.snapshot(), num(cfg.snapshotIntervalMs, 30_000));
   snap.unref?.();
 
+  // A deployment with no admins can never adjudicate: every dispute
+  // rides the grace timer and the oracle's resolution stands unchallenged.
+  // That may be a deliberate choice for a demo, but it must not be a
+  // silent one — the trust model advertises operator adjudication.
+  if (!admins.size) {
+    api.log.warn(
+      'markets: no config.admins — nobody can adjudicate a dispute, so every dispute will expire '
+      + 'into the oracle\'s resolution and forfeit the disputer\'s bond. Set config.admins for a '
+      + 'deployment where disputes are meant to be a real check on the oracle.',
+    );
+  }
+
   api.log.info(
     `markets: LMSR prediction markets at ${prefix} — ${Object.keys(state.markets).length} market(s), `
     + `${Object.keys(state.ledger).length} account(s), grant ${grantMicro / MICRO}, fee ${feeBps}bps, `
