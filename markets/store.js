@@ -71,16 +71,28 @@ export function durableWriteSync(file, data) {
 // Handlers validate and emit; the reducer applies. That is what makes a
 // trade atomic: append (fsync) → apply (synchronous, no await) → reply.
 
-const MAX_HISTORY = 720;      // price samples kept per market
-const MAX_SETTLEMENTS = 200;  // settlement receipts kept per agent
+const ROTATE_BYTES = 32 * 1024 * 1024; // rotate the journal past this size
+const MAX_HISTORY = 720;              // price samples kept per market
+const MAX_SETTLEMENTS = 200;          // settlement receipts kept per agent
+const PROTECT_MS = 4 * 60 * 60 * 1000; // recent window that is never thinned
 
-/** Thin the price history in place, keeping the newest samples dense. */
-function compactHistory(h) {
+/**
+ * Thin the price history in place. Samples inside PROTECT_MS of `nowT`
+ * are NEVER merged: thinning by COUNT alone would let a high-frequency
+ * market push real samples out of the void TWAP window, making the
+ * redemption price a function of trade timing — i.e. attacker-steerable.
+ * Thinning strictly outside the window cannot move the TWAP integral
+ * over it.
+ */
+function compactHistory(h, nowT) {
   if (h.length <= MAX_HISTORY) return h;
-  const keep = h.slice(-Math.floor(MAX_HISTORY / 2));            // recent: all
-  const old = h.slice(0, h.length - keep.length).filter((_, i) => i % 2 === 0); // older: halved
+  const cutoff = nowT - PROTECT_MS;
+  const recent = h.filter((s) => s.t >= cutoff);
+  const older = h.filter((s) => s.t < cutoff).filter((_, i) => i % 2 === 0);
+  // Keep the last sample before the window so the first in-window segment
+  // still has the price that was in force when it began.
   h.length = 0;
-  h.push(...old, ...keep);
+  h.push(...older, ...recent);
   return h;
 }
 
@@ -159,7 +171,7 @@ export function applyEvent(state, ev, prices) {
       m.volumeMicro += ev.sharesMicro;
       m.trades += 1;
       m.history.push({ t: ev.t, p: prices(m.q, m.bMicro) });
-      compactHistory(m.history);
+      compactHistory(m.history, ev.t);
       break;
     }
     case 'market.close': {
@@ -181,7 +193,14 @@ export function applyEvent(state, ev, prices) {
     case 'market.dispute': {
       const m = state.markets[ev.marketId];
       m.status = 'disputed';
-      (m.disputes || (m.disputes = [])).push({ agent: ev.agent, reason: ev.reason, at: ev.t });
+      // The bond is what stops "dispute every loss": it is forfeited to
+      // the house if the resolution is upheld, refunded if the dispute
+      // was right. Held by the market until settlement, like the pool.
+      row(state, ev.agent).balanceMicro -= ev.bondMicro || 0;
+      m.disputeBondMicro = (m.disputeBondMicro || 0) + (ev.bondMicro || 0);
+      (m.disputes || (m.disputes = [])).push({
+        agent: ev.agent, reason: ev.reason, at: ev.t, bondMicro: ev.bondMicro || 0,
+      });
       break;
     }
     case 'market.settle': {
@@ -196,6 +215,9 @@ export function applyEvent(state, ev, prices) {
           payout: micro,
           at: ev.t,
         });
+      }
+      for (const [agent, micro] of Object.entries(ev.bondRefunds || {})) {
+        row(state, agent).balanceMicro += micro;
       }
       row(state, m.creator).balanceMicro += ev.creatorMicro;
       if (ev.houseMicro) row(state, ev.house).balanceMicro += ev.houseMicro;
@@ -267,33 +289,58 @@ export function createStore({ dir, log, prices }) {
   }
 
   // ---- replay the journal tail (everything after the snapshot)
+  //
+  // A torn FINAL line is the normal crash signature — an append
+  // interrupted mid-write — and is safe to drop, because that event was
+  // never acknowledged to a client. But it must also be TRUNCATED away
+  // before we append again: reopening in 'a' mode over a fragment welds
+  // the next (acknowledged, fsync'd) event onto the partial line, so the
+  // next boot drops a real event, reuses its seq, and silently loses a
+  // credit movement. `goodBytes` tracks the end of the last complete
+  // line so the file can be cut back to it.
   let replayed = 0;
+  let torn = false;
+  let goodBytes = 0;
   if (fs.existsSync(journalFile)) {
     const lines = fs.readFileSync(journalFile, 'utf8').split('\n');
-    for (const line of lines) {
-      if (!line) continue;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trailing = lines.slice(i + 1).every((l) => l === '');
+      if (!line) { if (i < lines.length - 1) goodBytes += 1; continue; }
       let ev;
       try {
         ev = JSON.parse(line);
       } catch (err) {
-        // A torn LAST line is the normal crash signature (append
-        // interrupted mid-write) and is safe to drop: that event was
-        // never acknowledged. A torn line anywhere else is corruption.
-        if (line === lines[lines.length - 2] || line === lines[lines.length - 1]) {
-          log.warn(`markets: dropping torn final journal line (${err.message})`);
+        // Only a genuinely final fragment can be a torn write; anything
+        // earlier means the audit trail itself has been damaged.
+        if (trailing) {
+          log.warn(`markets: dropping torn final journal line and truncating to ${goodBytes} bytes (${err.message})`);
+          torn = true;
           break;
         }
         throw new Error(`markets: ${journalFile} is corrupt at a non-final line: ${err.message}`);
       }
+      goodBytes += Buffer.byteLength(line, 'utf8') + (i < lines.length - 1 ? 1 : 0);
       if (ev.seq <= state.seq) continue;
+      // Contiguity check: an excised or reordered middle line means the
+      // audit trail has been tampered with or truncated. Replaying past
+      // a gap would silently produce a state nobody can account for.
+      if (ev.seq !== state.seq + 1) {
+        throw new Error(
+          `markets: journal gap at seq ${ev.seq} (expected ${state.seq + 1}) — the ledger cannot be `
+          + `reconstructed from a discontinuous journal; restore from backup`,
+        );
+      }
       applyEvent(state, ev, prices);
       replayed++;
     }
   }
   if (replayed) log.info(`markets: replayed ${replayed} journal event(s) past snapshot seq ${state.seq - replayed}`);
+  // Cut the fragment off BEFORE opening for append (see above).
+  if (torn) fs.truncateSync(journalFile, goodBytes);
 
   // ---- append path: fsync'd before the caller is allowed to reply
-  const jfd = fs.openSync(journalFile, 'a');
+  let jfd = fs.openSync(journalFile, 'a');
   let dirty = 0;
 
   /**
@@ -320,6 +367,20 @@ export function createStore({ dir, log, prices }) {
         seq: state.seq, ledger: state.ledger, markets: state.markets, settlements: state.settlements,
       }));
       dirty = 0;
+      // Rotate only AFTER a durable snapshot that covers every event in
+      // the file — then the retired segment is never needed for replay,
+      // only for audit. Without this the journal grows forever and boot
+      // is O(lifetime).
+      try {
+        if (fs.fstatSync(jfd).size >= ROTATE_BYTES) {
+          fs.closeSync(jfd);
+          fs.renameSync(journalFile, path.join(path.dirname(journalFile), `journal.${state.seq}.jsonl`));
+          jfd = fs.openSync(journalFile, 'a');
+          log.info(`markets: rotated journal at seq ${state.seq} (prior segment retained for audit)`);
+        }
+      } catch (err) {
+        log.warn(`markets: journal rotation failed (harmless, will retry): ${err.message}`);
+      }
     } catch (err) {
       // Non-fatal by design: the journal is the durable record, so a
       // failed snapshot costs replay time at boot, not data.
@@ -327,10 +388,35 @@ export function createStore({ dir, log, prices }) {
     }
   }
 
+  /**
+   * Every journal event touching one agent — the support/adjudication
+   * query. Reads the journal rather than memory, because the point is to
+   * answer "what actually happened", not "what does state say now".
+   */
+  function eventsFor(agent, limit = 500) {
+    let lines;
+    try {
+      lines = fs.readFileSync(journalFile, 'utf8').split('\n');
+    } catch { return []; }
+    const out = [];
+    for (const line of lines) {
+      if (!line || !line.includes(agent)) continue; // cheap prefilter
+      let ev;
+      try { ev = JSON.parse(line); } catch { continue; }
+      const touches = ev.agent === agent
+        || (ev.payouts && ev.payouts[agent] !== undefined)
+        || (ev.bondRefunds && ev.bondRefunds[agent] !== undefined)
+        || (ev.market && ev.market.creator === agent);
+      if (touches) out.push(ev);
+    }
+    return out.slice(-limit);
+  }
+
   return {
     state,
     commit,
     snapshot,
+    eventsFor,
     stats: () => ({ seq: state.seq, replayed, journalFile, snapFile }),
     close() {
       snapshot();

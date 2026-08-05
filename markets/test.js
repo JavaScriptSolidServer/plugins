@@ -13,6 +13,8 @@
 
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
@@ -59,11 +61,16 @@ describe('markets plugin', () => {
   const stats = () => call(null, 'GET', '/stats').then((r) => json(r, 200));
   const balance = async (who) => (await me(who)).balance;
 
+  // Operator adjustments mint or burn on purpose, so they move the
+  // baseline; everything else must leave it untouched.
+  let adminMinted = 0;
+
   /** Every credit ever granted is still somewhere: a balance or a pool. */
   async function assertConserved(where) {
     const s = await stats();
-    assert.ok(Math.abs(s.creditsInSystem - AGENTS * GRANT) < 1e-9,
-      `${where}: creditsInSystem ${s.creditsInSystem} ≠ ${AGENTS * GRANT}`);
+    const expected = AGENTS * GRANT + adminMinted;
+    assert.ok(Math.abs(s.creditsInSystem - expected) < 1e-9,
+      `${where}: creditsInSystem ${s.creditsInSystem} ≠ ${expected}`);
   }
 
   // ================================================== pure unit checks
@@ -109,14 +116,23 @@ describe('markets plugin', () => {
   });
 
   it('guard: session tokens verify, expire, and reject forgeries', () => {
-    const s = createSessions({ dir: __dirname, ttlMs: 60_000 });
+    // A throwaway dir: minting into __dirname wrote secret material into
+    // the source tree (and it got committed once — never again).
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'markets-sess-'));
+    const s = createSessions({ dir, ttlMs: 60_000 });
     const tok = s.mint('https://alice.example/#me');
     assert.strictEqual(s.verify(tok), 'https://alice.example/#me');
     assert.strictEqual(s.verify(`${tok}x`), null, 'tampered mac rejected');
     assert.strictEqual(s.verify('v1.aaa.bbb'), null);
     assert.strictEqual(s.verify(null), null);
-    const expired = createSessions({ dir: __dirname, ttlMs: -1 }).mint('https://bob.example/#me');
-    assert.strictEqual(createSessions({ dir: __dirname, ttlMs: -1 }).verify(expired), null, 'expired rejected');
+    const expired = createSessions({ dir, ttlMs: -1 }).mint('https://bob.example/#me');
+    assert.strictEqual(createSessions({ dir, ttlMs: -1 }).verify(expired), null, 'expired rejected');
+    // A different deployment's secret must not verify our tokens.
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'markets-sess2-'));
+    assert.strictEqual(createSessions({ dir: other, ttlMs: 60_000 }).verify(tok), null,
+      'a token from another deployment is rejected');
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(other, { recursive: true, force: true });
   });
 
   it('guard: rate limiter refuses over-budget callers and refills', async () => {
@@ -707,8 +723,9 @@ describe('markets plugin', () => {
         prefix: '/markets',
         config: {
           grantCredits: GRANT, feeBps: 100, baseUrl: base,
-          disputeWindowMs: 300, settlementWindowMs: 800,
+          disputeWindowMs: 300, settlementWindowMs: 800, disputeBondCredits: 25,
           rateCapacity: 1e9, rateRefillPerSec: 1e6,
+          admins: [aliceId], // the operator plane, exercised below
         },
       }],
     });
@@ -731,8 +748,129 @@ describe('markets plugin', () => {
     await assertConserved('after settling a market that spanned a restart');
   });
 
+  // ============================================================ admin
+  it('admin: hide makes a market untradable, not merely unlisted', async () => {
+    const m = await json(await call('alice', 'POST', '/markets', {
+      title: 'Something the operator must withdraw',
+      outcomes: ['Yes', 'No'],
+      closesAt: new Date(Date.now() + 3600e3).toISOString(),
+      b: 20,
+    }), 201);
+    await json(await call('alice', 'POST', '/admin/hide', { market: m.id, hidden: true }), 200);
+    const listed = await json(await call(null, 'GET', '/markets?limit=200'), 200);
+    assert.ok(!listed.markets.some((x) => x.id === m.id), 'gone from listings');
+    const t = await json(await call('bob', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 0, shares: 1 }), 403);
+    assert.match(t.error, /withdrawn/, 'takedown that leaves the URL tradable is not takedown');
+    await assertConserved('after a takedown');
+  });
+
+  it('admin: freeze blocks a trader, unfreeze restores them, both journalled', async () => {
+    const carolId = (await me('carol')).agent;
+    await json(await call('alice', 'POST', '/admin/freeze', { agent: carolId, frozen: true }), 200);
+    const blocked = await json(await call('carol', 'GET', '/me'), 403);
+    assert.match(blocked.error, /frozen/);
+    await json(await call('alice', 'POST', '/admin/freeze', { agent: carolId, frozen: false }), 200);
+    assert.strictEqual((await call('carol', 'GET', '/me')).status, 200);
+  });
+
+  it('admin: adjust requires a reason and moves the balance', async () => {
+    const bobId = (await me('bob')).agent;
+    const before = await balance('bob');
+    const noReason = await json(await call('alice', 'POST', '/admin/adjust',
+      { agent: bobId, credits: 5 }), 400);
+    assert.match(noReason.error, /reason/);
+    await json(await call('alice', 'POST', '/admin/adjust',
+      { agent: bobId, credits: 5, reason: 'goodwill after a support ticket' }), 200);
+    assert.ok(Math.abs(await balance('bob') - (before + 5)) < 1e-9);
+    // An operator credit adjustment mints money on purpose, so it must
+    // move the conservation baseline by exactly that amount and no more.
+    adminMinted += 5;
+    await assertConserved('after an operator adjustment');
+  });
+
+  it('admin: the agent history endpoint answers "what happened to this account"', async () => {
+    const bobId = (await me('bob')).agent;
+    const h = await json(await call('alice', 'GET',
+      `/admin/agent?agent=${encodeURIComponent(bobId)}`), 200);
+    assert.strictEqual(h.agent, bobId);
+    assert.ok(h.history.length > 3, 'the journal, filtered to this agent');
+    assert.ok(h.history.some((e) => e.type === 'trade'), 'his trades are there');
+    assert.ok(h.history.some((e) => e.type === 'admin.adjust'), 'and the operator adjustment');
+    assert.strictEqual((await call('bob', 'GET', `/admin/agent?agent=${encodeURIComponent(bobId)}`)).status, 403);
+  });
+
+  it('ADJUDICATION: a dispute can be UPHELD, and the bond is forfeited', async () => {
+    // Without this verb, disputing is a free refund option on any lost
+    // bet and every rational loser disputes.
+    const m = await json(await call('alice', 'POST', '/markets', {
+      title: 'A resolution worth arguing about',
+      outcomes: ['Home', 'Away'],
+      closesAt: new Date(Date.now() + 3600e3).toISOString(),
+      b: 30,
+    }), 201);
+    await json(await call('bob', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 0, shares: 10 }), 200);
+    await json(await call('alice', 'POST', `/markets/${m.id}/resolve`, { outcome: 1 }), 200);
+
+    const beforeBond = await balance('bob');
+    const d = await json(await call('bob', 'POST', `/markets/${m.id}/dispute`,
+      { reason: 'the goal was onside' }), 200);
+    assert.strictEqual(d.status, 'disputed');
+    assert.ok(Math.abs((beforeBond - await balance('bob')) - 25) < 1e-9, 'the 25-credit bond is staked');
+
+    const queue = await json(await call('alice', 'GET', '/admin/disputes'), 200);
+    assert.ok(queue.disputes.some((x) => x.id === m.id), 'it lands in the operator queue');
+
+    const before = await balance('bob');
+    const out = await json(await call('alice', 'POST', '/admin/adjudicate',
+      { market: m.id, uphold: true }), 200);
+    assert.strictEqual(out.status, 'resolved', 'the original resolution stands');
+    // bob backed the losing outcome AND lost his bond: no free refund.
+    assert.ok(await balance('bob') - before < 1e-9, 'a rejected dispute pays nothing back');
+    await assertConserved('after upholding a disputed resolution');
+  });
+
+  it('ADJUDICATION: a dispute can be UPHELD FOR THE DISPUTER, refunding the bond', async () => {
+    const m = await json(await call('alice', 'POST', '/markets', {
+      title: 'A genuinely wrong resolution',
+      outcomes: ['Home', 'Away'],
+      closesAt: new Date(Date.now() + 3600e3).toISOString(),
+      b: 30,
+    }), 201);
+    await json(await call('bob', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 0, shares: 10 }), 200);
+    await json(await call('alice', 'POST', `/markets/${m.id}/resolve`, { outcome: 1 }), 200);
+    const before = await balance('bob');
+    await json(await call('bob', 'POST', `/markets/${m.id}/dispute`, { reason: 'clearly wrong' }), 200);
+    const out = await json(await call('alice', 'POST', '/admin/adjudicate',
+      { market: m.id, uphold: false }), 200);
+    assert.strictEqual(out.status, 'void');
+    const back = await balance('bob') - before;
+    assert.ok(back > -1e-6, `a vindicated disputer gets the bond back plus redemption (got ${back})`);
+    await assertConserved('after voiding a disputed resolution');
+  });
+
+  it('a void never pays a holder more than they paid (kills the sustained pump)', async () => {
+    const m = await json(await call('alice', 'POST', '/markets', {
+      title: 'Sustained pump attempt',
+      outcomes: ['Yes', 'No'],
+      closesAt: new Date(Date.now() + 3600e3).toISOString(),
+      b: 50,
+    }), 201);
+    const before = await balance('bob');
+    // Pump and HOLD, so the TWAP itself equals the pumped price — the
+    // one case a TWAP alone does not defeat.
+    await json(await call('bob', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 0, spend: 150 }), 200);
+    await sleep(600);
+    await json(await call('alice', 'POST', `/markets/${m.id}/void`), 200);
+    const net = await balance('bob') - before;
+    assert.ok(net <= 1e-6, `pump-and-hold-then-void must not profit (net ${net})`);
+    await assertConserved('after a sustained-pump void');
+  });
+
   it('the journal is an append-only audit trail of every credit movement', async () => {
-    const fs = await import('node:fs');
     const journal = path.join(jss.root, '.plugins', 'markets', 'journal.jsonl');
     const lines = fs.readFileSync(journal, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     assert.ok(lines.length > 20, 'every event is recorded');
@@ -741,18 +879,87 @@ describe('markets plugin', () => {
       assert.ok(types.has(t), `journal records ${t}`);
     }
     // Sequence numbers are gapless and monotonic — nothing was dropped.
-    lines.forEach((l, i) => assert.strictEqual(l.seq, i + 1, 'gapless journal sequence'));
+    // (Relative to the first line, so a rotated journal still checks out.)
+    const base = lines[0].seq;
+    lines.forEach((l, i) => assert.strictEqual(l.seq, base + i, 'gapless journal sequence'));
     const aTrade = lines.find((l) => l.type === 'trade');
     for (const f of ['marketId', 'agent', 'side', 'outcome', 'sharesMicro', 'totalMicro', 't']) {
       assert.ok(aTrade[f] !== undefined, `a trade record carries ${f} for dispute adjudication`);
     }
   });
 
-  it('refuses to boot on a corrupt snapshot rather than resetting balances', async () => {
-    const fs = await import('node:fs');
+  it('CRASH RECOVERY: a torn journal tail is truncated, and later writes survive', async () => {
+    // The crash the whole design exists to survive. Dropping the torn
+    // fragment is not enough: if the file is reopened for append without
+    // truncating it, the next acknowledged event is welded onto the
+    // fragment and is silently lost at the NEXT boot — a real,
+    // reproduced ledger-loss bug.
     const { root } = jss;
+    const dir = path.join(root, '.plugins', 'markets');
+    const journal = path.join(dir, 'journal.jsonl');
+    let port = await probePort();
+    await jss.close({ keepData: true });
+
+    // Simulate a power cut mid-append.
+    fs.appendFileSync(journal, '{"type":"trade","seq":99999,"marketId":"x","agen');
+    fs.rmSync(path.join(dir, 'state.json'), { force: true }); // force full replay
+
+    const boot = async (p) => startJss({
+      root, port: p, idp: true,
+      plugins: [{
+        module: module_,
+        prefix: '/markets',
+        config: { grantCredits: GRANT, feeBps: 100, baseUrl: `http://127.0.0.1:${p}`, rateCapacity: 1e9, rateRefillPerSec: 1e6 },
+      }],
+    });
+
+    jss = await boot(port);
+    base = `http://127.0.0.1:${port}`;
+    mk = `${base}/markets/api`;
+    const afterCrash = await stats();
+
+    // Now write a real event and confirm it survives the NEXT restart.
+    await json(await call('bob', 'POST', '/markets', {
+      title: 'Written after the crash',
+      outcomes: ['Yes', 'No'],
+      closesAt: new Date(Date.now() + 3600e3).toISOString(),
+      b: 20,
+    }), 201);
+    const afterWrite = await stats();
+    assert.strictEqual(afterWrite.journalSeq, afterCrash.journalSeq + 1);
+
+    port = await probePort();
+    await jss.close({ keepData: true });
+    jss = await boot(port);
+    base = `http://127.0.0.1:${port}`;
+    mk = `${base}/markets/api`;
+    const afterReboot = await stats();
+    assert.strictEqual(afterReboot.journalSeq, afterWrite.journalSeq,
+      'the post-crash event survived — it was not welded onto the torn fragment');
+    assert.ok(Math.abs(afterReboot.creditsInSystem - afterWrite.creditsInSystem) < 1e-9,
+      'and no credits moved across the restart');
+  });
+
+  it('refuses to boot on a journal with an excised middle line', async () => {
+    const { root } = jss;
+    const journal = path.join(root, '.plugins', 'markets', 'journal.jsonl');
     await jss.close({ keepData: true });
     jss = null;
+    const lines = fs.readFileSync(journal, 'utf8').trim().split('\n');
+    const kept = lines.filter((_, i) => i !== Math.floor(lines.length / 2));
+    fs.writeFileSync(journal, `${kept.join('\n')}\n`);
+    fs.rmSync(path.join(root, '.plugins', 'markets', 'state.json'), { force: true });
+    await assert.rejects(
+      startJss({ root, plugins: [{ module: module_, prefix: '/markets' }] }),
+      /journal gap/,
+      'a discontinuous audit trail must not replay silently',
+    );
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('refuses to boot on a corrupt snapshot rather than resetting balances', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'markets-corrupt-'));
+    fs.mkdirSync(path.join(root, '.plugins', 'markets'), { recursive: true });
     const snap = path.join(root, '.plugins', 'markets', 'state.json');
     fs.writeFileSync(snap, '{"ledger": {"a": ');  // truncated, as a crash would leave it
     await assert.rejects(

@@ -52,6 +52,18 @@ payout is **capped at their escrow**; and a resolution sits in a
 A market whose oracle never acts is **auto-voided at TWAP** after the
 settlement window — anyone can trigger it, so funds are never stuck.
 
+Disputes cost a **bond** (`disputeBondCredits`, default 25), forfeited to
+the house if the resolution is upheld and returned if it isn't. Without a
+bond and an *uphold* verb, disputing is a free refund option on any lost
+bet and every rational loser disputes; an operator resolves the queue at
+`GET /api/admin/disputes` → `POST /api/admin/adjudicate`.
+
+**A void never pays a holder more than they paid.** Redemption is
+`min(TWAP value, cost basis)` per outcome. The TWAP alone defeats a
+last-second pump but not one *held across the whole window*; the cap
+makes pumping-to-be-voided unprofitable at any hold duration, and since
+it only ever pays less than the TWAP, conservation is untouched.
+
 ## What this is not (deliberately)
 
 **Not real money.** A real-money book is a gambling licence, KYC/AML,
@@ -127,6 +139,14 @@ the walls point at.
   regression test for exactly this attack, and it caught a real bug: the
   price path was seeded with `m.history || [seed]`, and an empty array is
   truthy, so the TWAP degenerated to the post-pump spot price.
+- **Dropping a torn journal tail is only half of crash recovery.** The
+  fragment must also be TRUNCATED before reopening for append —
+  otherwise the next acknowledged, fsync'd event is welded onto the
+  partial line, and the boot after that silently drops a real credit
+  movement and reuses its sequence number. A durability design can pass
+  every "does it survive a restart" test and still fail the one crash it
+  exists to survive; the regression test now crashes, writes, and
+  restarts again.
 - **Atomicity by construction is fragile and undocumented.** Every
   mutating handler awaits auth first, then validates and commits with no
   `await` in between, so the event loop makes each trade a transaction.
@@ -140,7 +160,7 @@ the walls point at.
 
 ## Tests
 
-`node --test --test-concurrency=1 markets/test.js` — 51 tests: LMSR and
+`node --test --test-concurrency=1 markets/test.js` — 60 tests: LMSR and
 TWAP math, session/CSRF/rate-limit units, hardened headers, cookie
 scoping, prototype-key ids, grants, escrow, stake-first quotes,
 quote↔trade parity, slippage guards (including the NaN-fails-closed case),
@@ -148,6 +168,8 @@ no-shorting, idempotent retries, 12 concurrent trades, ws privacy,
 pagination and search, the full settlement state machine (resolve →
 dispute → settle, void, early close, dead-oracle rescue), the
 self-dealing and pump-and-void attacks, 12-outcome and no-trade markets,
-admin gating, reboot with an open market mid-flight, journal integrity,
-corrupt-snapshot boot refusal — and micro-credit-exact conservation
-after every single one.
+the admin plane (hide-makes-untradable, freeze, journalled adjust, agent
+history), both adjudication paths, the sustained-pump void, reboot with
+an open market mid-flight, journal integrity, journal-gap and
+corrupt-snapshot boot refusal, and torn-tail crash recovery — with
+micro-credit-exact conservation asserted after every single one.

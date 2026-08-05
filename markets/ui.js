@@ -324,9 +324,12 @@ export function renderUi(prefix) {
             + '<td class="num">' + cr(p.totalValue) + '</td>'
             + '<td class="num"><span class="pnl ' + cls + '">' + sign + cr(p.unrealizedPnl) + '</span></td>'
             + '<td class="num">' + (p.tradable
-                ? '<button class="small cashout" data-m="' + esc(p.market) + '">Cash out</button>' : '') + '</td></tr>';
+                ? p.shares.map((s, i) => (s > 0
+                    ? '<button class="small cashout" data-m="' + esc(p.market) + '" data-i="' + i + '">Cash out '
+                      + esc(p.outcomes[i]) + '</button>' : '')).join(' ')
+                : '') + '</td></tr>';
         }).join('') + '</tbody></table>';
-      el.querySelectorAll('.cashout').forEach((b) => { b.onclick = () => cashOut(b.dataset.m); });
+      el.querySelectorAll('.cashout').forEach((b) => { b.onclick = () => cashOut(b.dataset.m, Number(b.dataset.i)); });
     }
     const s = $('settled');
     s.innerHTML = me.settlements.length
@@ -338,21 +341,29 @@ export function renderUi(prefix) {
       : '<span class="hint">nothing settled yet</span>';
   }
 
-  async function cashOut(marketId) {
+  // Cash out a SPECIFIC outcome. Taking "the first outcome with shares"
+  // silently sold the wrong leg for anyone holding two sides of a market,
+  // so the outcome index is always passed explicitly.
+  async function cashOut(marketId, outcome) {
     const m = await api('/markets/' + encodeURIComponent(marketId));
     if (!m.position) return;
-    const i = m.position.shares.findIndex((s) => s > 0);
-    if (i < 0) return;
+    const i = Number.isInteger(outcome) ? outcome : m.position.shares.findIndex((s) => s > 0);
+    if (i < 0 || !(m.position.shares[i] > 0)) return;
     const shares = m.position.shares[i];
     const q = await api('/markets/' + m.id + '/quote?side=sell&outcome=' + i + '&shares=' + shares);
-    if (!confirm('Cash out ' + cr(shares) + ' × ' + m.outcomes[i] + ' for about ' + cr(q.total) + ' credits?')) return;
+    const floor = q.total * 0.98;
+    if (!confirm('Cash out ' + cr(shares) + ' × ' + m.outcomes[i] + ' for about ' + cr(q.total)
+      + ' credits?\\n\\nYou will receive at least ' + cr(floor) + ' if the price moves.')) return;
+    // One key per cash-out intent, so a retry after a timeout replays the
+    // original trade instead of selling twice.
+    const key = uid();
     try {
       await api('/markets/' + m.id + '/trade', {
         method: 'POST',
-        headers: { 'idempotency-key': uid() },
-        body: JSON.stringify({ side: 'sell', outcome: i, shares, minProceeds: q.total * 0.98 }),
+        headers: { 'idempotency-key': key },
+        body: JSON.stringify({ side: 'sell', outcome: i, shares, minProceeds: floor }),
       });
-      toast('Cashed out for ' + cr(q.total) + ' credits');
+      toast('Cashed out for about ' + cr(q.total) + ' credits');
       await refreshMe(); await route();
     } catch (e) { toast(e.message); }
   }
@@ -434,7 +445,8 @@ export function renderUi(prefix) {
 
     const canTrade = m.tradable && me && me.agent !== m.oracle && me.agent !== m.creator;
     $('ticket').classList.toggle('hidden', !m.tradable);
-    $('t-buy').disabled = !canTrade;
+    // Never leave the primary CTA inert: signed out, it opens sign-in.
+    $('t-buy').disabled = m.tradable && me && !canTrade;
     $('t-buy').textContent = !me ? 'Sign in to bet'
       : (me.agent === m.oracle || me.agent === m.creator) ? 'You run this market' : 'Place bet';
 
@@ -456,8 +468,14 @@ export function renderUi(prefix) {
       pd.querySelectorAll('.sell-one').forEach((b) => { b.onclick = () => cashOut(m.id); });
     } else pd.classList.add('hidden');
 
+    // Use canResolve (the RAW lifecycle state), not the display status:
+    // a market past its close time displays as 'closed' while still
+    // awaiting resolution, and that is precisely when the oracle needs
+    // these controls. Gating on status === 'open' hid them at the only
+    // moment they mattered, so markets drifted to the auto-void backstop
+    // and winners were never paid.
     const isOracle = me && (me.agent === m.oracle);
-    $('oracle-row').classList.toggle('hidden', !(isOracle && (m.status === 'open')));
+    $('oracle-row').classList.toggle('hidden', !(isOracle && m.canResolve));
     $('o-outcome').innerHTML = m.outcomes.map((o, i) => '<option value="' + i + '">' + esc(o) + '</option>').join('');
     $('dispute-row').classList.toggle('hidden', !(m.status === 'resolving' && pos));
     quote();
@@ -540,7 +558,7 @@ export function renderUi(prefix) {
     } catch (e) { $('auth-msg').textContent = e.message; $('auth-msg').className = 'msg err'; }
   };
   $('back').onclick = (e) => { e.preventDefault(); location.hash = ''; };
-  $('t-buy').onclick = placeBet;
+  $('t-buy').onclick = () => { if (!me) { $('auth-card').classList.remove('hidden'); $('token').focus(); return; } placeBet(); };
   $('more').onclick = () => renderList(true);
   let searchTimer;
   $('search').oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { cursor = null; renderList(); }, 250); };
@@ -610,7 +628,7 @@ export function renderUi(prefix) {
     ws.onmessage = (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch { return; }
       if (current) { if (msg.market && msg.market.id === current.id) renderDetail(current.id, true); }
-      else renderList();
+      else if (!cursor) renderList(); // don't yank a user who has paged down
       if (msg.type === 'settle' && me) refreshMe();
     };
   }

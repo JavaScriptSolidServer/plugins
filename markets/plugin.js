@@ -57,6 +57,8 @@
 // in-memory ledger ahead of the durable one.
 
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { lmsrPrices, tradeCostRaw, sharesForBudget, twapPrices, uniformPrices } from './lmsr.js';
 import { createStore, dict } from './store.js';
 import {
@@ -104,6 +106,17 @@ export function randomId(len = 8) {
 /** An agent id is a WebID (http/https URL) or a DID — the two shapes
  *  getAgent can ever return. Rejecting anything else at creation stops a
  *  typo'd oracle from being an unsatisfiable settlement condition. */
+/** A persistent per-deployment secret, created 0600 on first boot. */
+function readOrCreateSecret(file) {
+  try {
+    return fs.readFileSync(file);
+  } catch {
+    const s = crypto.randomBytes(32);
+    fs.writeFileSync(file, s, { mode: 0o600 });
+    return s;
+  }
+}
+
 export function isAgentId(s) {
   if (typeof s !== 'string' || !s || s.length > 512) return false;
   if (s.startsWith('did:')) return /^did:[a-z0-9]+:[\w.:%-]+$/i.test(s);
@@ -122,7 +135,8 @@ export async function activate(api) {
   const grantMicro = Math.round(num(cfg.grantCredits, 1000) * MICRO);
   const feeBps = num(cfg.feeBps, 100);
   const houseFeeShareBps = num(cfg.houseFeeShareBps, 5000);
-  const disputeWindowMs = num(cfg.disputeWindowMs, 10 * 60 * 1000);
+  const disputeWindowMs = num(cfg.disputeWindowMs, 60 * 60 * 1000);
+  const disputeBondMicro = Math.round(num(cfg.disputeBondCredits, 25) * MICRO);
   const disputeGraceMs = num(cfg.disputeGraceMs, 7 * 24 * 3600 * 1000);
   const settlementWindowMs = num(cfg.settlementWindowMs, 7 * 24 * 3600 * 1000);
   const twapWindowMs = num(cfg.twapWindowMs, 30 * 60 * 1000);
@@ -142,6 +156,20 @@ export async function activate(api) {
   for (const a of admins) {
     if (!isAgentId(a)) throw new Error(`markets: config.admins contains a non-agent id: ${a}`);
   }
+  // These windows are load-bearing, not cosmetic: twapWindowMs = 0 makes
+  // voidPrices() degenerate to the SPOT price, which resurrects the
+  // buy-then-void arbitrage the TWAP exists to prevent. Refuse to boot on
+  // a value that would silently disable a defence.
+  for (const [name, v] of Object.entries({
+    disputeWindowMs, disputeGraceMs, settlementWindowMs, twapWindowMs, sessionTtlMs,
+  })) {
+    if (!Number.isFinite(v) || v <= 0) {
+      throw new Error(`markets: config.${name} must be a positive number of milliseconds (got ${v})`);
+    }
+  }
+  if (!Number.isFinite(disputeBondMicro) || disputeBondMicro < 0) {
+    throw new Error('markets: config.disputeBondCredits must be a non-negative number');
+  }
   if (/["'<>]/.test(prefix)) throw new Error(`markets: refusing an unsafe prefix: ${prefix}`);
 
   // -------------------------------------------------- store & security
@@ -149,6 +177,7 @@ export async function activate(api) {
   const store = createStore({ dir, log: api.log, prices: lmsrPrices });
   const { state } = store;
   const sessions = createSessions({ dir, ttlMs: sessionTtlMs });
+  const pseudonymSalt = readOrCreateSecret(path.join(dir, 'pseudonym.salt'));
   const limiter = createRateLimiter({ capacity: num(cfg.rateCapacity, 120), refillPerSec: num(cfg.rateRefillPerSec, 2) });
 
   /** agent → Set(marketId) — so /api/me is O(your markets), not O(all). */
@@ -211,7 +240,12 @@ export async function activate(api) {
    *  credential is ambient (cookie/TLS cert), because those are exactly
    *  the credentials a cross-origin page can borrow. */
   function csrfOk(request) {
-    if (!isAmbientCredential(request)) return true;
+    // A session cookie makes the request ambient REGARDLESS of any
+    // Authorization header: resolveAgent checks the cookie first, so an
+    // attacker could otherwise bolt on a junk bearer to look
+    // "explicitly credentialed", skip this check, and still be
+    // authenticated by the victim's cookie.
+    if (!cookieToken(request) && !isAmbientCredential(request)) return true;
     return isSameOrigin(request, ownOrigin());
   }
 
@@ -316,7 +350,16 @@ export async function activate(api) {
       outcomes: m.outcomes,
       prices: prices.map((p) => Number(p.toFixed(6))),
       status: displayStatus(m),
+      // The RAW lifecycle state, distinct from the display status: a
+      // market past closesAt displays as 'closed' while its raw status is
+      // still 'open', and that is exactly when the oracle must resolve.
+      // Without this a client can't tell "closed, awaiting resolution"
+      // from "settled", and hides the resolve controls at the only moment
+      // they matter.
+      rawStatus: m.status,
       tradable: tradable(m),
+      canResolve: m.status === 'open',
+      canVoid: m.status !== 'resolved' && m.status !== 'void',
       closesAt: new Date(m.closesAt).toISOString(),
       createdAt: m.createdAt,
       creator: m.creator,
@@ -421,7 +464,7 @@ export async function activate(api) {
    * in the event, and applied by the reducer — so replay never recomputes
    * float arithmetic.
    */
-  function settle(m, status, payoutMicroOf, prices) {
+  function settle(m, status, payoutMicroOf, prices, { adjudicatedBy = null } = {}) {
     const pool = m.subsidyMicro + m.collectedMicro;
     const raw = [];
     let sum = 0;
@@ -453,23 +496,46 @@ export async function activate(api) {
     const houseFee = Math.floor((m.feesMicro * houseFeeShareBps) / 10_000);
     const creatorFee = m.feesMicro - houseFee;
 
+    // Dispute bonds: refunded if the market ends up VOID (the disputer
+    // was vindicated), forfeited to the house if the resolution stands.
+    const bondRefunds = {};
+    let bondToHouse = 0;
+    for (const d of m.disputes || []) {
+      if (!d.bondMicro) continue;
+      if (status === 'void') bondRefunds[d.agent] = (bondRefunds[d.agent] || 0) + d.bondMicro;
+      else bondToHouse += d.bondMicro;
+    }
+
     store.commit({
       type: 'market.settle',
       marketId: m.id,
       status,
       payouts,
+      bondRefunds,
       creatorMicro: creatorFromPool + creatorFee,
-      houseMicro: houseFromPool + houseFee,
+      houseMicro: houseFromPool + houseFee + bondToHouse,
       house: HOUSE,
+      adjudicatedBy,
       prices: prices ? prices.map((p) => Number(p.toFixed(6))) : null,
     });
     broadcast('settle', m);
   }
 
-  const settleResolved = (m) => settle(m, 'resolved', (pos) => pos.shares[m.resolvedOutcome], null);
-  const settleVoid = (m) => {
+  const settleResolved = (m, opts) => settle(m, 'resolved', (pos) => pos.shares[m.resolvedOutcome], null, opts);
+  // On a void you receive the LESSER of market value (at the TWAP) and
+  // what you actually paid. The cap is what finally kills the void
+  // arbitrage: the TWAP already defeats a last-second pump, but a
+  // *sustained* pump held across the whole window makes the TWAP equal
+  // the pumped price, and against a dead oracle that is a profitable
+  // grief funded by the creator's escrow. Capping at cost basis means no
+  // holder can ever exit a void for more than they put in, so pumping to
+  // be voided is never profitable at any hold duration. It only ever
+  // pays LESS than the TWAP, so conservation is strictly preserved.
+  const settleVoid = (m, opts) => {
     const p = voidPrices(m);
-    settle(m, 'void', (pos) => pos.shares.reduce((a, s, i) => a + s * p[i], 0), p);
+    settle(m, 'void',
+      (pos) => pos.shares.reduce((a, s, i) => a + Math.min(s * p[i], pos.costMicro[i]), 0),
+      p, opts);
   };
 
   /**
@@ -787,6 +853,9 @@ export async function activate(api) {
     // contract (see header). Do not introduce one.
     const m = state.markets[request.params.id];
     if (!m) return err(reply, 404, 'no such market');
+    // A hidden market must be UNTRADABLE, not merely unlisted: takedown
+    // that leaves the URL working is not takedown.
+    if (m.hidden) return err(reply, 403, 'this market has been withdrawn by the operator');
     if (!tradable(m)) return err(reply, 409, `market is ${displayStatus(m)} — trading has stopped`);
     if (!allowInsiderTrading && (agent === m.oracle || agent === m.creator)) {
       return err(reply, 403, 'the creator and oracle of a market may not trade in it');
@@ -925,7 +994,14 @@ export async function activate(api) {
     if (!pos || pos.shares.every((s) => s === 0)) return err(reply, 403, 'only a holder may dispute');
     const reason = typeof (request.body || {}).reason === 'string'
       ? request.body.reason.slice(0, 500) : '';
-    store.commit({ type: 'market.dispute', marketId: m.id, agent, reason });
+    if (!reason.trim()) return err(reply, 400, 'a reason is required to dispute');
+    ensureAccount(agent);
+    if (balanceOf(agent) < disputeBondMicro) {
+      return err(reply, 402, `disputing stakes a bond of ${(disputeBondMicro / MICRO).toFixed(2)} credits, forfeited if the resolution is upheld`);
+    }
+    store.commit({
+      type: 'market.dispute', marketId: m.id, agent, reason, bondMicro: disputeBondMicro,
+    });
     api.log.warn(`markets: ${m.id} disputed by ${agent}: ${reason}`);
     broadcast('market', m);
     return reply.send(marketOut(m));
@@ -962,7 +1038,7 @@ export async function activate(api) {
       // market escrows subsidy + collected + fees, and all three are paid
       // out at settlement. Omitting fees here would make the conservation
       // figure drift by exactly the fee take.
-      openPoolMicro += m.subsidyMicro + m.collectedMicro + m.feesMicro;
+      openPoolMicro += m.subsidyMicro + m.collectedMicro + m.feesMicro + (m.disputeBondMicro || 0);
       open++;
     }
     return reply.send({
@@ -992,9 +1068,12 @@ export async function activate(api) {
     return reply.send({ leaderboard: top });
   });
 
-  /** Stable pseudonym: a leaderboard should show a rival, not a dossier. */
+  /** Stable pseudonym: a leaderboard should show a rival, not a dossier.
+   *  SALTED with a per-deployment secret — an unsalted hash of a WebID is
+   *  not a pseudonym at all, since anyone can hash a known WebID and
+   *  unmask the row. */
   function anonymize(agentId) {
-    return `anon-${crypto.createHash('sha256').update(agentId).digest('hex').slice(0, 8)}`;
+    return `anon-${crypto.createHmac('sha256', pseudonymSalt).update(agentId).digest('hex').slice(0, 8)}`;
   }
 
   // ---- admin ----------------------------------------------------------
@@ -1027,6 +1106,56 @@ export async function activate(api) {
     });
     api.log.warn(`markets: admin ${by} adjusted ${agent} by ${credits}: ${reason}`);
     return reply.send({ ok: true, agent, balance: balanceOf(agent) / MICRO });
+  });
+
+  // The adjudication verb. Without it a dispute could only ever end in a
+  // void, which makes disputing a free refund option on any lost bet:
+  // every rational loser disputes, and correct resolutions never stand.
+  api.fastify.post(`${prefix}/api/admin/adjudicate`, jsonOpts(1024), async (request, reply) => {
+    const by = await adminOnly(request, reply);
+    if (!by) return reply;
+    const { market, uphold } = request.body || {};
+    const m = state.markets[market];
+    if (!m) return err(reply, 404, 'no such market');
+    if (m.status !== 'disputed') return err(reply, 409, `market is ${displayStatus(m)}, not disputed`);
+    if (uphold === true) settleResolved(m, { adjudicatedBy: by });
+    else if (uphold === false) settleVoid(m, { adjudicatedBy: by });
+    else return err(reply, 400, 'uphold must be true (the resolution stands) or false (void it)');
+    api.log.warn(`markets: admin ${by} ${uphold ? 'upheld' : 'voided'} disputed market ${m.id}`);
+    return reply.send(marketOut(m));
+  });
+
+  // Disputes awaiting adjudication — the operator's work queue.
+  api.fastify.get(`${prefix}/api/admin/disputes`, async (request, reply) => {
+    const by = await adminOnly(request, reply);
+    if (!by) return reply;
+    const queue = Object.values(state.markets)
+      .filter((m) => m.status === 'disputed')
+      .map((m) => ({
+        ...marketOut(m),
+        disputeDetail: (m.disputes || []).map((d) => ({
+          agent: d.agent, reason: d.reason, at: new Date(d.at).toISOString(), bond: (d.bondMicro || 0) / MICRO,
+        })),
+        autoVoidsAt: new Date((m.disputes[0]?.at || Date.now()) + disputeGraceMs).toISOString(),
+      }));
+    return reply.send({ disputes: queue });
+  });
+
+  // Everything an operator needs to answer "what happened to this
+  // account?" — the journal, filtered, instead of grep on a server.
+  api.fastify.get(`${prefix}/api/admin/agent`, async (request, reply) => {
+    const by = await adminOnly(request, reply);
+    if (!by) return reply;
+    const who = (request.query || {}).agent;
+    if (!isAgentId(who)) return err(reply, 400, 'agent must be an agent id');
+    const row = state.ledger[who];
+    return reply.send({
+      agent: who,
+      balance: row ? row.balanceMicro / MICRO : 0,
+      frozen: !!(row && row.frozen),
+      created: row ? row.created : null,
+      history: store.eventsFor(who).map((e) => ({ ...e, t: new Date(e.t).toISOString() })),
+    });
   });
 
   api.fastify.post(`${prefix}/api/admin/hide`, jsonOpts(1024), async (request, reply) => {
