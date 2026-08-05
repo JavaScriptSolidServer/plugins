@@ -100,6 +100,7 @@ const fastify = createServer({
     { module: at('micropub/plugin.js'), prefix: '/micropub', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://localhost:${PORT}` } },
     { module: at('backup/plugin.js'), prefix: '/backup', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://localhost:${PORT}` } },
     { module: at('shortlink/plugin.js'), prefix: '/short', config: { baseUrl: PUBLIC_URL } },
+    { module: at('markets/plugin.js'), prefix: '/predict', config: { baseUrl: PUBLIC_URL, ...(process.env.MARKETS_ADMIN ? { admins: [process.env.MARKETS_ADMIN] } : {}) } },
     { module: at('oembed/plugin.js'), prefix: '/oembed', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://localhost:${PORT}` } },
     { module: at('jmap/plugin.js'), prefix: '/jmap', config: { baseUrl: PUBLIC_URL, loopbackUrl: `http://localhost:${PORT}` } },
     // Zero config on purpose — gallery/ needs none (api.serverInfo origin,
@@ -191,6 +192,7 @@ console.log(`  s3:             ${PUBLIC_URL}/s3/<bucket>/<key>  (aws-cli/rclone,
 console.log(`  micropub:       POST ${PUBLIC_URL}/micropub  (IndieWeb clients; pod bearer as token)`);
 console.log(`  backup:         GET ${PUBLIC_URL}/backup/<pod>/  → .tar.gz of what you can read`);
 console.log(`  shortlink:      POST ${PUBLIC_URL}/short  (auth; local targets only)`);
+console.log(`  markets:        ${PUBLIC_URL}/predict  (LMSR prediction markets, paper credits)`);
 console.log(`  oembed:         GET ${PUBLIC_URL}/oembed?url=<pod-resource-url>  (link unfurling)`);
 console.log(`  gallery:        ${PUBLIC_URL}/gallery  (photo/media gallery; streaming upload)`);
 console.log(`  forge:          ${PUBLIC_URL}/forge/  (git hosting; push http://.../forge/<you>/<repo>.git)`);

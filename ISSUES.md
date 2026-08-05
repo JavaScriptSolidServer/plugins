@@ -23,6 +23,7 @@ evidence. Legend:
 | #507 | `webdav/` | mount a pod in Finder/Nautilus/Windows |
 | #509 | `sparql/` | SPARQL SELECT + UPDATE over pod JSON-LD (write-index → 🔩 `api.events`) |
 | #322 | `gitscratch/` | ephemeral Solid-authed git remotes (git-http-backend CGI) |
+| — | `markets/` | prediction markets/AMM (no issue; built to probe money-shaped state: journal, CSRF, scoped creds) |
 | #515 / #516 | `mastodon/` | Mastodon-API shim — a client can log into its own pod (self-reserves `/api`+`/oauth` — #602 consumed) |
 | #505 | `otp/` | one-time-password session flow (account *recovery* → 🔩 core auth) |
 | #157 | `carddav/` | CardDAV contact sync (iOS/macOS/Thunderbird/DAVx5) |

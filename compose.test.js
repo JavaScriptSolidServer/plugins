@@ -92,6 +92,7 @@ describe('composition: every plugin on one server', () => {
         { module: at('micropub/plugin.js'), prefix: '/micropub', config: { baseUrl: base, loopbackUrl: base } },
         { module: at('backup/plugin.js'), prefix: '/backup', config: { baseUrl: base, loopbackUrl: base } },
         { module: at('shortlink/plugin.js'), prefix: '/short', config: { baseUrl: base } },
+        { module: at('markets/plugin.js'), prefix: '/predict', config: { baseUrl: base } },
         { module: at('oembed/plugin.js'), prefix: '/oembed', config: { baseUrl: base, loopbackUrl: base } },
         { module: at('jmap/plugin.js'), prefix: '/jmap', config: { baseUrl: base, loopbackUrl: base } },
         // Zero config on purpose — gallery/ is the first plugin needing none
@@ -347,6 +348,17 @@ describe('composition: every plugin on one server', () => {
     assert.strictEqual(res.status, 401);
     res = await fetch(`${base}/short/nosuchslug`, { redirect: 'manual' });
     assert.strictEqual(res.status, 404);
+  });
+
+  it('markets: public list is 200, anonymous trade is 401, UI serves', async () => {
+    let res = await fetch(`${base}/predict/api/markets`);
+    assert.strictEqual(res.status, 200);
+    assert.deepStrictEqual(await res.json(), { markets: [], total: 0, nextCursor: null });
+    res = await fetch(`${base}/predict/api/me`);
+    assert.strictEqual(res.status, 401);
+    res = await fetch(`${base}/predict`);
+    assert.strictEqual(res.status, 200);
+    assert.match(res.headers.get('content-type'), /text\/html/);
   });
 
   it('oembed: missing url is 400 (endpoint alive, never fetches external)', async () => {

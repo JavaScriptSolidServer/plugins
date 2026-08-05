@@ -384,3 +384,38 @@ this repo is its proof.
   synthetic headers-only request — valid for bearers per the auth.js
   contract, not for DPoP-bound tokens. Third WS plugin to want this;
   a documented `api.auth.getAgentFromToken(token)` would make it official.
+
+- **`api.ws.route` must be awaited** (markets/): calling it
+  fire-and-forget inside `activate` deadlocks the whole server boot —
+  `listen()` never resolves, no error, no log line. relay/ and webrtc/
+  both await it by habit, so nothing had exposed that it is load-bearing.
+  Document the requirement, or make a non-awaited call safe.
+- **Hooks via `api.fastify` are server-wide, not plugin-scoped**
+  (markets/, seen from the other side by metrics/): an `onRequest`
+  rate-limit hook 429'd the metrics and dashboard plugins in the compose
+  suite, and an `onSend` hook rewrote CORS headers for core's routes too.
+  Every hook has to gate on `api.prefix` by hand. The loader knows the
+  prefix; scoping this (or documenting it loudly) would stop a whole class
+  of cross-plugin interference.
+- **Host CORS defaults are unsafe for stateful plugins** (markets/): the
+  server reflects the request Origin with `Allow-Credentials: true`, and
+  `getAgent` honours ambient WebID-TLS certs — fine for LDP, a CSRF
+  primitive for a plugin holding balances. A plugin cannot set
+  server-level CORS, so it must override per-response *and* enforce
+  same-origin itself. Candidate seam: `api.cors` / per-prefix override.
+- **No scoped-credential mint** (markets/): a browser app's only offered
+  credential is a pod-wide bearer, which cannot safely live in web
+  storage on an origin that also serves user-uploaded HTML. markets/
+  mints its own HMAC session (capability/'s shape) behind an HttpOnly
+  cookie; every browser-facing plugin will reinvent it.
+  `api.auth.mintScoped({ agent, scope, ttl })` is the shared primitive.
+- **No `api.rateLimit`** (markets/): the host limiter is `global: false`,
+  so plugin routes get none and anonymous bodies are parsed before the
+  401. Route-level `bodyLimit` is reachable; throttling is not.
+- **The one-JSON-blob persistence pattern doesn't scale to money**
+  (markets/, fourth stateful plugin to outgrow it): a full rewrite per
+  mutation is O(entire state) per trade, keeps no audit trail, and turns a
+  torn write into a silent total reset. markets/ hand-rolls a journal
+  (append + fsync) plus a periodic snapshot, with corruption a boot
+  failure. A documented `api.storage.journal()` would stop everyone
+  rediscovering fsync-and-rename semantics.

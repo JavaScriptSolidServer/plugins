@@ -78,6 +78,7 @@ README and NOTES.md, ship the closest honest approximation.
 | `caldav/` | #157-sib | calendar sync + free-busy — completes the DAV family (webdav+carddav+caldav) |
 | `webfinger/` | #164 | `/.well-known/webfinger` — fediverse `acct:` resolution for the shims |
 | `activitypub/` | #51/#164 | federate a pod as an AS2 actor; outbound HTTP Signatures |
+| `markets/` | new | LMSR prediction markets + AMM; journal-backed ledger, TWAP voids, dispute window |
 | `rss/` | — | any pod container as an Atom/RSS feed |
 | `matrix/` | — | Matrix Client-Server API shim (chat protocol) |
 | `search/` | — | full-text search over pod resources (TF-IDF) |
