@@ -349,6 +349,58 @@ describe('markets plugin', () => {
     await assertConserved('after create');
   });
 
+  it('a cookie session resolves to the RIGHT agent, and sessions are isolated', async () => {
+    // The regression that 62 status-code-only tests missed: verify()
+    // returns a claims OBJECT, and returning it as the agent id made
+    // every cookie user share one ledger row keyed "[object Object]".
+    for (const user of ['alice', 'bob', 'carol']) {
+      const res = await fetch(`${mk}/me`, {
+        headers: { cookie: cookie[user], 'sec-fetch-site': 'same-origin' },
+      });
+      const body = await json(res, 200);
+      assert.strictEqual(typeof body.agent, 'string', 'the agent is an id, not a claims object');
+      assert.ok(isAgentId(body.agent), `${user}'s cookie resolves to a WebID (got ${body.agent})`);
+      const viaBearer = await me(user);
+      assert.strictEqual(body.agent, viaBearer.agent,
+        `${user}'s cookie and pod bearer must be the same identity`);
+    }
+    // …and two users must not be the same account.
+    const a = await (await fetch(`${mk}/me`, { headers: { cookie: cookie.alice, 'sec-fetch-site': 'same-origin' } })).json();
+    const b = await (await fetch(`${mk}/me`, { headers: { cookie: cookie.bob, 'sec-fetch-site': 'same-origin' } })).json();
+    assert.notStrictEqual(a.agent, b.agent, 'cookie sessions are not a shared ledger row');
+    // A cookie session can also create a market (isAgentId(obj) failed,
+    // so the shipped UI could not create one at all).
+    const created = await fetch(`${mk}/markets`, {
+      method: 'POST',
+      headers: { cookie: cookie.alice, 'content-type': 'application/json', 'sec-fetch-site': 'same-origin' },
+      body: JSON.stringify({
+        title: 'Created from a browser session',
+        outcomes: ['Yes', 'No'],
+        closesAt: new Date(Date.now() + 3600e3).toISOString(),
+        b: 15,
+      }),
+    });
+    assert.strictEqual(created.status, 201, await created.text());
+    await assertConserved('after a cookie-session market');
+  });
+
+  it('signing out actually revokes the session token', async () => {
+    // Clearing the cookie is cosmetic: the token is self-verifying, so a
+    // captured copy worked for the full TTL until epochs were added.
+    const res = await call('carol', 'POST', '/session');
+    const tok = res.headers.get('set-cookie').split(';')[0];
+    assert.strictEqual((await fetch(`${mk}/me`, { headers: { cookie: tok, 'sec-fetch-site': 'same-origin' } })).status, 200);
+    await fetch(`${mk}/session`, {
+      method: 'DELETE',
+      headers: { cookie: tok, 'sec-fetch-site': 'same-origin' },
+    });
+    const replayed = await fetch(`${mk}/me`, { headers: { cookie: tok, 'sec-fetch-site': 'same-origin' } });
+    assert.strictEqual(replayed.status, 401, 'a replayed token after sign-out must be dead');
+    // carol needs a working session again for later tests.
+    const fresh = await call('carol', 'POST', '/session');
+    cookie.carol = fresh.headers.get('set-cookie').split(';')[0];
+  });
+
   it('the creator and oracle may not trade in their own market', async () => {
     const out = await json(await call('alice', 'POST', `/markets/${market.id}/trade`,
       { side: 'buy', outcome: 0, shares: 10 }), 403);

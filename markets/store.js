@@ -397,7 +397,9 @@ export function createStore({ dir, log, prices }) {
   function commit(ev) {
     ev.seq = state.seq + 1;
     ev.t = ev.t || Date.now();
-    fs.writeSync(jfd, `${JSON.stringify(ev)}\n`);
+    const line = Buffer.from(`${JSON.stringify(ev)}\n`, 'utf8');
+    let off = 0;
+    while (off < line.length) off += fs.writeSync(jfd, line, off, line.length - off);
     fs.fsyncSync(jfd);
     applyEvent(state, ev, prices);
     dirty++;
@@ -416,15 +418,21 @@ export function createStore({ dir, log, prices }) {
       // the file — then the retired segment is never needed for replay,
       // only for audit. Without this the journal grows forever and boot
       // is O(lifetime).
-      try {
-        if (fs.fstatSync(jfd).size >= ROTATE_BYTES) {
+      if (fs.fstatSync(jfd).size >= ROTATE_BYTES) {
+        const retired = path.join(path.dirname(journalFile), `journal.${state.seq}.jsonl`);
+        try {
           fs.closeSync(jfd);
-          fs.renameSync(journalFile, path.join(path.dirname(journalFile), `journal.${state.seq}.jsonl`));
+          fs.renameSync(journalFile, retired);
+          files.push(retired); // keep the audit query able to see it
+        } catch (err) {
+          // NOT harmless: leaving jfd closed makes every later commit
+          // fail with EBADF, i.e. every trade and settlement 500s
+          // forever. Always get a working descriptor back.
+          log.error(`markets: journal rotation failed: ${err.message}`);
+        } finally {
           jfd = fs.openSync(journalFile, 'a');
-          log.info(`markets: rotated journal at seq ${state.seq} (prior segment retained for audit)`);
         }
-      } catch (err) {
-        log.warn(`markets: journal rotation failed (harmless, will retry): ${err.message}`);
+        log.info(`markets: rotated journal at seq ${state.seq} (prior segment retained for audit)`);
       }
     } catch (err) {
       // Non-fatal by design: the journal is the durable record, so a
@@ -444,7 +452,15 @@ export function createStore({ dir, log, prices }) {
     // an EMPTY history after the first rotation, and a confidently empty
     // answer to "what happened to this account" is worse than an error.
     const all = [];
-    for (const file of files) {
+    // Re-scan: a rotation since boot moved the live file's contents into
+    // a segment that wasn't in the boot-time list.
+    const current = new Set(files);
+    try {
+      for (const f of fs.readdirSync(dir)) {
+        if (/^journal\.\d+\.jsonl$/.test(f)) current.add(path.join(dir, f));
+      }
+    } catch { /* directory vanished */ }
+    for (const file of [...current].sort()) {
       try { all.push(...fs.readFileSync(file, 'utf8').split('\n')); } catch { /* rotated away */ }
     }
     for (const line of all) {

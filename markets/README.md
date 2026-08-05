@@ -24,6 +24,9 @@ Open `{prefix}/` for the UI; the JSON API is under `{prefix}/api`.
 | `POST /api/markets/:id/trade` | buy/sell, slippage guards, idempotency keys |
 | `.../close .../resolve .../dispute .../settle .../void` | lifecycle |
 | `GET /api/stats` | public conservation figures + journal seq |
+| `POST /api/admin/adjudicate` | uphold / re-resolve / void a disputed market |
+| `GET /api/admin/disputes` | the operator's dispute queue, soonest deadline first |
+| `GET /api/admin/agent` | one agent's journal history (support / adjudication) |
 | `POST /api/admin/{freeze,adjust,hide}` | operator plane (journalled) |
 | `WS {prefix}/ws` | `{market,trade,settle}` events |
 
@@ -150,6 +153,17 @@ the walls point at.
   regression test for exactly this attack, and it caught a real bug: the
   price path was seeded with `m.history || [seed]`, and an empty array is
   truthy, so the TWAP degenerated to the post-pump spot price.
+- **A self-verifying credential needs an epoch, and the type of what
+  `verify()` returns is a money bug.** Widening the session verifier from
+  "returns the agent id" to "returns the claims" without updating its two
+  callers made every cookie session authenticate as the string
+  `[object Object]`: one shared ledger row for every browser user, a
+  phantom grant minted against that key, a rate limiter keyed on a fresh
+  object per request (so, disabled), and a conservation invariant that
+  was silently false and would have replayed that way forever. Sixty-two
+  green tests missed it because they asserted status codes and never once
+  asserted *which agent* a cookie resolved to. Test the identity, not the
+  200.
 - **Dropping a torn journal tail is only half of crash recovery.** The
   fragment must also be TRUNCATED before reopening for append —
   otherwise the next acknowledged, fsync'd event is welded onto the
@@ -171,7 +185,7 @@ the walls point at.
 
 ## Tests
 
-`node --test --test-concurrency=1 markets/test.js` — 62 tests: LMSR and
+`node --test --test-concurrency=1 markets/test.js` — 64 tests: LMSR and
 TWAP math, session/CSRF/rate-limit units, hardened headers, cookie
 scoping, prototype-key ids, grants, escrow, stake-first quotes,
 quote↔trade parity, slippage guards (including the NaN-fails-closed case),

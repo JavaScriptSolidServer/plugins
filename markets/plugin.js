@@ -33,7 +33,9 @@
 //     |                                        (funds are NEVER stuck:
 //     | any holder disputes                     anyone may trigger this)
 //     v
-//   disputed --admin, or disputeGrace--> void at TWAP
+//   disputed --admin: uphold / re-resolve / void--> settled
+//            --disputeGrace with no admin--> the resolution STANDS
+//              (bonds forfeited: silence must not be a free refund)
 //
 // Three separate defences against the oracle stealing the pool:
 //   1. the oracle and creator MAY NOT TRADE in their own market;
@@ -221,15 +223,27 @@ export async function activate(api) {
    * the pod bearer path is reserved for API clients that send it
    * explicitly.
    */
+  /** Resolve a session token to an agent id. A session is live only
+   *  while its epoch matches the agent's current epoch — that comparison
+   *  is what makes sign-out, freeze and revoke actually end a session,
+   *  since a self-verifying token is otherwise valid for its whole TTL. */
+  function liveSession(token) {
+    const claims = sessions.verify(token);
+    if (!claims) return null;
+    const row = state.ledger[claims.agent];
+    if (row && (row.epoch || 0) !== claims.epoch) return null;
+    return claims.agent;
+  }
+
   async function resolveAgent(request) {
     const cookie = cookieToken(request);
     if (cookie) {
-      const agent = sessions.verify(cookie);
+      const agent = liveSession(cookie);
       if (agent) return agent;
     }
     const auth = request.headers.authorization;
     if (auth && auth.startsWith('Bearer v1.')) {
-      const agent = sessions.verify(auth.slice(7));
+      const agent = liveSession(auth.slice(7));
       if (agent) return agent;
     }
     return api.auth.getAgent(request);
@@ -241,6 +255,16 @@ export async function activate(api) {
   /** Guard for every mutating route: same-origin required whenever the
    *  credential is ambient (cookie/TLS cert), because those are exactly
    *  the credentials a cross-origin page can borrow. */
+  /** The origin to compare against, preferring configured/serverInfo and
+   *  falling back to the request's own Host so a deployment without
+   *  baseUrl doesn't silently refuse every browser mutation. */
+  function originFor(request) {
+    const known = ownOrigin();
+    if (known) return known;
+    const host = request.headers.host;
+    return host ? `${request.protocol || 'http'}://${host}` : null;
+  }
+
   function csrfOk(request) {
     // A session cookie makes the request ambient REGARDLESS of any
     // Authorization header: resolveAgent checks the cookie first, so an
@@ -248,7 +272,7 @@ export async function activate(api) {
     // "explicitly credentialed", skip this check, and still be
     // authenticated by the victim's cookie.
     if (!cookieToken(request) && !isAmbientCredential(request)) return true;
-    return isSameOrigin(request, ownOrigin());
+    return isSameOrigin(request, originFor(request));
   }
 
   async function authed(request, reply, { mutating = true } = {}) {
@@ -294,7 +318,7 @@ export async function activate(api) {
 
   api.fastify.addHook('onRequest', async (request, reply) => {
     if (!mine(request)) return undefined;
-    const key = sessions.verify(cookieToken(request) || '') || request.ip;
+    const key = liveSession(cookieToken(request) || '') || request.ip;
     const cost = request.method === 'GET' || request.method === 'HEAD' ? 1 : 4;
     const waitMs = limiter.take(key, cost);
     if (waitMs) {
@@ -684,8 +708,8 @@ export async function activate(api) {
     if (!csrfOk(request)) return err(reply, 403, 'cross-origin request refused');
     const agent = await api.auth.getAgent(request);
     if (!agent) return err(reply, 401, 'a pod bearer token is required to start a session');
-    const token = sessions.mint(agent);
     ensureAccount(agent);
+    const token = sessions.mint(agent, state.ledger[agent].epoch || 0);
     const secure = (ownOrigin() || '').startsWith('https:') ? ' Secure;' : '';
     reply.header('set-cookie',
       `${cookieName}=${encodeURIComponent(token)}; Path=${prefix}; HttpOnly; SameSite=Strict;${secure} Max-Age=${Math.floor(sessionTtlMs / 1000)}`);
@@ -693,6 +717,12 @@ export async function activate(api) {
   });
 
   api.fastify.delete(`${prefix}/api/session`, async (request, reply) => {
+    if (!csrfOk(request)) return err(reply, 403, 'cross-origin request refused');
+    // Clearing the cookie is cosmetic on its own — the token is
+    // self-verifying, so a captured copy still worked for the full TTL.
+    // Bump the epoch so every token minted before now stops verifying.
+    const who = await resolveAgent(request);
+    if (who && state.ledger[who]) store.commit({ type: 'session.revoke', agent: who });
     reply.header('set-cookie', `${cookieName}=; Path=${prefix}; HttpOnly; SameSite=Strict; Max-Age=0`);
     return reply.send({ ok: true });
   });
@@ -1043,8 +1073,10 @@ export async function activate(api) {
     return err(reply, 409, `market is ${displayStatus(m)} — nothing to settle`);
   });
 
-  // A holder can park a resolution they believe is wrong. That is the
-  // check on a unilateral oracle: disputed markets never auto-pay.
+  // A holder can park a resolution they believe is wrong, at the cost of
+  // a bond. An operator adjudicates; if none does before the grace
+  // expires the resolution stands and the bond is forfeited, because a
+  // dispute that cancels the market for free is just a refund button.
   api.fastify.post(`${prefix}/api/markets/:id/dispute`, jsonOpts(1024), async (request, reply) => {
     const agent = await authed(request, reply);
     if (!agent) return reply;
@@ -1100,7 +1132,10 @@ export async function activate(api) {
         : 'only the oracle may void before the settlement window expires');
     }
     if (!m.closedAt) store.commit({ type: 'market.close', marketId: m.id });
-    settleVoid(m);
+    // An operator voiding a DISPUTED market has sustained the dispute,
+    // whichever route they used to do it.
+    settleVoid(m, m.status === 'disputed' && admins.has(agent)
+      ? { adjudicatedBy: agent, sustained: true } : {});
     api.log.info(`markets: ${m.id} voided (redeemed at TWAP)`);
     return reply.send(marketOut(m));
   });
