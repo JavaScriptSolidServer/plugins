@@ -52,11 +52,22 @@ payout is **capped at their escrow**; and a resolution sits in a
 A market whose oracle never acts is **auto-voided at TWAP** after the
 settlement window — anyone can trigger it, so funds are never stuck.
 
-Disputes cost a **bond** (`disputeBondCredits`, default 25), forfeited to
-the house if the resolution is upheld and returned if it isn't. Without a
-bond and an *uphold* verb, disputing is a free refund option on any lost
-bet and every rational loser disputes; an operator resolves the queue at
-`GET /api/admin/disputes` → `POST /api/admin/adjudicate`.
+Disputes cost a **bond** — `max(disputeBondCredits, disputeBondBps` of the
+disputed position`)`, default 25 credits or 20% — returned only if an
+operator **sustains** the dispute, forfeited otherwise, including when
+nobody adjudicates in time. Every holder posts their own bond, and an
+unadjudicated dispute falls through to the **oracle's resolution, not a
+void**. Each of those is load-bearing: refunding on any void, latching on
+the first disputer, or defaulting to void made disputing a free refund
+option on any lost bet — paid for out of the winner's payout — so every
+rational loser disputes and correct resolutions never stand.
+
+An operator works the queue at `GET /api/admin/disputes` →
+`POST /api/admin/adjudicate`, which has three verbs: **uphold** (the
+resolution stands), **re-resolve** (`uphold:false` with an `outcome` —
+the oracle was wrong and we know the right answer), and **void**.
+Re-resolution matters because voiding an incorrect resolution refunds the
+loser and wipes out whoever actually backed the correct outcome.
 
 **A void never pays a holder more than they paid.** Redemption is
 `min(TWAP value, cost basis)` per outcome. The TWAP alone defeats a
@@ -160,7 +171,7 @@ the walls point at.
 
 ## Tests
 
-`node --test --test-concurrency=1 markets/test.js` — 60 tests: LMSR and
+`node --test --test-concurrency=1 markets/test.js` — 62 tests: LMSR and
 TWAP math, session/CSRF/rate-limit units, hardened headers, cookie
 scoping, prototype-key ids, grants, escrow, stake-first quotes,
 quote↔trade parity, slippage guards (including the NaN-fails-closed case),

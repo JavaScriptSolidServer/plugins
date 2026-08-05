@@ -96,19 +96,24 @@ export function renderUi(prefix) {
 <body>
 <div class="topbar">
   <a class="brand" href="${prefix}">Mar<span>kets</span></a>
-  <span class="chip hidden" id="live">● live</span>
+  <span class="chip hidden" id="live" aria-live="polite">● live</span>
   <span class="spacer"></span>
-  <span class="chip">⛁ <b id="bal">—</b> credits</span>
+  <span class="chip" title="play money — these credits have no monetary value">⛁ <b id="bal">—</b> paper credits</span>
   <button class="small" id="signin">Sign in</button>
 </div>
 <main>
+  <p class="hint" style="margin:.4rem .2rem">
+    <b>Paper credits — play money.</b> These credits cannot be bought, sold or withdrawn and
+    have no monetary value. Prices are set by an automated market maker; markets are resolved
+    by a named oracle and can be disputed.
+  </p>
   <div class="card hidden" id="auth-card">
     <h2>Start a session</h2>
     <p class="hint">Paste a pod bearer token (from <code>POST /idp/credentials</code>). It is exchanged
        for a session cookie scoped to this app and <b>never stored in the browser</b> —
        so this page can't leak access to the rest of your pod.</p>
     <div class="row">
-      <input id="token" type="password" placeholder="pod bearer token" style="flex:1;min-width:12rem">
+      <input id="token" type="password" placeholder="pod bearer token" aria-label="Pod bearer token" style="flex:1;min-width:12rem">
       <button class="primary" id="do-signin">Start session</button>
     </div>
     <div class="msg" id="auth-msg"></div>
@@ -117,7 +122,7 @@ export function renderUi(prefix) {
   <div id="list-view">
     <nav class="tabs" id="tabs"></nav>
     <div class="row" style="margin:.2rem">
-      <input id="search" placeholder="Search markets" style="flex:1">
+      <input id="search" placeholder="Search markets" aria-label="Search markets" style="flex:1">
     </div>
     <div class="card" id="list">loading…</div>
     <div class="row" style="justify-content:center">
@@ -138,6 +143,8 @@ export function renderUi(prefix) {
          your own market.</p>
       <div class="row"><input id="c-title" placeholder="Question — e.g. Arsenal v Spurs: full-time result" style="flex:1;min-width:14rem"></div>
       <div class="row"><input id="c-outcomes" placeholder="Outcomes, comma-separated — Arsenal, Draw, Spurs" style="flex:1;min-width:14rem"></div>
+      <div class="row"><textarea id="c-desc" rows="2" placeholder="Rules — exactly what counts as a win, and from which source" style="flex:1;min-width:14rem"></textarea></div>
+      <div class="row"><input id="c-oracle" placeholder="Oracle WebID (optional — defaults to you)" style="flex:1;min-width:14rem"></div>
       <div class="row">
         <input id="c-category" placeholder="Category (e.g. football)" style="width:11rem">
         <label class="hint">closes <input id="c-closes" type="datetime-local"></label>
@@ -164,7 +171,7 @@ export function renderUi(prefix) {
       <div class="ticket" id="ticket">
         <div class="row" style="margin:0 0 .4rem">
           <span class="hint">Risk</span>
-          <input id="t-stake" type="number" min="0" step="1" value="10" style="width:6.5rem">
+          <input id="t-stake" type="number" min="0" step="1" value="10" aria-label="Stake in credits" style="width:6.5rem">
           <span class="hint">credits on <b id="t-pick">—</b></span>
         </div>
         <div class="stakes">
@@ -176,7 +183,7 @@ export function renderUi(prefix) {
         </div>
         <div class="row" style="margin:.6rem 0 .2rem">
           <div>
-            <div class="hint">To win</div>
+            <div class="hint">Returns</div>
             <div class="big" id="t-towin">—</div>
           </div>
           <div>
@@ -199,9 +206,12 @@ export function renderUi(prefix) {
         <button id="o-void">Void</button>
         <button id="o-close">Close early</button>
       </div>
-      <div class="row hidden" id="dispute-row">
-        <span class="hint">Resolution looks wrong?</span>
-        <button id="o-dispute" class="small">Dispute</button>
+      <div class="hidden" id="dispute-row" style="margin-top:.7rem">
+        <div class="card" style="margin:0">
+          <h2>Resolution looks wrong?</h2>
+          <p class="hint" id="dispute-copy"></p>
+          <button id="o-dispute">Dispute this resolution</button>
+        </div>
       </div>
     </div>
   </div>
@@ -214,6 +224,7 @@ export function renderUi(prefix) {
   const COLORS = ['#0f7d5c','#97a09c','#b45309','#1d4ed8','#7c3aed','#0e7490',
                   '#a21caf','#4d7c0f','#b91c1c','#334155','#9a3412','#115e59'];
   let me = null, current = null, pick = 0, tab = 'open', cursor = null, quoteSeq = 0, lastQuote = null;
+  let paged = false; // has the user loaded past page one?
   // One key per BET INTENT. Minting it per click defeats the point: the
   // case idempotency exists for is the user retrying after a timeout,
   // and a fresh key on the retry executes a second trade. It is renewed
@@ -240,6 +251,8 @@ export function renderUi(prefix) {
   function toast(text, ms = 4200) {
     const el = document.createElement('div');
     el.className = 'toast'; el.textContent = text;
+    el.setAttribute('role', 'status');
+    el.setAttribute('aria-live', 'polite');
     document.body.appendChild(el);
     setTimeout(() => el.remove(), ms);
   }
@@ -307,11 +320,15 @@ export function renderUi(prefix) {
           : 'Settled: ' + s.title + ' — no return this time');
       }
     } catch (e) {
-      me = null;
-      $('bal').textContent = '—';
-      $('signin').textContent = 'Sign in';
-      $('me-card').classList.add('hidden');
-      if (!quiet && e.status !== 401) $('auth-msg').textContent = e.message;
+      // Only an auth failure means signed-out. Treating a 429 or a 500
+      // as a logout blanks the balance and flips the bet button to
+      // "Sign in" while the user is perfectly well signed in.
+      if (e.status === 401 || e.status === 403) {
+        me = null;
+        $('bal').textContent = '—';
+        $('signin').textContent = 'Sign in';
+        $('me-card').classList.add('hidden');
+      } else if (!quiet) toast('Connection trouble — showing the last known state');
     }
   }
 
@@ -336,7 +353,9 @@ export function renderUi(prefix) {
                       + esc(p.outcomes[i]) + '</button>' : '')).join(' ')
                 : '') + '</td></tr>';
         }).join('') + '</tbody></table>';
-      el.querySelectorAll('.cashout').forEach((b) => { b.onclick = () => cashOut(b.dataset.m, Number(b.dataset.i)); });
+      el.querySelectorAll('.cashout').forEach((b) => {
+        b.onclick = () => cashOut(b.dataset.m, Number(b.dataset.i));
+      });
     }
     const s = $('settled');
     s.innerHTML = me.settlements.length
@@ -357,8 +376,9 @@ export function renderUi(prefix) {
   async function cashOut(marketId, outcome) {
     const m = await api('/markets/' + encodeURIComponent(marketId));
     if (!m.position) return;
-    const i = Number.isInteger(outcome) ? outcome : m.position.shares.findIndex((s) => s > 0);
-    if (i < 0 || !(m.position.shares[i] > 0)) return;
+    if (!Number.isInteger(outcome)) return; // never guess which leg to sell
+    const i = outcome;
+    if (!(m.position.shares[i] > 0)) return;
     const shares = m.position.shares[i];
     const q = await api('/markets/' + m.id + '/quote?side=sell&outcome=' + i + '&shares=' + shares);
     const floor = q.total * 0.98;
@@ -428,7 +448,17 @@ export function renderUi(prefix) {
   async function renderDetail(id, keepTicket) {
     let m;
     try { m = await api('/markets/' + encodeURIComponent(id)); }
-    catch (e) { toast(e.message); location.hash = ''; return; }
+    catch (e) {
+      // Never navigate away on a refresh failure: a transient 429 from a
+      // busy market would otherwise eject the user mid-bet-slip.
+      toast(e.message);
+      if (!current) location.hash = '';
+      return;
+    }
+    // Reset the ticket whenever the MARKET changes — otherwise the
+    // previously picked index leaks across markets and can point past
+    // the end of a shorter outcome list.
+    if (!current || current.id !== m.id) { pick = 0; newIntent(); }
     current = m;
     $('list-view').classList.add('hidden');
     $('detail-view').classList.remove('hidden');
@@ -439,13 +469,16 @@ export function renderUi(prefix) {
       + ' · <span id="d-countdown">' + (m.tradable ? countdown(m.closesAt)
         : 'closed ' + new Date(m.closesAt).toLocaleString()) + '</span>'
       + ' · pool ' + cr(m.liquidity) + ' · ' + m.trades + ' trades'
-      + (m.description ? '<br>' + esc(m.description) : '');
+      + '<br>resolved by ' + esc(m.oracle === (me && me.agent) ? 'you' : m.oracle)
+      + (m.description ? '<br><b>Rules:</b> ' + esc(m.description)
+        : '<br><i>No rules stated by the creator.</i>');
     priceBar($('d-bar'), m.outcomes, m.prices);
     sparkline($('d-spark'), m.history, m.outcomes.length);
 
-    if (!keepTicket && pick >= m.outcomes.length) pick = 0;
+    if (pick >= m.outcomes.length) pick = 0;
     $('d-outcomes').innerHTML = m.outcomes.map((o, i) =>
-      '<button class="out-btn ' + (i === pick ? 'on' : '') + '" data-i="' + i + '">'
+      '<button class="out-btn ' + (i === pick ? 'on' : '') + '" data-i="' + i + '"'
+      + ' aria-pressed="' + (i === pick) + '">'
       + '<span><span style="color:' + COLORS[i % COLORS.length] + '">●</span> ' + esc(o) + '</span>'
       + '<span class="px">' + pct(m.prices[i]) + ' · ' + (1 / Math.max(m.prices[i], 1e-6)).toFixed(2) + '</span>'
       + '</button>').join('');
@@ -468,15 +501,20 @@ export function renderUi(prefix) {
       const cls = pos.unrealizedPnl >= 0 ? 'up' : 'down';
       pd.innerHTML = '<div class="card" style="margin:0"><h2>Your position</h2>'
         + '<table><tbody>' + pos.shares.map((s, i) => s > 0
-          ? '<tr><td>' + cr(s) + ' × ' + esc(m.outcomes[i]) + '</td>'
-            + '<td class="num">worth ' + cr(pos.value[i]) + '</td>'
+          ? '<tr><td>' + cr(s) + ' × ' + esc(m.outcomes[i])
+              + '<div class="meta">in at ' + pct(pos.cost[i] / s) + ', now ' + pct(m.prices[i]) + '</div></td>'
+            + '<td class="num">worth ' + cr(pos.value[i])
+              + '<div class="meta ' + (pos.value[i] >= pos.cost[i] ? 'pnl up' : 'pnl down') + '">'
+              + (pos.value[i] >= pos.cost[i] ? '+' : '') + cr(pos.value[i] - pos.cost[i]) + '</div></td>'
             + '<td class="num">' + (m.tradable ? '<button class="small sell-one" data-i="' + i + '">Cash out</button>' : '') + '</td></tr>'
           : '').join('')
         + '</tbody></table>'
         + '<div class="row"><span class="hint">cost ' + cr(pos.totalCost) + ' · value ' + cr(pos.totalValue)
         + '</span><span class="spacer"></span><span class="pnl ' + cls + '">'
         + (pos.unrealizedPnl >= 0 ? '+' : '') + cr(pos.unrealizedPnl) + '</span></div></div>';
-      pd.querySelectorAll('.sell-one').forEach((b) => { b.onclick = () => cashOut(m.id); });
+      pd.querySelectorAll('.sell-one').forEach((b) => {
+        b.onclick = () => cashOut(m.id, Number(b.dataset.i));
+      });
     } else pd.classList.add('hidden');
 
     // Use canResolve (the RAW lifecycle state), not the display status:
@@ -488,7 +526,17 @@ export function renderUi(prefix) {
     const isOracle = me && (me.agent === m.oracle);
     $('oracle-row').classList.toggle('hidden', !(isOracle && m.canResolve));
     $('o-outcome').innerHTML = m.outcomes.map((o, i) => '<option value="' + i + '">' + esc(o) + '</option>').join('');
-    $('dispute-row').classList.toggle('hidden', !(m.status === 'resolving' && pos));
+    const canDispute = m.status === 'resolving' && pos;
+    $('dispute-row').classList.toggle('hidden', !canDispute);
+    if (canDispute) {
+      // State the bond, the stakes and the deadline BEFORE taking money.
+      const bond = Math.max(25, pos.totalCost * 0.2);
+      $('dispute-copy').innerHTML = 'This market resolved as <b>' + esc(m.outcomes[m.resolvedOutcome])
+        + '</b>. Disputing stakes a bond of about <b>' + cr(bond) + ' credits</b>, which you '
+        + '<b>lose</b> unless an operator agrees with you. '
+        + (m.disputes ? m.disputes + ' dispute(s) already filed. ' : '')
+        + 'If nobody adjudicates in time, the resolution stands.';
+    }
     quote();
   }
 
@@ -550,7 +598,7 @@ export function renderUi(prefix) {
     if (h.startsWith('#m/')) return renderDetail(h.slice(3), true);
     $('detail-view').classList.add('hidden');
     $('list-view').classList.remove('hidden');
-    current = null; cursor = null;
+    current = null; cursor = null; paged = false;
     renderTabs();
     return renderList();
   }
@@ -571,8 +619,16 @@ export function renderUi(prefix) {
     } catch (e) { $('auth-msg').textContent = e.message; $('auth-msg').className = 'msg err'; }
   };
   $('back').onclick = (e) => { e.preventDefault(); location.hash = ''; };
-  $('t-buy').onclick = () => { if (!me) { $('auth-card').classList.remove('hidden'); $('token').focus(); return; } placeBet(); };
-  $('more').onclick = () => renderList(true);
+  $('t-buy').onclick = () => {
+    if (!me) {
+      $('auth-card').classList.remove('hidden');
+      $('auth-card').scrollIntoView({ behavior: 'smooth', block: 'center' });
+      $('token').focus();
+      return;
+    }
+    placeBet();
+  };
+  $('more').onclick = () => { paged = true; renderList(true); };
   let searchTimer;
   $('search').oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { cursor = null; renderList(); }, 250); };
   let quoteTimer;
@@ -580,6 +636,7 @@ export function renderUi(prefix) {
   document.querySelectorAll('[data-stake]').forEach((b) => {
     b.onclick = () => {
       $('t-stake').value = b.dataset.stake === 'max' ? Math.floor((me ? me.balance : 0) * 100) / 100 : b.dataset.stake;
+      newIntent(); // a different stake is a different bet
       quote();
     };
   });
@@ -595,11 +652,18 @@ export function renderUi(prefix) {
     if (typed.trim().toLowerCase() !== label.toLowerCase()) { toast('Not resolved — that did not match "' + label + '"'); return; }
     act('resolve', { outcome: i });
   };
-  $('o-void').onclick = () => act('void', {}, 'Void this market? Every share is redeemed at the average price over the window before close.');
+  $('o-void').onclick = () => {
+    const typed = prompt('Void "' + current.title + '".\\n\\n'
+      + 'Every share is redeemed at the average price over the window before close, capped at\\n'
+      + 'what each holder paid. Nobody wins. This cannot be undone.\\n\\nType VOID to confirm:');
+    if (typed === null) return;
+    if (typed.trim().toUpperCase() !== 'VOID') { toast('Not voided'); return; }
+    act('void', {});
+  };
   $('o-close').onclick = () => act('close', {});
   $('o-dispute').onclick = () => {
-    const reason = prompt('Why is this resolution wrong?');
-    if (reason) act('dispute', { reason });
+    const reason = prompt('Why is this resolution wrong? (Your bond is forfeited unless an operator agrees.)');
+    if (reason && reason.trim()) act('dispute', { reason });
   };
   $('c-go').onclick = async () => {
     $('c-msg').textContent = ''; $('c-msg').className = 'msg';
@@ -611,6 +675,8 @@ export function renderUi(prefix) {
         body: JSON.stringify({
           title: $('c-title').value,
           outcomes,
+          description: $('c-desc').value,
+          ...($('c-oracle').value.trim() ? { oracle: $('c-oracle').value.trim() } : {}),
           category: $('c-category').value,
           closesAt: $('c-closes').value ? new Date($('c-closes').value).toISOString() : '',
           b: Number($('c-b').value),
@@ -647,7 +713,7 @@ export function renderUi(prefix) {
     ws.onmessage = (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch { return; }
       if (current) { if (msg.market && msg.market.id === current.id) renderDetail(current.id, true); }
-      else if (!cursor) renderList(); // don't yank a user who has paged down
+      else if (!paged) renderList(); // don't yank a user who has paged down
       if (msg.type === 'settle' && me) refreshMe();
     };
   }

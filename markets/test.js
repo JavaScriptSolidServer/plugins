@@ -120,8 +120,9 @@ describe('markets plugin', () => {
     // the source tree (and it got committed once — never again).
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'markets-sess-'));
     const s = createSessions({ dir, ttlMs: 60_000 });
-    const tok = s.mint('https://alice.example/#me');
-    assert.strictEqual(s.verify(tok), 'https://alice.example/#me');
+    const tok = s.mint('https://alice.example/#me', 3);
+    assert.strictEqual(s.verify(tok).agent, 'https://alice.example/#me');
+    assert.strictEqual(s.verify(tok).epoch, 3, 'the epoch rides in the token so sessions can be revoked');
     assert.strictEqual(s.verify(`${tok}x`), null, 'tampered mac rejected');
     assert.strictEqual(s.verify('v1.aaa.bbb'), null);
     assert.strictEqual(s.verify(null), null);
@@ -151,7 +152,11 @@ describe('markets plugin', () => {
     assert.ok(!isSameOrigin({ headers: { 'sec-fetch-site': 'cross-site' } }, own));
     assert.ok(!isSameOrigin({ headers: { origin: 'https://evil.example' } }, own));
     assert.ok(isSameOrigin({ headers: { origin: own } }, own));
-    assert.ok(isSameOrigin({ headers: {} }, own), 'non-browser client');
+    // Both present must AGREE — otherwise the Origin check is dead code
+    // whenever Sec-Fetch-Site is set.
+    assert.ok(!isSameOrigin({ headers: { origin: 'https://evil.example', 'sec-fetch-site': 'same-origin' } }, own));
+    // Neither header, ambient credential: refused rather than trusted.
+    assert.ok(!isSameOrigin({ headers: {} }, own));
   });
 
   it('agent ids: WebIDs and DIDs pass, typos do not', () => {
@@ -559,6 +564,11 @@ describe('markets plugin', () => {
     const t = await json(await call('bob', 'POST', `/markets/${m.id}/trade`,
       { side: 'buy', outcome: 0, spend: Math.min(before * 0.5, 200) }), 200);
     assert.ok(t.market.prices[0] > 0.9, 'bob pumped the price hard');
+    // Voiding LIVE trading would cancel everyone's open bets, so the
+    // oracle must close the market first.
+    const live = await json(await call('alice', 'POST', `/markets/${m.id}/void`), 403);
+    assert.match(live.error, /close the market before voiding/);
+    await json(await call('alice', 'POST', `/markets/${m.id}/close`), 200);
     await json(await call('alice', 'POST', `/markets/${m.id}/void`), 200);
     const after = await balance('bob');
     assert.ok(after < before,
@@ -577,6 +587,7 @@ describe('markets plugin', () => {
       { side: 'buy', outcome: 0, shares: 20 }), 200);
     await sleep(350); // the holder's price is what sits in the window
     const before = await balance('carol');
+    await json(await call('alice', 'POST', `/markets/${m.id}/close`), 200);
     await json(await call('alice', 'POST', `/markets/${m.id}/void`), 200);
     const redeemed = await balance('carol') - before;
     assert.ok(redeemed > 8 && redeemed < 20, `redeemed ${redeemed} ≈ 20 shares near 50c`);
@@ -618,7 +629,38 @@ describe('markets plugin', () => {
     await sleep(400);
     const after = await json(await call(null, 'GET', `/markets/${m.id}`), 200);
     assert.strictEqual(after.status, 'disputed', 'the dispute window closing must not pay out a disputed market');
-    assert.strictEqual((await call('carol', 'POST', `/markets/${m.id}/dispute`, { reason: 'me too' })).status, 409);
+    // A non-holder has no standing.
+    assert.strictEqual((await call('carol', 'POST', `/markets/${m.id}/dispute`, { reason: 'me too' })).status, 403);
+    // …and the same holder cannot stack bonds on one market.
+    assert.strictEqual((await call('bob', 'POST', `/markets/${m.id}/dispute`, { reason: 'again' })).status, 409);
+  });
+
+  it('every disputer posts their OWN bond, scaled to what they staked', async () => {
+    const m = await json(await call('alice', 'POST', '/markets', {
+      title: 'Two unhappy holders',
+      outcomes: ['Home', 'Away'],
+      closesAt: new Date(Date.now() + 3600e3).toISOString(),
+      b: 40,
+    }), 201);
+    await json(await call('bob', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 0, spend: 200 }), 200);
+    await json(await call('carol', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 0, shares: 5 }), 200);
+    await json(await call('alice', 'POST', `/markets/${m.id}/resolve`, { outcome: 1 }), 200);
+
+    const bobBefore = await balance('bob');
+    await json(await call('bob', 'POST', `/markets/${m.id}/dispute`, { reason: 'wrong' }), 200);
+    const bobBond = bobBefore - await balance('bob');
+    // 20% of a ~200-credit position is well above the 25-credit floor.
+    assert.ok(bobBond > 25, `a large position posts a large bond (got ${bobBond})`);
+
+    const carolBefore = await balance('carol');
+    const second = await json(await call('carol', 'POST', `/markets/${m.id}/dispute`,
+      { reason: 'also wrong' }), 200);
+    assert.strictEqual(second.disputes, 2, 'a second holder can dispute too');
+    const carolBond = carolBefore - await balance('carol');
+    assert.ok(Math.abs(carolBond - 25) < 1e-9, `a small position posts the floor (got ${carolBond})`);
+    await assertConserved('with two bonds staked');
   });
 
   it('early close stops trading but keeps the market resolvable', async () => {
@@ -849,6 +891,32 @@ describe('markets plugin', () => {
     const back = await balance('bob') - before;
     assert.ok(back > -1e-6, `a vindicated disputer gets the bond back plus redemption (got ${back})`);
     await assertConserved('after voiding a disputed resolution');
+  });
+
+  it('ADJUDICATION: an operator can RE-RESOLVE, making the honest winner whole', async () => {
+    // The remedy for oracle error must not be a void: that refunds the
+    // loser and wipes out whoever actually backed the correct outcome.
+    const m = await json(await call('alice', 'POST', '/markets', {
+      title: 'The oracle simply got it wrong',
+      outcomes: ['Home', 'Away'],
+      closesAt: new Date(Date.now() + 3600e3).toISOString(),
+      b: 30,
+    }), 201);
+    await json(await call('bob', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 0, shares: 20 }), 200);
+    await json(await call('alice', 'POST', `/markets/${m.id}/resolve`, { outcome: 1 }), 200);
+    const before = await balance('bob');
+    await json(await call('bob', 'POST', `/markets/${m.id}/dispute`, { reason: 'Home clearly won' }), 200);
+
+    const fixed = await json(await call('alice', 'POST', '/admin/adjudicate',
+      { market: m.id, uphold: false, outcome: 0 }), 200);
+    assert.strictEqual(fixed.status, 'resolved');
+    assert.strictEqual(fixed.resolvedOutcome, 0, 're-resolved to the correct outcome');
+    // bob held 20 winning shares and gets his bond back — a sustained
+    // dispute must leave the person who was right better off.
+    assert.ok(await balance('bob') - before > 15,
+      'the vindicated holder is paid out and refunded his bond');
+    await assertConserved('after a re-resolution');
   });
 
   it('a void never pays a holder more than they paid (kills the sustained pump)', async () => {

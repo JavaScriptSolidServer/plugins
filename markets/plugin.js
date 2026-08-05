@@ -91,6 +91,7 @@ const LIMITS = {
   tradeFeedLimit: 100,
   idempotencyTtlMs: 10 * 60 * 1000,
   maxIdempotencyKeys: 10_000,
+  maxAdjustCredits: 1_000_000,
   maxSockets: 500,
   maxSocketsPerIp: 10,
   wsBufferBytes: 1 << 20,
@@ -137,6 +138,7 @@ export async function activate(api) {
   const houseFeeShareBps = num(cfg.houseFeeShareBps, 5000);
   const disputeWindowMs = num(cfg.disputeWindowMs, 60 * 60 * 1000);
   const disputeBondMicro = Math.round(num(cfg.disputeBondCredits, 25) * MICRO);
+  const disputeBondBps = num(cfg.disputeBondBps, 2000); // 20% of the disputed position
   const disputeGraceMs = num(cfg.disputeGraceMs, 7 * 24 * 3600 * 1000);
   const settlementWindowMs = num(cfg.settlementWindowMs, 7 * 24 * 3600 * 1000);
   const twapWindowMs = num(cfg.twapWindowMs, 30 * 60 * 1000);
@@ -250,12 +252,14 @@ export async function activate(api) {
   }
 
   async function authed(request, reply, { mutating = true } = {}) {
+    // Resolve first so an anonymous caller gets a 401 rather than a
+    // confusing 403; nothing is acted on before the CSRF check below.
+    const agent = await resolveAgent(request);
+    if (!agent) { err(reply, 401, 'authentication required'); return null; }
     if (mutating && !csrfOk(request)) {
       err(reply, 403, 'cross-origin request refused — this endpoint is same-origin only');
       return null;
     }
-    const agent = await resolveAgent(request);
-    if (!agent) { err(reply, 401, 'authentication required'); return null; }
     if (state.ledger[agent] && state.ledger[agent].frozen) {
       err(reply, 403, 'this account is frozen; contact the operator');
       return null;
@@ -464,7 +468,7 @@ export async function activate(api) {
    * in the event, and applied by the reducer — so replay never recomputes
    * float arithmetic.
    */
-  function settle(m, status, payoutMicroOf, prices, { adjudicatedBy = null } = {}) {
+  function settle(m, status, payoutMicroOf, prices, { adjudicatedBy = null, sustained = false } = {}) {
     const pool = m.subsidyMicro + m.collectedMicro;
     const raw = [];
     let sum = 0;
@@ -496,13 +500,16 @@ export async function activate(api) {
     const houseFee = Math.floor((m.feesMicro * houseFeeShareBps) / 10_000);
     const creatorFee = m.feesMicro - houseFee;
 
-    // Dispute bonds: refunded if the market ends up VOID (the disputer
-    // was vindicated), forfeited to the house if the resolution stands.
+    // Dispute bonds return ONLY when an operator SUSTAINED the dispute —
+    // whether that meant voiding or re-resolving. Inferring it from a
+    // void status was wrong twice over: a re-resolution vindicates the
+    // disputer but isn't a void, and an unadjudicated grace-expiry void
+    // would hand the bond back for free.
     const bondRefunds = {};
     let bondToHouse = 0;
     for (const d of m.disputes || []) {
       if (!d.bondMicro) continue;
-      if (status === 'void') bondRefunds[d.agent] = (bondRefunds[d.agent] || 0) + d.bondMicro;
+      if (sustained) bondRefunds[d.agent] = (bondRefunds[d.agent] || 0) + d.bondMicro;
       else bondToHouse += d.bondMicro;
     }
 
@@ -547,6 +554,16 @@ export async function activate(api) {
    * trader's credits forever, since trading also stops at close. After
    * settlementWindow anyone's request advances it to a TWAP void.
    */
+  // Settlement on the request path is bounded to once a second: a mass
+  // expiry otherwise turns an anonymous GET into a multi-second stall
+  // (one fsync per newly-due market).
+  let lastTick = 0;
+  function maybeTick() {
+    if (Date.now() - lastTick < 1000) return;
+    lastTick = Date.now();
+    tick();
+  }
+
   function tick() {
     const now = Date.now();
     for (const m of Object.values(state.markets)) {
@@ -556,8 +573,12 @@ export async function activate(api) {
           api.log.warn(`markets: ${m.id} auto-voiding — no resolution within the settlement window`);
           settleVoid(m);
         } else if (m.status === 'disputed' && now >= (m.disputes[0].at + disputeGraceMs)) {
-          api.log.warn(`markets: ${m.id} auto-voiding — dispute unresolved by an admin`);
-          settleVoid(m);
+          // Fall through to the ORACLE'S RESOLUTION, not to a void: an
+          // unadjudicated dispute must not be a way to cancel a bet you
+          // lost. The disputer forfeits their bond; a genuinely wrong
+          // resolution needs an admin to say so before the grace expires.
+          api.log.warn(`markets: ${m.id} dispute expired unadjudicated — the resolution stands`);
+          settleResolved(m);
         }
       } catch (e) {
         api.log.error(`markets: tick failed for ${m.id}: ${e.message}`);
@@ -569,6 +590,13 @@ export async function activate(api) {
   const sockets = new Set();
   const perIp = new Map();
   await api.ws.route(`${prefix}/ws`, (socket, request) => {
+    // Reject cross-origin upgrades: public data today, but an unchecked
+    // origin makes any future per-agent field on the wire a leak.
+    const wsOrigin = request.headers && request.headers.origin;
+    if (wsOrigin && !isSameOrigin({ headers: { origin: wsOrigin } }, ownOrigin())) {
+      try { socket.close(1008, 'cross-origin'); } catch { /* gone */ }
+      return;
+    }
     const ip = request.socket ? request.socket.remoteAddress : 'unknown';
     const n = perIp.get(ip) || 0;
     if (sockets.size >= LIMITS.maxSockets || n >= LIMITS.maxSocketsPerIp) {
@@ -618,19 +646,28 @@ export async function activate(api) {
   // twice. Keyed by agent + Idempotency-Key; the original response is
   // replayed verbatim.
   const idem = new Map();
-  function idemGet(agent, key) {
+  const fingerprint = (request) => crypto.createHash('sha256')
+    .update(`${request.method} ${request.url} ${JSON.stringify(request.body || {})}`)
+    .digest('hex');
+
+  /** @returns {{code,body}|'conflict'|null} */
+  function idemGet(agent, key, fp) {
     if (!key) return null;
     const hit = idem.get(`${agent} ${key}`);
     if (!hit) return null;
     if (Date.now() - hit.at > LIMITS.idempotencyTtlMs) { idem.delete(`${agent} ${key}`); return null; }
+    // A key reused for a DIFFERENT request is an error, never a replay:
+    // otherwise a client deriving keys per session or per market silently
+    // loses trades and is told they succeeded.
+    if (hit.fp !== fp) return 'conflict';
     return hit;
   }
-  function idemPut(agent, key, code, body) {
+  function idemPut(agent, key, code, body, fp) {
     if (!key) return;
     if (idem.size >= LIMITS.maxIdempotencyKeys) {
       for (const k of idem.keys()) { idem.delete(k); if (idem.size < LIMITS.maxIdempotencyKeys * 0.9) break; }
     }
-    idem.set(`${agent} ${key}`, { at: Date.now(), code, body });
+    idem.set(`${agent} ${key}`, { at: Date.now(), code, body, fp });
   }
   const idemKey = (request) => {
     const k = request.headers['idempotency-key'];
@@ -665,7 +702,7 @@ export async function activate(api) {
     const agent = await authed(request, reply, { mutating: false });
     if (!agent) return reply;
     ensureAccount(agent);
-    tick();
+    maybeTick();
     const positions = [];
     for (const id of byAgent.get(agent) || []) {
       const m = state.markets[id];
@@ -704,7 +741,9 @@ export async function activate(api) {
     const agent = await authed(request, reply);
     if (!agent) return reply;
     const key = idemKey(request);
-    const prior = idemGet(agent, key);
+    const fp = key ? fingerprint(request) : null;
+    const prior = idemGet(agent, key, fp);
+    if (prior === 'conflict') return err(reply, 409, 'this Idempotency-Key was already used for a different request');
     if (prior) return reply.code(prior.code).send(prior.body);
 
     const body = request.body && typeof request.body === 'object' ? request.body : {};
@@ -791,13 +830,13 @@ export async function activate(api) {
     api.log.info(`markets: ${agent} created ${id} "${title}" (${outcomes.length} outcomes, b=${b})`);
     broadcast('market', m);
     const out = marketOut(m, { agent });
-    idemPut(agent, key, 201, out);
+    idemPut(agent, key, 201, out, fp);
     return reply.code(201).send(out);
   });
 
   // ---- list: cursor pagination + filters ------------------------------
   api.fastify.get(`${prefix}/api/markets`, async (request, reply) => {
-    tick();
+    maybeTick();
     const q = request.query || {};
     const limit = Math.min(LIMITS.listLimitMax, Math.max(1, Number(q.limit) || LIMITS.listLimit));
     const wanted = typeof q.status === 'string' ? q.status : '';
@@ -833,10 +872,16 @@ export async function activate(api) {
   });
 
   api.fastify.get(`${prefix}/api/markets/:id`, async (request, reply) => {
-    tick();
+    maybeTick();
     const m = state.markets[request.params.id];
     if (!m) return err(reply, 404, 'no such market');
     const agent = await resolveAgent(request);
+    // Withdrawn means withdrawn: leaving the title and description served
+    // at a stable URL is not takedown. Holders and operators can still
+    // see it, so positions remain settleable.
+    if (m.hidden && !admins.has(agent) && !m.positions[agent]) {
+      return err(reply, 451, 'this market has been withdrawn by the operator');
+    }
     return reply.send(marketOut(m, { agent, history: true }));
   });
 
@@ -855,7 +900,9 @@ export async function activate(api) {
     const agent = await authed(request, reply);
     if (!agent) return reply;
     const key = idemKey(request);
-    const prior = idemGet(agent, key);
+    const fp = key ? fingerprint(request) : null;
+    const prior = idemGet(agent, key, fp);
+    if (prior === 'conflict') return err(reply, 409, 'this Idempotency-Key was already used for a different request');
     if (prior) return reply.code(prior.code).send(prior.body);
 
     // From here to store.commit() there is NO await — the atomicity
@@ -929,7 +976,7 @@ export async function activate(api) {
       balance: balanceOf(agent) / MICRO,
       market: marketOut(m, { agent }),
     };
-    idemPut(agent, key, 200, out);
+    idemPut(agent, key, 200, out, fp);
     return reply.send(out);
   });
 
@@ -1003,19 +1050,30 @@ export async function activate(api) {
     if (!agent) return reply;
     const m = state.markets[request.params.id];
     if (!m) return err(reply, 404, 'no such market');
-    if (m.status !== 'resolving') return err(reply, 409, 'only a resolving market can be disputed');
+    // 'disputed' is disputable too: latching on the FIRST disputer meant
+    // one person paid the bond and every other loser free-rode on the
+    // resulting void. Each disputer posts their own.
+    if (m.status !== 'resolving' && m.status !== 'disputed') {
+      return err(reply, 409, 'only a resolving market can be disputed');
+    }
     const pos = m.positions[agent];
     if (!pos || pos.shares.every((s) => s === 0)) return err(reply, 403, 'only a holder may dispute');
+    if ((m.disputes || []).some((d) => d.agent === agent)) {
+      return err(reply, 409, 'you have already disputed this market');
+    }
     const reason = typeof (request.body || {}).reason === 'string'
       ? request.body.reason.slice(0, 500) : '';
     if (!reason.trim()) return err(reply, 400, 'a reason is required to dispute');
     ensureAccount(agent);
-    if (balanceOf(agent) < disputeBondMicro) {
-      return err(reply, 402, `disputing stakes a bond of ${(disputeBondMicro / MICRO).toFixed(2)} credits, forfeited if the resolution is upheld`);
+    // Scale with what the dispute puts at risk. A flat bond against a
+    // large position is trivially +EV to post: the disputer risks 25 to
+    // reclaim hundreds.
+    const atRisk = pos.costMicro.reduce((a, x) => a + x, 0);
+    const bondMicro = Math.max(disputeBondMicro, Math.ceil(atRisk * disputeBondBps / 10_000));
+    if (balanceOf(agent) < bondMicro) {
+      return err(reply, 402, `disputing this market stakes a bond of ${(bondMicro / MICRO).toFixed(2)} credits, forfeited unless the operator sustains your dispute`);
     }
-    store.commit({
-      type: 'market.dispute', marketId: m.id, agent, reason, bondMicro: disputeBondMicro,
-    });
+    store.commit({ type: 'market.dispute', marketId: m.id, agent, reason, bondMicro });
     api.log.warn(`markets: ${m.id} disputed by ${agent}: ${reason}`);
     broadcast('market', m);
     return reply.send(marketOut(m));
@@ -1027,12 +1085,20 @@ export async function activate(api) {
     const m = state.markets[request.params.id];
     if (!m) return err(reply, 404, 'no such market');
     const stale = Date.now() >= m.closesAt + settlementWindowMs;
-    // The oracle/admin may void at will; ANYONE may void a market whose
-    // oracle has gone missing past the settlement window (the backstop).
-    if (!(agent === m.oracle || admins.has(agent) || stale)) {
-      return err(reply, 403, 'only the oracle may void before the settlement window expires');
-    }
     if (m.status === 'resolved' || m.status === 'void') return err(reply, 409, `market is ${m.status}`);
+    // Once disputed, ONLY an admin may settle. Otherwise the oracle
+    // answers a dispute against itself by voiding the market, and the
+    // dispute is no check on the oracle at all.
+    if (m.status === 'disputed' && !admins.has(agent)) {
+      return err(reply, 403, 'this market is under dispute; only the operator may settle it');
+    }
+    // The oracle/admin may void a market that has stopped trading; ANYONE
+    // may void one whose oracle went missing past the settlement window.
+    if (!(admins.has(agent) || stale || (agent === m.oracle && !tradable(m)))) {
+      return err(reply, 403, tradable(m)
+        ? 'close the market before voiding it — voiding live trading cancels everyone’s open bets'
+        : 'only the oracle may void before the settlement window expires');
+    }
     if (!m.closedAt) store.commit({ type: 'market.close', marketId: m.id });
     settleVoid(m);
     api.log.info(`markets: ${m.id} voided (redeemed at TWAP)`);
@@ -1113,10 +1179,17 @@ export async function activate(api) {
     if (!by) return reply;
     const { agent, credits, reason } = request.body || {};
     if (!isAgentId(agent)) return err(reply, 400, 'agent must be an agent id');
-    if (!Number.isFinite(Number(credits))) return err(reply, 400, 'credits must be a finite number');
+    const deltaMicro = Math.round(Number(credits) * MICRO);
+    // 1e303 is "finite": rounding it into micros yields Infinity, which
+    // journals as null and makes every later sum on that row NaN — and
+    // the journal replays the corruption on every future boot.
+    if (!Number.isFinite(Number(credits)) || !Number.isSafeInteger(deltaMicro)
+        || Math.abs(Number(credits)) > LIMITS.maxAdjustCredits) {
+      return err(reply, 400, `credits must be a number within ±${LIMITS.maxAdjustCredits}`);
+    }
     if (typeof reason !== 'string' || !reason.trim()) return err(reply, 400, 'a reason is required (it is journalled)');
     store.commit({
-      type: 'admin.adjust', agent, deltaMicro: Math.round(Number(credits) * MICRO), reason: reason.slice(0, 200), by,
+      type: 'admin.adjust', agent, deltaMicro, reason: reason.slice(0, 200), by,
     });
     api.log.warn(`markets: admin ${by} adjusted ${agent} by ${credits}: ${reason}`);
     return reply.send({ ok: true, agent, balance: balanceOf(agent) / MICRO });
@@ -1128,14 +1201,25 @@ export async function activate(api) {
   api.fastify.post(`${prefix}/api/admin/adjudicate`, jsonOpts(1024), async (request, reply) => {
     const by = await adminOnly(request, reply);
     if (!by) return reply;
-    const { market, uphold } = request.body || {};
+    const { market, uphold, outcome } = request.body || {};
     const m = state.markets[market];
     if (!m) return err(reply, 404, 'no such market');
     if (m.status !== 'disputed') return err(reply, 409, `market is ${displayStatus(m)}, not disputed`);
-    if (uphold === true) settleResolved(m, { adjudicatedBy: by });
-    else if (uphold === false) settleVoid(m, { adjudicatedBy: by });
-    else return err(reply, 400, 'uphold must be true (the resolution stands) or false (void it)');
-    api.log.warn(`markets: admin ${by} ${uphold ? 'upheld' : 'voided'} disputed market ${m.id}`);
+    if (uphold === true) {
+      settleResolved(m, { adjudicatedBy: by });
+    } else if (uphold === false && Number.isInteger(outcome)) {
+      // RE-RESOLVE: the oracle got it wrong and we know the right answer.
+      // Voiding would refund the loser and wipe out whoever was RIGHT, so
+      // a correctable error needs its own verb.
+      if (outcome < 0 || outcome >= m.outcomes.length) return err(reply, 400, 'outcome must be a valid outcome index');
+      m.resolvedOutcome = outcome;
+      settleResolved(m, { adjudicatedBy: by, sustained: true });
+    } else if (uphold === false) {
+      settleVoid(m, { adjudicatedBy: by, sustained: true });
+    } else {
+      return err(reply, 400, 'uphold must be true (resolution stands), or false (void) — with an outcome to re-resolve instead');
+    }
+    api.log.warn(`markets: admin ${by} adjudicated ${m.id}: ${uphold ? 'upheld' : (Number.isInteger(outcome) ? `re-resolved to ${outcome}` : 'voided')}`);
     return reply.send(marketOut(m));
   });
 
@@ -1145,6 +1229,8 @@ export async function activate(api) {
     if (!by) return reply;
     const queue = Object.values(state.markets)
       .filter((m) => m.status === 'disputed')
+      .sort((a, b) => (a.disputes[0]?.at || 0) - (b.disputes[0]?.at || 0))
+      .slice(0, 200)
       .map((m) => ({
         ...marketOut(m),
         disputeDetail: (m.disputes || []).map((d) => ({

@@ -107,7 +107,7 @@ export function emptyState() {
 function row(state, agent) {
   let r = state.ledger[agent];
   if (!r) {
-    r = { balanceMicro: 0, created: null, frozen: false };
+    r = { balanceMicro: 0, created: null, frozen: false, epoch: 0 };
     state.ledger[agent] = r;
   }
   return r;
@@ -250,7 +250,15 @@ export function applyEvent(state, ev, prices) {
       break;
     }
     case 'admin.freeze': {
-      row(state, ev.agent).frozen = !!ev.frozen;
+      const r = row(state, ev.agent);
+      r.frozen = !!ev.frozen;
+      // Freezing must also kill live sessions, not just future requests.
+      if (r.frozen) r.epoch = (r.epoch || 0) + 1;
+      break;
+    }
+    case 'session.revoke': {
+      const r = row(state, ev.agent);
+      r.epoch = (r.epoch || 0) + 1;
       break;
     }
     case 'admin.hide': {
@@ -292,7 +300,7 @@ export function createStore({ dir, log, prices }) {
       throw new Error(
         `markets: ${snapFile} is corrupt (${err.message}). Refusing to boot rather than `
         + `silently resetting every balance — restore ${bakFile}, or delete the snapshot to `
-        + `rebuild from ${journalFile}.`,
+        + `rebuild by replaying every journal segment (journal.jsonl plus any journal.<seq>.jsonl).`,
       );
     }
     if (!snap || typeof snap !== 'object' || !snap.ledger || !snap.markets) {
@@ -307,54 +315,72 @@ export function createStore({ dir, log, prices }) {
     for (const m of Object.values(state.markets)) m.positions = dict(m.positions);
   }
 
-  // ---- replay the journal tail (everything after the snapshot)
+  // ---- replay the journal (every segment, in sequence order)
   //
-  // A torn FINAL line is the normal crash signature — an append
-  // interrupted mid-write — and is safe to drop, because that event was
-  // never acknowledged to a client. But it must also be TRUNCATED away
-  // before we append again: reopening in 'a' mode over a fragment welds
-  // the next (acknowledged, fsync'd) event onto the partial line, so the
-  // next boot drops a real event, reuses its seq, and silently loses a
-  // credit movement. `goodBytes` tracks the end of the last complete
-  // line so the file can be cut back to it.
+  // Rotation retires `journal.jsonl` to `journal.<seq>.jsonl`, so the live
+  // file alone is NOT the ledger. Replaying only the live file meant that
+  // deleting a corrupt snapshot — which is exactly what the boot error
+  // used to advise — silently produced a brand-new empty ledger with
+  // every balance at zero and no warning at all. Recovery reads every
+  // segment.
+  //
+  // A torn FINAL line in the LIVE segment is the normal crash signature —
+  // an append interrupted mid-write — and is safe to drop, because that
+  // event was never acknowledged to a client. But it must also be
+  // TRUNCATED away before appending again: reopening in 'a' mode over a
+  // fragment welds the next (acknowledged, fsync'd) event onto the
+  // partial line, so the next boot drops a real event and reuses its seq.
+  const segments = fs.existsSync(dir)
+    ? fs.readdirSync(dir)
+      .map((f) => /^journal\.(\d+)\.jsonl$/.exec(f))
+      .filter(Boolean)
+      .map((m) => ({ file: path.join(dir, m[0]), seq: Number(m[1]) }))
+      .sort((a, b) => a.seq - b.seq)
+      .map((x) => x.file)
+    : [];
+  const files = [...segments, journalFile].filter((f) => fs.existsSync(f));
+
   let replayed = 0;
   let torn = false;
   let goodBytes = 0;
-  if (fs.existsSync(journalFile)) {
-    const lines = fs.readFileSync(journalFile, 'utf8').split('\n');
+  for (const file of files) {
+    const isLive = file === journalFile;
+    const lines = fs.readFileSync(file, 'utf8').split('\n');
+    // O(1) "is this the final content line?" — the previous O(n) slice
+    // per line made boot quadratic (100k events ≈ 5.4s of blocked boot).
+    let lastContent = -1;
+    for (let i = lines.length - 1; i >= 0; i--) { if (lines[i]) { lastContent = i; break; } }
+    if (isLive) goodBytes = 0;
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
-      const trailing = lines.slice(i + 1).every((l) => l === '');
-      if (!line) { if (i < lines.length - 1) goodBytes += 1; continue; }
+      if (!line) { if (isLive && i < lines.length - 1) goodBytes += 1; continue; }
       let ev;
       try {
         ev = JSON.parse(line);
       } catch (err) {
-        // Only a genuinely final fragment can be a torn write; anything
-        // earlier means the audit trail itself has been damaged.
-        if (trailing) {
+        if (isLive && i === lastContent) {
           log.warn(`markets: dropping torn final journal line and truncating to ${goodBytes} bytes (${err.message})`);
           torn = true;
           break;
         }
-        throw new Error(`markets: ${journalFile} is corrupt at a non-final line: ${err.message}`);
+        throw new Error(`markets: ${file} is corrupt at a non-final line: ${err.message}`);
       }
-      goodBytes += Buffer.byteLength(line, 'utf8') + (i < lines.length - 1 ? 1 : 0);
+      if (isLive) goodBytes += Buffer.byteLength(line, 'utf8') + (i < lines.length - 1 ? 1 : 0);
       if (ev.seq <= state.seq) continue;
-      // Contiguity check: an excised or reordered middle line means the
-      // audit trail has been tampered with or truncated. Replaying past
-      // a gap would silently produce a state nobody can account for.
+      // Contiguity: an excised or reordered line means the audit trail has
+      // been tampered with or truncated. Replaying past a gap would
+      // silently produce a state nobody can account for.
       if (ev.seq !== state.seq + 1) {
         throw new Error(
-          `markets: journal gap at seq ${ev.seq} (expected ${state.seq + 1}) — the ledger cannot be `
-          + `reconstructed from a discontinuous journal; restore from backup`,
+          `markets: journal gap at seq ${ev.seq} (expected ${state.seq + 1}) in ${file} — the ledger `
+          + `cannot be reconstructed from a discontinuous journal; restore from backup`,
         );
       }
       applyEvent(state, ev, prices);
       replayed++;
     }
   }
-  if (replayed) log.info(`markets: replayed ${replayed} journal event(s) past snapshot seq ${state.seq - replayed}`);
+  if (replayed) log.info(`markets: replayed ${replayed} journal event(s) across ${files.length} segment(s)`);
   // Cut the fragment off BEFORE opening for append (see above).
   if (torn) fs.truncateSync(journalFile, goodBytes);
 
@@ -413,12 +439,15 @@ export function createStore({ dir, log, prices }) {
    * answer "what actually happened", not "what does state say now".
    */
   function eventsFor(agent, limit = 500) {
-    let lines;
-    try {
-      lines = fs.readFileSync(journalFile, 'utf8').split('\n');
-    } catch { return []; }
     const out = [];
-    for (const line of lines) {
+    // Every segment, oldest first: reading only the live journal returns
+    // an EMPTY history after the first rotation, and a confidently empty
+    // answer to "what happened to this account" is worse than an error.
+    const all = [];
+    for (const file of files) {
+      try { all.push(...fs.readFileSync(file, 'utf8').split('\n')); } catch { /* rotated away */ }
+    }
+    for (const line of all) {
       if (!line || !line.includes(agent)) continue; // cheap prefilter
       let ev;
       try { ev = JSON.parse(line); } catch { continue; }

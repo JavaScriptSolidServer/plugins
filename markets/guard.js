@@ -52,13 +52,19 @@ export function createSessions({ dir, ttlMs }) {
 
   const sign = (payload) => crypto.createHmac('sha256', secret).update(payload).digest();
 
-  function mint(agent) {
+  function mint(agent, epoch = 0) {
     const exp = Date.now() + ttlMs;
-    const payload = b64url(JSON.stringify({ agent, exp }));
+    const payload = b64url(JSON.stringify({ agent, exp, epoch }));
     return `v1.${payload}.${b64url(sign(payload))}`;
   }
 
-  /** @returns {string|null} the agent id, or null if absent/forged/expired */
+  /**
+   * @returns {{agent:string, exp:number, epoch:number}|null} the claims,
+   * or null if absent/forged/expired. The caller must still compare
+   * `epoch` against the agent's current epoch — that comparison is what
+   * makes sign-out, freeze and revoke actually terminate a session,
+   * since a self-verifying token is otherwise valid for its whole TTL.
+   */
   function verify(token) {
     if (typeof token !== 'string' || !token.startsWith('v1.')) return null;
     const [, payload, mac] = token.split('.');
@@ -72,7 +78,7 @@ export function createSessions({ dir, ttlMs }) {
       claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
     } catch { return null; }
     if (!claims.agent || typeof claims.exp !== 'number' || Date.now() > claims.exp) return null;
-    return claims.agent;
+    return { agent: claims.agent, exp: claims.exp, epoch: claims.epoch || 0 };
   }
 
   return { mint, verify, ttlMs };
@@ -91,13 +97,23 @@ export function createSessions({ dir, ttlMs }) {
  */
 export function isSameOrigin(request, ownOrigin) {
   const site = request.headers['sec-fetch-site'];
-  if (site) return site === 'same-origin' || site === 'none';
   const origin = request.headers.origin;
-  if (!origin) return true;
-  if (!ownOrigin) return false; // origin claimed but we can't verify it → refuse
-  try {
-    return new URL(origin).origin === new URL(ownOrigin).origin;
-  } catch { return false; }
+  // When both are present they must AGREE. Letting Sec-Fetch-Site alone
+  // decide makes the Origin check dead code and trusts any intermediary
+  // that rewrites headers.
+  if (site && !(site === 'same-origin' || site === 'none')) return false;
+  if (origin) {
+    if (!ownOrigin) return false; // an origin is claimed and we can't verify it
+    try {
+      if (new URL(origin).origin !== new URL(ownOrigin).origin) return false;
+    } catch { return false; }
+    return true;
+  }
+  // No Origin header: trust only an explicit same-origin/none fetch
+  // signal. A request with neither header is not a browser request, and
+  // the caller only reaches here when the credential is ambient — so
+  // refusing costs nothing and closes the header-stripping case.
+  return site === 'same-origin' || site === 'none';
 }
 
 /** True when the credential is ambient (cookie / TLS cert), i.e. a browser
