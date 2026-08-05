@@ -103,9 +103,6 @@ export function randomId(len = 8) {
   return s;
 }
 
-/** An agent id is a WebID (http/https URL) or a DID — the two shapes
- *  getAgent can ever return. Rejecting anything else at creation stops a
- *  typo'd oracle from being an unsatisfiable settlement condition. */
 /** A persistent per-deployment secret, created 0600 on first boot. */
 function readOrCreateSecret(file) {
   try {
@@ -117,6 +114,9 @@ function readOrCreateSecret(file) {
   }
 }
 
+/** An agent id is a WebID (http/https URL) or a DID — the two shapes
+ *  getAgent can ever return. Rejecting anything else at creation stops a
+ *  typo'd oracle from being an unsatisfiable settlement condition. */
 export function isAgentId(s) {
   if (typeof s !== 'string' || !s || s.length > 512) return false;
   if (s.startsWith('did:')) return /^did:[a-z0-9]+:[\w.:%-]+$/i.test(s);
@@ -735,11 +735,13 @@ export async function activate(api) {
     const oracle = body.oracle === undefined || body.oracle === '' ? agent : body.oracle;
     if (!isAgentId(oracle)) return err(reply, 400, 'oracle must be a WebID (http/https) or a did: identifier');
 
-    if (Object.keys(state.markets).length >= LIMITS.maxMarkets) return err(reply, 503, 'market cap reached');
-    const mine = Object.values(state.markets)
-      .filter((m) => m.creator === agent && m.status !== 'resolved' && m.status !== 'void').length;
-    if (mine >= LIMITS.maxMarketsPerAgent) {
-      return err(reply, 429, `you already have ${mine} unsettled markets (max ${LIMITS.maxMarketsPerAgent})`);
+    // Count only LIVE markets: counting settled ones would make the cap
+    // a permanent ceiling on markets ever created, not on markets open.
+    const live = Object.values(state.markets).filter((x) => x.status !== 'resolved' && x.status !== 'void');
+    if (live.length >= LIMITS.maxMarkets) return err(reply, 503, 'too many open markets; try again later');
+    const ownLive = live.filter((x) => x.creator === agent).length;
+    if (ownLive >= LIMITS.maxMarketsPerAgent) {
+      return err(reply, 429, `you already have ${ownLive} unsettled markets (max ${LIMITS.maxMarketsPerAgent})`);
     }
 
     const bMicro = Math.round(b * MICRO);
@@ -753,6 +755,7 @@ export async function activate(api) {
     while (state.markets[id]) id = randomId();
     store.commit({
       type: 'market.create',
+      seedPrices: uniformPrices(outcomes.length),
       market: {
         id,
         title,
@@ -895,10 +898,15 @@ export async function activate(api) {
       }
     }
 
+    // The post-trade price vector, computed here and journalled, so
+    // replay never has to recompute a float (see store.js).
+    const qAfter = m.q.slice();
+    qAfter[t.outcome] += t.side === 'buy' ? t.sharesMicro : -t.sharesMicro;
     store.commit({
       type: 'trade',
       marketId: m.id,
       agent,
+      pricesAfter: lmsrPrices(qAfter, m.bMicro),
       side: t.side,
       outcome: t.outcome,
       sharesMicro: t.sharesMicro,

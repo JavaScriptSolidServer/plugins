@@ -16,9 +16,12 @@
 //      O(entire state) per mutation. An append is O(event).
 //
 // Recovery = load the snapshot, replay journal entries with seq >
-// snapshot.seq. Because every amount is RECORDED in its event (never
-// recomputed at replay), replay is deterministic even though pricing is
-// float: the reducer does bookkeeping, not arithmetic decisions.
+// snapshot.seq. Every amount AND every price vector is RECORDED in its
+// event, never recomputed at replay, so recovery is deterministic even
+// though pricing is float: the reducer does bookkeeping, not arithmetic.
+// (Recomputing would be subtly wrong, not merely wasteful — Math.exp is
+// implementation-defined precision, and the void TWAP is integrated over
+// the recorded price path.)
 //
 // Corruption is a BOOT FAILURE, never a silent reset (AGENT.md: "fail
 // loudly"). A truncated snapshot that reset to {} would erase every
@@ -139,7 +142,9 @@ export function applyEvent(state, ev, prices) {
       // starts at its first trade has a TWAP equal to the post-trade
       // price, which is precisely the void front-run the TWAP exists to
       // stop. (Caught by the pump-and-void regression test.)
-      if (!m.history || !m.history.length) m.history = [{ t: ev.t, p: prices(m.q, m.bMicro) }];
+      if (!m.history || !m.history.length) {
+        m.history = [{ t: ev.t, p: ev.seedPrices || prices(m.q, m.bMicro) }];
+      }
       state.markets[m.id] = m;
       row(state, m.creator).balanceMicro -= m.subsidyMicro;
       break;
@@ -170,7 +175,12 @@ export function applyEvent(state, ev, prices) {
       m.feesMicro += ev.feeMicro;
       m.volumeMicro += ev.sharesMicro;
       m.trades += 1;
-      m.history.push({ t: ev.t, p: prices(m.q, m.bMicro) });
+      // Use the price vector RECORDED with the event, not a fresh
+      // softmax: Math.exp is implementation-defined precision, so
+      // recomputing at replay could drift the price path across
+      // machines or libm versions — and the void TWAP is computed from
+      // that path, so drift would change what a market pays out.
+      m.history.push({ t: ev.t, p: ev.pricesAfter || prices(m.q, m.bMicro) });
       compactHistory(m.history, ev.t);
       break;
     }
