@@ -214,6 +214,12 @@ export function renderUi(prefix) {
   const COLORS = ['#0f7d5c','#97a09c','#b45309','#1d4ed8','#7c3aed','#0e7490',
                   '#a21caf','#4d7c0f','#b91c1c','#334155','#9a3412','#115e59'];
   let me = null, current = null, pick = 0, tab = 'open', cursor = null, quoteSeq = 0, lastQuote = null;
+  // One key per BET INTENT. Minting it per click defeats the point: the
+  // case idempotency exists for is the user retrying after a timeout,
+  // and a fresh key on the retry executes a second trade. It is renewed
+  // when the intent changes (stake or outcome) or after one succeeds.
+  let betKey = null;
+  const newIntent = () => { betKey = null; };
 
   async function api(path, opts = {}) {
     const res = await fetch(API + path, {
@@ -318,8 +324,9 @@ export function renderUi(prefix) {
           const cls = p.unrealizedPnl >= 0 ? 'up' : 'down';
           const sign = p.unrealizedPnl >= 0 ? '+' : '';
           return '<tr><td><a href="#m/' + esc(p.market) + '">' + esc(p.title) + '</a>'
-            + '<div class="meta">' + p.shares.map((s, i) => s > 0
-                ? cr(s) + ' × ' + esc(p.outcomes[i]) + ' @ ' + pct(p.prices[i]) : '').filter(Boolean).join(' · ')
+            + '<div class="meta">' + p.shares.map((s, i) => (s > 0
+                ? cr(s) + ' × ' + esc(p.outcomes[i]) + ' — in at ' + pct(p.cost[i] / s)
+                  + ', now ' + pct(p.prices[i]) : '')).filter(Boolean).join(' · ')
             + '</div></td>'
             + '<td class="num">' + cr(p.totalValue) + '</td>'
             + '<td class="num"><span class="pnl ' + cls + '">' + sign + cr(p.unrealizedPnl) + '</span></td>'
@@ -333,11 +340,14 @@ export function renderUi(prefix) {
     }
     const s = $('settled');
     s.innerHTML = me.settlements.length
-      ? '<table><tbody>' + me.settlements.slice(0, 10).map((x) =>
-          '<tr><td>' + esc(x.title) + '<div class="meta">' + esc(x.status)
-          + (x.outcome != null ? '' : ' (voided)') + ' · ' + new Date(x.at).toLocaleString() + '</div></td>'
-          + '<td class="num"><span class="pnl ' + (x.payout > 0 ? 'up' : 'down') + '">+'
-          + cr(x.payout) + '</span></td></tr>').join('') + '</tbody></table>'
+      ? '<table><tbody>' + me.settlements.slice(0, 10).map((x) => {
+          const net = x.net === undefined ? x.payout : x.net;
+          return '<tr><td>' + esc(x.title) + '<div class="meta">' + esc(x.status)
+            + (x.outcome == null ? ' (voided)' : '') + ' · staked ' + cr(x.cost || 0)
+            + ' · returned ' + cr(x.payout) + ' · ' + new Date(x.at).toLocaleString() + '</div></td>'
+            + '<td class="num"><span class="pnl ' + (net >= 0 ? 'up' : 'down') + '">'
+            + (net >= 0 ? '+' : '') + cr(net) + '</span></td></tr>';
+        }).join('') + '</tbody></table>'
       : '<span class="hint">nothing settled yet</span>';
   }
 
@@ -426,7 +436,8 @@ export function renderUi(prefix) {
     $('d-meta').innerHTML = '<span class="status ' + esc(m.status) + '">' + esc(m.status) + '</span>'
       + (m.status === 'resolved' && m.resolvedOutcome != null ? ' → <b>' + esc(m.outcomes[m.resolvedOutcome]) + '</b>' : '')
       + (m.status === 'resolving' ? ' → <b>' + esc(m.outcomes[m.resolvedOutcome]) + '</b> · settles ' + new Date(m.settleAt).toLocaleTimeString() + ' (disputable)' : '')
-      + ' · ' + (m.tradable ? countdown(m.closesAt) : 'closed ' + new Date(m.closesAt).toLocaleString())
+      + ' · <span id="d-countdown">' + (m.tradable ? countdown(m.closesAt)
+        : 'closed ' + new Date(m.closesAt).toLocaleString()) + '</span>'
       + ' · pool ' + cr(m.liquidity) + ' · ' + m.trades + ' trades'
       + (m.description ? '<br>' + esc(m.description) : '');
     priceBar($('d-bar'), m.outcomes, m.prices);
@@ -439,7 +450,7 @@ export function renderUi(prefix) {
       + '<span class="px">' + pct(m.prices[i]) + ' · ' + (1 / Math.max(m.prices[i], 1e-6)).toFixed(2) + '</span>'
       + '</button>').join('');
     $('d-outcomes').querySelectorAll('.out-btn').forEach((b) => {
-      b.onclick = () => { pick = Number(b.dataset.i); renderDetail(m.id, true); };
+      b.onclick = () => { pick = Number(b.dataset.i); newIntent(); renderDetail(m.id, true); };
     });
     $('t-pick').textContent = m.outcomes[pick];
 
@@ -510,11 +521,13 @@ export function renderUi(prefix) {
     $('t-msg').textContent = ''; $('t-msg').className = 'msg';
     $('t-buy').disabled = true;
     try {
+      if (!betKey) betKey = uid();
       const r = await api('/markets/' + current.id + '/trade', {
         method: 'POST',
-        headers: { 'idempotency-key': uid() },
+        headers: { 'idempotency-key': betKey },
         body: JSON.stringify({ side: 'buy', outcome: pick, spend: Number($('t-stake').value), maxCost: lastQuote.total * 1.02 }),
       });
+      betKey = null; // that intent is spent; the next bet is a new one
       toast('Bet placed — ' + cr(r.shares) + ' × ' + r.outcomeLabel + ' to win ' + cr(r.toWin));
       await refreshMe(); await renderDetail(current.id, true);
     } catch (e) {
@@ -563,7 +576,7 @@ export function renderUi(prefix) {
   let searchTimer;
   $('search').oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { cursor = null; renderList(); }, 250); };
   let quoteTimer;
-  $('t-stake').oninput = () => { clearTimeout(quoteTimer); quoteTimer = setTimeout(quote, 220); };
+  $('t-stake').oninput = () => { newIntent(); clearTimeout(quoteTimer); quoteTimer = setTimeout(quote, 220); };
   document.querySelectorAll('[data-stake]').forEach((b) => {
     b.onclick = () => {
       $('t-stake').value = b.dataset.stake === 'max' ? Math.floor((me ? me.balance : 0) * 100) / 100 : b.dataset.stake;
@@ -572,9 +585,15 @@ export function renderUi(prefix) {
   });
   $('o-resolve').onclick = () => {
     const i = Number($('o-outcome').value);
-    act('resolve', { outcome: i },
-      'Resolve "' + current.title + '" as "' + current.outcomes[i] + '"?\\n\\n'
-      + 'This pays out the whole pool after the dispute window. It cannot be undone.');
+    const label = current.outcomes[i];
+    // Typed confirmation, not a one-click OK: this pays out the entire
+    // pool and there is no undo.
+    const typed = prompt('Resolve "' + current.title + '" as "' + label + '".\\n\\n'
+      + 'This pays out the whole pool after the dispute window and cannot be undone.\\n'
+      + 'Type the winning outcome to confirm:');
+    if (typed === null) return;
+    if (typed.trim().toLowerCase() !== label.toLowerCase()) { toast('Not resolved — that did not match "' + label + '"'); return; }
+    act('resolve', { outcome: i });
   };
   $('o-void').onclick = () => act('void', {}, 'Void this market? Every share is redeemed at the average price over the window before close.');
   $('o-close').onclick = () => act('close', {});
@@ -633,7 +652,16 @@ export function renderUi(prefix) {
     };
   }
   connect();
-  setInterval(() => { if (current) { const el = $('d-meta'); if (el && current.tradable) renderDetail(current.id, true); } }, 30000);
+  // Tick the countdown locally every second; only re-fetch when the
+  // market actually crosses its close time and the UI must change state.
+  setInterval(() => {
+    if (!current || !current.tradable) return;
+    const el = $('d-countdown');
+    if (!el) return;
+    const left = new Date(current.closesAt).getTime() - Date.now();
+    if (left <= 0) renderDetail(current.id, true);
+    else el.textContent = countdown(current.closesAt);
+  }, 1000);
   escrowPreview();
   refreshMe(true).then(route);
 })();

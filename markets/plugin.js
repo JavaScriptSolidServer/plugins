@@ -683,7 +683,13 @@ export async function activate(api) {
       });
     }
     const settlements = (state.settlements[agent] || []).slice(-25).reverse()
-      .map((s) => ({ ...s, payout: s.payout / MICRO, at: new Date(s.at).toISOString() }));
+      .map((s) => ({
+        ...s,
+        payout: s.payout / MICRO,
+        cost: (s.cost || 0) / MICRO,
+        net: (s.payout - (s.cost || 0)) / MICRO,
+        at: new Date(s.at).toISOString(),
+      }));
     return reply.send({
       agent,
       balance: balanceOf(agent) / MICRO,

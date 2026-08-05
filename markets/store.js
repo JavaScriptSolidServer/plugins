@@ -215,14 +215,23 @@ export function applyEvent(state, ev, prices) {
     }
     case 'market.settle': {
       const m = state.markets[ev.marketId];
-      for (const [agent, micro] of Object.entries(ev.payouts)) {
-        row(state, agent).balanceMicro += micro;
+      // Everyone who HELD is given a receipt, not only those who were
+      // paid: "you lost 12.40 on this" is the settlement a bettor most
+      // needs to see, and a payout-only list silently drops it.
+      const holders = new Set([...Object.keys(ev.payouts), ...Object.keys(m.positions)]);
+      for (const agent of holders) {
+        const micro = ev.payouts[agent] || 0;
+        if (micro) row(state, agent).balanceMicro += micro;
+        const pos = m.positions[agent];
+        if (!micro && !(pos && pos.shares.some((x) => x !== 0))) continue;
         pushSettlement(state, agent, {
           market: m.id,
           title: m.title,
           status: ev.status,
           outcome: ev.status === 'resolved' ? m.resolvedOutcome : null,
           payout: micro,
+          // Cost basis of what was held, so the receipt can show net P&L.
+          cost: pos ? pos.costMicro.reduce((a, x) => a + x, 0) : 0,
           at: ev.t,
         });
       }
