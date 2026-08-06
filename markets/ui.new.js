@@ -39,11 +39,9 @@ export function renderUi(prefix) {
     /* brand + semantics. up/down are P&L ONLY, never a button. */
     --accent:#0b6b4f; --accent-ink:#ffffff; --accent-tint:rgba(11,107,79,.08);
     --up:#0f7d5c; --down:#b3261e; --live:#b3261e;
-    /* outcome palette — no grey, no brand green, and every one of these
-       carries --on-outcome text at 11px/600 above 4.5:1 */
-    --o1:#2563eb; --o2:#b45309; --o3:#7c3aed;
-    --o4:#0e7490; --o5:#be123c; --o6:#4d7c0f;
-    --on-outcome:#ffffff;
+    /* outcome palette — no grey, all AA on white at 11px/600 */
+    --o1:#0f7d5c; --o2:#2563eb; --o3:#b45309;
+    --o4:#7c3aed; --o5:#0891b2; --o6:#be123c;
     /* 4px spacing scale */
     --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s6:24px; --s8:32px; --s12:48px;
     /* type scale */
@@ -61,12 +59,8 @@ export function renderUi(prefix) {
       --ink:#e9efeb; --ink2:#a9b6af; --ink3:#8b9891;
       --accent:#2f9d78; --accent-ink:#06120d; --accent-tint:rgba(47,157,120,.14);
       --up:#3fbf94; --down:#f0685f; --live:#f0685f;
-      /* dark fills are LIGHTER, so white-on-fill inverts to dark ink —
-         white measured 2.4–3.4:1 on these, worse than the swatch that
-         failed round 1. */
-      --o1:#6ea8fe; --o2:#e08a3c; --o3:#a98bff;
-      --o4:#35b3cc; --o5:#f2708c; --o6:#9bc44e;
-      --on-outcome:#08110d;
+      --o1:#2f9d78; --o2:#6ea8fe; --o3:#e08a3c;
+      --o4:#a98bff; --o5:#35b3cc; --o6:#f2708c;
       --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.28);
       --shadow-lift:0 8px 28px rgba(0,0,0,.45);
     }
@@ -163,8 +157,8 @@ export function renderUi(prefix) {
   .status{display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;
     letter-spacing:.08em;text-transform:uppercase;padding:3px 7px;border-radius:5px;white-space:nowrap}
   .status.open{color:var(--up);background:color-mix(in srgb, var(--up) 12%, transparent)}
-  .status.closed,.status.resolving,.status.voiding{color:var(--on-outcome);background:var(--live)}
-  .status.disputed{color:var(--on-outcome);background:var(--o3)}
+  .status.closed,.status.resolving,.status.voiding{color:#fff;background:var(--live)}
+  .status.disputed{color:#fff;background:var(--o4)}
   .status.resolved,.status.void{color:var(--ink3);background:color-mix(in srgb, var(--ink3) 14%, transparent)}
   .status .sd{width:6px;height:6px;border-radius:50%;background:currentColor}
   @media (prefers-reduced-motion: no-preference){
@@ -196,7 +190,7 @@ export function renderUi(prefix) {
   .oracle .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--t-meta)}
 
   .bar{display:flex;gap:2px;height:28px;border-radius:var(--r-bar);overflow:hidden;margin:var(--s3) 0}
-  .bar div{display:flex;align-items:center;padding-left:var(--s2);color:var(--on-outcome);
+  .bar div{display:flex;align-items:center;padding-left:var(--s2);color:#fff;
     font-size:var(--t-micro);font-weight:600;overflow:hidden;white-space:nowrap;min-width:3px}
   .spark{width:100%;height:140px;display:block;margin:var(--s4) 0}
 
@@ -224,7 +218,7 @@ export function renderUi(prefix) {
     color:var(--accent);font-weight:700}
   .payout{display:flex;align-items:center;gap:var(--s6);margin:var(--s4) 0 var(--s2)}
   .payout .sep{width:1px;align-self:stretch;background:var(--line);flex:none}
-  .payout .big{font-size:28px;font-weight:700;line-height:1.1}
+  .payout .big{font-size:var(--t-hero);font-weight:700;line-height:1.1}
   .payout .unit{font-size:var(--t-body);font-weight:500;color:var(--ink2);margin-left:6px}
   .payout .odds{font-size:20px;font-weight:600;color:var(--ink2);line-height:1.1}
   .profit{color:var(--up);font-size:var(--t-meta);font-weight:600}
@@ -239,9 +233,8 @@ export function renderUi(prefix) {
     border:1px solid var(--accent);border-radius:var(--r-bar);padding:var(--s2) var(--s3);
     margin-top:var(--s2);font-weight:600;font-size:var(--t-meta)}
   .lost{color:var(--ink3);text-decoration:line-through}
-  .youre-in{font-size:var(--t-micro);font-weight:700;padding:2px 6px;border-radius:5px}
-  .youre-in.up{background:color-mix(in srgb, var(--up) 12%, transparent);color:var(--up)}
-  .youre-in.down{background:color-mix(in srgb, var(--down) 12%, transparent);color:var(--down)}
+  .youre-in{font-size:var(--t-micro);font-weight:700;padding:2px 6px;border-radius:5px;
+    background:var(--accent-tint);color:var(--accent)}
 
   /* ---------- tables ---------- */
   table{width:100%;border-collapse:collapse;font-size:var(--t-meta)}
@@ -265,32 +258,17 @@ export function renderUi(prefix) {
   .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:var(--s6);z-index:60;
     background:var(--ink);color:var(--surface);padding:12px 16px;border-radius:var(--r-card);
     font-size:var(--t-body);box-shadow:var(--shadow-lift);max-width:92vw}
-  details>summary{list-style:none}
-  details>summary::-webkit-details-marker{display:none}
-  details>summary::before{content:"+ ";color:var(--accent);font-weight:700}
-  details[open]>summary::before{content:"\\2212 "}
   footer{max-width:1200px;margin:0 auto;padding:var(--s6) var(--s4) var(--s12);
     color:var(--ink3);font-size:var(--t-meta);border-top:1px solid var(--line)}
   .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
   .skip{position:absolute;left:-9999px}
   .skip:focus{left:var(--s4);top:8px;z-index:50;background:var(--card);padding:8px 12px;
     border-radius:var(--r-ctl);border:1px solid var(--accent)}
-  /* Below the two-column breakpoint the ticket must come FIRST on a
-     market page — it was rendering after the chart and the position
-     table, i.e. two screens below the fold. */
-  @media (max-width:999px){
-    .cols{display:flex;flex-direction:column}
-    #detail-view .rail{order:-1}
-  }
-  @media (max-width:560px){
+  @media (max-width:520px){
     main{padding:var(--s3)}
     .mrow{margin:0 calc(-1 * var(--s3));padding:var(--s3)}
     .payout{gap:var(--s4)}
     .cash{width:100%}
-    /* the top bar was overflowing the viewport by ~40px */
-    .playpill,.livechip{display:none}
-    .brand span{display:none}
-    .stats{grid-template-columns:repeat(2,1fr)}
   }
 </style>
 </head>
@@ -301,7 +279,7 @@ export function renderUi(prefix) {
     <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true">
       <rect x="1" y="11" width="4.5" height="8" rx="1.5" fill="currentColor" opacity=".45"></rect>
       <rect x="7.75" y="6" width="4.5" height="13" rx="1.5" fill="currentColor" opacity=".7"></rect>
-      <rect x="14.5" y="1" width="4.5" height="18" rx="1.5" fill="var(--accent)"></rect>
+      <rect x="14.5" y="1" width="4.5" height="18" rx="1.5" fill="#0f7d5c"></rect>
     </svg>
     Markets
   </a>
@@ -466,8 +444,7 @@ export function renderUi(prefix) {
           </div>
           <div class="row">
             <label class="micro" for="t-stake">Risk</label>
-            <input id="t-stake" type="number" min="0" step="1" value="10"
-              style="flex:1;min-width:90px;font-size:28px;font-weight:700;text-align:right;min-height:56px">
+            <input id="t-stake" type="number" min="0" step="1" value="10" style="flex:1;min-width:90px">
             <span class="hint">credits</span>
           </div>
           <div class="stakes" id="t-chips" role="group" aria-label="Quick stake"></div>
@@ -577,10 +554,7 @@ export function renderUi(prefix) {
   // Named legend + ratio strip. A bar of coloured percentages with no
   // names is unreadable the moment there are more than two outcomes.
   function legendHtml(m, limit = 3) {
-    // Outcome order, NOT price order — the strip below is in outcome
-    // order, and two different orderings of the same colours read as a
-    // contradiction.
-    const idx = m.prices.map((p, i) => [p, i]);
+    const idx = m.prices.map((p, i) => [p, i]).sort((a, b) => b[0] - a[0]);
     const show = idx.slice(0, limit);
     const rest = idx.length - show.length;
     return '<div class="legend">' + show.map(([p, i]) =>
@@ -629,30 +603,28 @@ export function renderUi(prefix) {
 
   function renderMe() {
     const el = $('positions');
-    if (!me.positions.length) {
-      el.innerHTML = '<div class="empty">No open bets yet. Pick a market to place your first.</div>';
-    } else {
-      const totalVal = me.positions.reduce((a, p) => a + p.totalValue, 0);
-      const totalPnl = me.positions.reduce((a, p) => a + p.unrealizedPnl, 0);
-      el.innerHTML = '<div class="row" style="justify-content:space-between;align-items:baseline">'
-        + '<span><span class="micro">Open value</span> <b style="font-size:var(--t-title)">' + cr(totalVal) + '</b></span>'
-        + '<span class="pnl ' + (totalPnl >= 0 ? 'up' : 'down') + '">'
-        + (totalPnl >= 0 ? '+' : '') + cr(totalPnl) + '</span></div>'
-        + '<ul class="mlist">' + me.positions.map((p) => {
+    if (!me.positions.length) el.innerHTML = '<div class="empty">No open positions yet.</div>';
+    else {
+      el.innerHTML = '<table><thead><tr><th>Market</th><th class="num">Value</th><th class="num">P&amp;L</th><th></th></tr></thead><tbody>'
+        + me.positions.map((p) => {
           const cls = p.unrealizedPnl >= 0 ? 'up' : 'down';
           const sign = p.unrealizedPnl >= 0 ? '+' : '';
-          const on = p.shares.map((s, i) => (s > 0 ? p.outcomes[i] : null)).filter(Boolean);
-          return '<li><a class="mrow" href="#m/' + esc(p.market) + '" style="padding-left:0;padding-right:0;margin:0">'
-            + '<div class="row" style="margin:0;gap:var(--s2);justify-content:space-between;flex-wrap:nowrap">'
-            + '<span style="min-width:0"><span class="t" style="font-size:var(--t-meta);font-weight:600">'
-            + esc(p.title) + '</span>'
-            + '<div class="meta" style="margin-top:2px">' + esc(on.join(', '))
-            + '<span class="dot">·</span>worth ' + cr(p.totalValue) + '</div></span>'
-            + '<span class="pnl ' + cls + '" style="white-space:nowrap">' + sign + cr(p.unrealizedPnl)
-            + (p.totalCost > 0 ? '<div class="hint" style="text-align:right">' + sign
-                + (p.unrealizedPnl / p.totalCost * 100).toFixed(0) + '%</div>' : '')
-            + '</span></div></a></li>';
-        }).join('') + '</ul>';
+          return '<tr><td><a href="#m/' + esc(p.market) + '">' + esc(p.title) + '</a>'
+            + '<ul class="legs">' + p.shares.map((s, i) => (s > 0
+              ? '<li><i style="background:' + col(i) + '"></i><span class="nm">' + esc(p.outcomes[i]) + '</span>'
+                + '<span>risked ' + cr(p.cost[i]) + ' → returns <b>' + cr(s) + '</b></span></li>' : '')).join('')
+            + '</ul></td>'
+            + '<td class="num">' + cr(p.totalValue) + '</td>'
+            + '<td class="num"><span class="pnl ' + cls + '">' + sign + cr(p.unrealizedPnl) + '</span>'
+            + (p.totalCost > 0 ? '<div class="hint">' + sign
+                + (p.unrealizedPnl / p.totalCost * 100).toFixed(0) + '%</div>' : '') + '</td>'
+            + '<td class="num">' + (p.tradable ? p.shares.map((s, i) => (s > 0
+                ? '<button type="button" class="small cash cashout" data-m="' + esc(p.market) + '" data-i="' + i + '">Cash out '
+                  + esc(p.outcomes[i]) + '</button>' : '')).join(' ') : '') + '</td></tr>';
+        }).join('') + '</tbody></table>';
+      el.querySelectorAll('.cashout').forEach((b) => {
+        b.onclick = () => cashOut(b.dataset.m, Number(b.dataset.i));
+      });
     }
     const s = $('settled');
     s.innerHTML = me.settlements.length
@@ -790,8 +762,8 @@ export function renderUi(prefix) {
         + '<span class="dot">·</span>' + m.trades + ' bets'
         // Traded volume, not LMSR maker depth — "pool" read as a prize pot.
         + '<span class="dot">·</span>' + cr(m.volume) + ' traded'
-        + (mine ? '<span class="youre-in ' + (mine.unrealizedPnl >= 0 ? 'up' : 'down') + '">You\u2019re in '
-            + (mine.unrealizedPnl >= 0 ? '+' : '') + cr(mine.unrealizedPnl) + '</span>' : '')
+        + (mine ? '<span class="youre-in">You\u2019re in ' + (mine.unrealizedPnl >= 0 ? '+' : '')
+            + cr(mine.unrealizedPnl) + '</span>' : '')
         + '</div>'
         // A decided question has an answer, not three live probabilities.
         + (won != null && m.status === 'resolved'
@@ -806,13 +778,8 @@ export function renderUi(prefix) {
   }
 
   // -------------------------------------------------------------- detail
-  function sparkline(el, history, n, outcomes) {
-    // A FIXED viewBox letterboxes: the default xMidYMid meet drew 294px
-    // of content inside a 730px box with the axis labels marooned in the
-    // middle. Size the coordinate system to the element instead.
-    const W = Math.max(280, Math.round(el.clientWidth || 320));
-    const H = 140, PAD = 8, GUT = 30;
-    el.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  function sparkline(el, history, n) {
+    const W = 320, H = 140, PAD = 4;
     el.innerHTML = '<title id="spark-title">Price history</title>';
     const ns = 'http://www.w3.org/2000/svg';
     const add = (tag, attrs) => {
@@ -820,45 +787,17 @@ export function renderUi(prefix) {
       for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
       el.appendChild(e); return e;
     };
-    // Zero is pinned (a probability chart that doesn't start at 0 lies),
-    // but the TOP tracks the data — a fixed 0–100% ceiling squeezed three
-    // lines into 26% of the canvas on a market where nothing exceeds 45%.
-    const peak = history && history.length
-      ? Math.max(...history.map((h) => Math.max(...h.p))) : 1;
-    const top = Math.min(1, Math.max(0.4, Math.ceil((peak * 1.15) / 0.1) * 0.1));
-    const y = (p) => PAD + (1 - p / top) * (H - 2 * PAD - 14);
-    const ticks = [0, top / 2, top];
-    for (const frac of ticks) {
-      const yy = y(frac);
-      add('line', {
-        x1: GUT, y1: yy, x2: W, y2: yy,
-        stroke: 'var(--line)', 'stroke-width': 1,
-        'stroke-dasharray': frac === 0 ? '' : '2 4',
-      });
-      const t = add('text', { x: 0, y: yy + 4, fill: 'var(--ink3)', 'font-size': 10 });
-      t.textContent = Math.round(frac * 100) + '%';
+    // Fixed 0–100% domain with a 50% baseline: an auto-scaled axis makes
+    // a flat market look volatile.
+    for (const [frac, colr] of [[0.25, 'var(--line)'], [0.5, 'var(--line-strong)'], [0.75, 'var(--line)']]) {
+      const y = PAD + (1 - frac) * (H - 2 * PAD);
+      add('line', { x1: 0, y1: y, x2: W, y2: y, stroke: colr, 'stroke-width': 1, 'stroke-dasharray': frac === 0.5 ? '' : '3 3' });
     }
     if (!history || history.length < 2) return;
     const t0 = history[0].t, t1 = history[history.length - 1].t || (t0 + 1);
     const span = Math.max(1, t1 - t0);
-    const x = (t) => GUT + ((t - t0) / span) * (W - GUT - 4);
-    // An x axis: three dates, so "when" is answerable.
-    // Pick a resolution the span can actually distinguish, or all three
-    // ticks print the same clock time and the axis looks broken.
-    const fmt = (ms) => {
-      const d = new Date(ms);
-      const two = (x) => String(x).padStart(2, '0');
-      if (span > 36e5 * 36) return (d.getMonth() + 1) + '/' + d.getDate();
-      if (span > 6e4 * 10) return d.getHours() + ':' + two(d.getMinutes());
-      return d.getHours() + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds());
-    };
-    for (const f of [0, 0.5, 1]) {
-      const t = add('text', {
-        x: x(t0 + span * f), y: H - 2, fill: 'var(--ink3)', 'font-size': 10,
-        'text-anchor': f === 0 ? 'start' : f === 1 ? 'end' : 'middle',
-      });
-      t.textContent = fmt(t0 + span * f);
-    }
+    const x = (t) => ((t - t0) / span) * W;
+    const y = (p) => PAD + (1 - p) * (H - 2 * PAD);
     for (let k = 0; k < n; k++) {
       const pts = history.map((h) => x(h.t).toFixed(1) + ',' + y(h.p[k]).toFixed(1)).join(' ');
       add('polyline', {
@@ -867,7 +806,7 @@ export function renderUi(prefix) {
         'vector-effect': 'non-scaling-stroke', // else the stroke scales unevenly
       });
       const last = history[history.length - 1];
-      add('circle', { cx: x(last.t).toFixed(1), cy: y(last.p[k]).toFixed(1), r: 3.5, fill: col(k) });
+      add('circle', { cx: x(last.t).toFixed(1), cy: y(last.p[k]).toFixed(1), r: 3, fill: col(k) });
     }
   }
 
@@ -910,8 +849,8 @@ export function renderUi(prefix) {
     const isYou = me && me.agent === m.oracle;
     $('d-stats').innerHTML = [
       ['Closes', m.tradable ? countdown(m.closesAt) : new Date(m.closesAt).toLocaleString()],
-      ['Traded', cr(m.volume)],
-      ['Bets', String(m.trades)],
+      ['Pool', cr(m.liquidity)],
+      ['Trades', String(m.trades)],
       ['Oracle', oracleChip(m.oracle, isYou)],
     ].map(([k, v]) => '<div><span class="micro">' + k + '</span><span class="v">' + v + '</span></div>').join('');
 
@@ -920,20 +859,15 @@ export function renderUi(prefix) {
       + esc(m.outcomes[i]) + ' ' + pct(p) + '">' + (p >= 0.12 ? esc(m.outcomes[i]) + ' ' + pct(p) : '') + '</div>').join('');
     $('d-bar').setAttribute('aria-label',
       m.outcomes.map((o, i) => o + ' ' + pct(m.prices[i])).join(', '));
-    sparkline($('d-spark'), m.history, m.outcomes.length, m.outcomes);
-    $('d-spark').setAttribute('aria-label', 'Price history: '
-      + m.outcomes.map((o, i) => o + ' now ' + pct(m.prices[i])).join(', '));
+    sparkline($('d-spark'), m.history, m.outcomes.length);
 
     if (pick >= m.outcomes.length) pick = 0;
     const held = m.position ? m.position.shares : m.outcomes.map(() => 0);
     $('d-outcomes').innerHTML = m.outcomes.map((o, i) =>
       '<button type="button" class="out-btn" data-i="' + i + '" aria-pressed="' + (i === pick) + '" style="--oc:' + col(i) + '">'
-      + '<span class="nm">' + esc(o)
-      + (held[i] > 0 ? '<div class="meta" style="margin:0">you hold ' + cr(held[i]) + ' to win</div>' : '')
-      + '</span>'
+      + '<span class="nm">' + esc(o) + '</span>'
       + '<span class="pc">' + pct(m.prices[i]) + '</span>'
-      + '<span class="od">' + (1 / Math.max(m.prices[i], 1e-6)).toFixed(2)
-      + '<span class="sr"> decimal odds</span></span>'
+      + '<span class="od">' + (held[i] > 0 ? 'you: ' + cr(held[i]) : '') + '</span>'
       + '</button>').join('');
     $('d-outcomes').querySelectorAll('.out-btn').forEach((b) => {
       b.onclick = () => {
@@ -997,9 +931,9 @@ export function renderUi(prefix) {
       pd.innerHTML = '<h2>Your position</h2>'
         + '<table><tbody>' + pos.shares.map((s, i) => (s > 0
           ? '<tr><td><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:'
-            + col(i) + '"></i> <b>' + esc(m.outcomes[i]) + '</b>'
-            + '<div class="meta">risked ' + cr(pos.cost[i]) + '<span class="dot">→</span>returns '
-            + cr(s) + ' if right</div></td>'
+            + col(i) + '"></i> ' + cr(s) + ' × ' + esc(m.outcomes[i])
+            + '<div class="meta">in at ' + pct(pos.cost[i] / s) + '<span class="dot">·</span>now '
+            + pct(m.prices[i]) + '</div></td>'
             + '<td class="num">' + cr(pos.value[i])
             + '<div class="pnl ' + (pos.value[i] >= pos.cost[i] ? 'up' : 'down') + '">'
             + (pos.value[i] >= pos.cost[i] ? '+' : '') + cr(pos.value[i] - pos.cost[i]) + '</div></td>'
@@ -1076,7 +1010,7 @@ export function renderUi(prefix) {
       // The price you get is not the price on the button: an AMM moves
       // as you buy. Say so, rather than showing two different "odds".
       const spot = current.prices[pick];
-      const impact = q.avgPrice - spot; // percentage POINTS, not relative
+      const impact = q.avgPrice > 0 ? (q.avgPrice - spot) / Math.max(spot, 1e-9) : 0;
       $('t-oddsnote').textContent = 'fills at ' + pct(q.avgPrice) + ' (now ' + pct(spot) + ')';
 
       const ok = me && me.agent !== current.oracle && me.agent !== current.creator;
@@ -1088,7 +1022,7 @@ export function renderUi(prefix) {
         $('t-buy').textContent = 'Stake too large';
       } else {
         warn(impact > 0.05
-          ? 'Big stake: this bet itself moves the price from ' + pct(spot) + ' to ' + pct(q.avgPrice) + '.'
+          ? 'Heads up: this stake moves the price from ' + pct(spot) + ' to ' + pct(q.avgPrice) + '.'
           : '');
         $('t-buy').disabled = !(current.tradable && ok);
         $('t-buy').textContent = !me ? 'Sign in to bet'
@@ -1105,7 +1039,6 @@ export function renderUi(prefix) {
 
   function cancelSlip() {
     $('t-slip').classList.add('hidden');
-    $('t-detail').classList.remove('hidden');
     $('t-buy').classList.remove('hidden');
     if (slipTimer) { clearTimeout(slipTimer); slipTimer = null; }
   }
@@ -1117,8 +1050,9 @@ export function renderUi(prefix) {
     if (!lastQuote || !current) return;
     $('t-slip-copy').innerHTML = '<div class="lead">Risk ' + cr(lastQuote.total) + ' on '
       + esc(current.outcomes[pick]) + '</div>'
-      + '<div class="hint">You pay at most ' + cr(lastQuote.total * 1.02) + ' if the price moves.</div>';
-    $('t-detail').classList.add('hidden');
+      + '<div class="hint">Returns <b>' + cr(lastQuote.toWin) + '</b> if right (+'
+      + cr(lastQuote.profit) + ') · odds ' + (lastQuote.odds || 0).toFixed(2)
+      + ' · you pay at most ' + cr(lastQuote.total * 1.02) + '</div>';
     $('t-slip').classList.remove('hidden');
     $('t-buy').classList.add('hidden');
     $('t-confirm').focus();
