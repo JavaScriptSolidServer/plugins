@@ -1044,24 +1044,39 @@ export function renderUi(prefix) {
       // time anyone else traded.
       const legs = pos.shares.map((s, i) => (s > 0 ? i : -1)).filter((i) => i >= 0);
       const shape = m.id + ':' + legs.join(',');
+      // Toggle the up/down class, never ASSIGN className — assigning it
+      // dropped the v-pnl/v-total hooks this very function needs, so the
+      // next tick threw, froze every P&L figure, and (via an early
+      // return) skipped quote(), letting an armed slip advertise a
+      // payout 3.4x what it filled at.
+      const mark = (el, val) => {
+        el.classList.toggle('up', val >= 0);
+        el.classList.toggle('down', val < 0);
+      };
+      let inPlace = false;
       if (pd.dataset.shape === shape) {
-        legs.forEach((i) => {
-          const row = pd.querySelector('tr[data-i="' + i + '"]');
-          if (!row) return;
-          row.querySelector('.v-now').textContent = cr(pos.value[i]);
-          const d = row.querySelector('.v-pnl');
-          d.textContent = (pos.value[i] >= pos.cost[i] ? '+' : '') + cr(pos.value[i] - pos.cost[i]);
-          d.className = 'pnl ' + (pos.value[i] >= pos.cost[i] ? 'up' : 'down');
-        });
-        const tot = pd.querySelector('.v-total');
-        if (tot) {
+        try {
+          legs.forEach((i) => {
+            const row = pd.querySelector('tr[data-i="' + i + '"]');
+            const now = row && row.querySelector('.v-now');
+            const d = row && row.querySelector('.v-pnl');
+            if (!now || !d) throw new Error('position hooks missing');
+            now.textContent = cr(pos.value[i]);
+            d.textContent = (pos.value[i] >= pos.cost[i] ? '+' : '') + cr(pos.value[i] - pos.cost[i]);
+            mark(d, pos.value[i] - pos.cost[i]);
+          });
+          const tot = pd.querySelector('.v-total');
+          if (!tot) throw new Error('position total missing');
           tot.textContent = (pos.unrealizedPnl >= 0 ? '+' : '') + cr(pos.unrealizedPnl);
-          tot.className = 'pnl ' + (pos.unrealizedPnl >= 0 ? 'up' : 'down');
+          mark(tot, pos.unrealizedPnl);
+          const cost = pd.querySelector('.v-cost');
+          if (cost) cost.textContent = 'cost ' + cr(pos.totalCost) + ' · value ' + cr(pos.totalValue);
+          inPlace = true;
+        } catch {
+          inPlace = false; // fall through to a full rebuild rather than throw
         }
-        const cost = pd.querySelector('.v-cost');
-        if (cost) cost.textContent = 'cost ' + cr(pos.totalCost) + ' · value ' + cr(pos.totalValue);
-        return;
       }
+      if (!inPlace) {
       pd.dataset.shape = shape;
       pd.innerHTML = '<h2>Your position</h2>'
         + '<table><thead><tr><th>Bet</th><th class="num">Sell now for</th>'
@@ -1083,6 +1098,7 @@ export function renderUi(prefix) {
       pd.querySelectorAll('.sell-one').forEach((b) => {
         b.onclick = () => cashOut(m.id, Number(b.dataset.i));
       });
+      }
     } else { pd.classList.add('hidden'); pd.dataset.shape = ''; }
 
     $('oracle-card').classList.toggle('hidden', !(isYou && m.canResolve));
@@ -1196,6 +1212,7 @@ export function renderUi(prefix) {
     $('t-buy').classList.remove('hidden');
     if (slipTimer) { clearInterval(slipTimer); slipTimer = null; }
     $('t-countdown').innerHTML = '';   // so the next slip rebuilds it
+    $('t-slip-copy').innerHTML = '';   // don't keep the last market's wording
     // Never strand focus on a hidden control — Tab from there restarts
     // at the top of the document, mid-purchase.
     if (hadFocus) {
@@ -1307,6 +1324,7 @@ export function renderUi(prefix) {
     $('list-view').classList.remove('hidden');
     document.title = 'Markets — prediction markets on your pod';
     current = null; cursor = null; paged = false;
+    $('d-position').dataset.shape = '';
     cancelSlip();
     $('t-msg').textContent = ''; $('t-msg').className = 'msg';
     $('t-fill').textContent = '';
@@ -1467,7 +1485,9 @@ export function renderUi(prefix) {
     ws.onmessage = (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch { return; }
       if (current) {
-        if (msg.market && msg.market.id === current.id) schedule(() => renderDetail(current.id, true));
+        if (msg.market && msg.market.id === current.id) {
+          schedule(() => renderDetail(current.id, true).catch((e) => console.error('render', e)));
+        }
       } else if (!paged) schedule(() => renderList());
       if (msg.type === 'settle' && me) refreshMe();
     };
