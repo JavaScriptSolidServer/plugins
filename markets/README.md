@@ -30,6 +30,11 @@ Open `{prefix}/` for the UI; the JSON API is under `{prefix}/api`.
 | `POST /api/admin/{freeze,adjust,hide}` | operator plane (journalled) |
 | `WS {prefix}/ws` | `{market,trade,settle}` events |
 
+**Layout.** `lmsr.js` (AMM math + TWAP), `store.js` (journal, snapshot,
+reducer), `lifecycle.js` (the settlement state machine), `guard.js`
+(sessions, CSRF, rate limiting, headers), `ui.js`, `plugin.js` (policy +
+routes).
+
 ## The economics, in six lines
 
 - Money is integer micro-credits; **costs round up, payouts round down**,

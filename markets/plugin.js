@@ -7,8 +7,9 @@
 //                         admins: ['https://alice.example/profile/card#me'] } }]
 //
 // Layout: lmsr.js (the AMM math + TWAP), store.js (journal + snapshot +
-// reducer), guard.js (sessions, CSRF, rate limiting, headers), ui.js (the
-// trading UI), this file (policy + routes).
+// reducer), lifecycle.js (the settlement state machine), guard.js
+// (sessions, CSRF, rate limiting, headers), ui.js (the trading UI), this
+// file (policy + routes).
 //
 // MONEY. Integer micro-credits (1 credit = 1e6 micro). Costs round up,
 // proceeds and payouts round down, fees round up — every rounding
@@ -63,6 +64,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { lmsrPrices, tradeCostRaw, sharesForBudget, twapPrices, uniformPrices } from './lmsr.js';
 import { createStore, dict, TWAP_PROTECT_MS } from './store.js';
+import { createLifecycle } from './lifecycle.js';
 import {
   createSessions, createRateLimiter, isSameOrigin, isAmbientCredential, UI_HEADERS, API_HEADERS,
 } from './guard.js';
@@ -491,145 +493,16 @@ export async function activate(api) {
   }
 
   // ----------------------------------------------------------- lifecycle
-  /** Prices to redeem a voided market at: the TWAP over the window ending
-   *  at close (see the header — this is what kills the void front-run). */
-  function voidPrices(m) {
-    const endT = m.closedAt || Math.min(m.closesAt, Date.now());
-    return twapPrices(m.history, endT - twapWindowMs, endT, m.outcomes.length);
-  }
-
-  /**
-   * Compute and journal a settlement. Payouts are derived here, RECORDED
-   * in the event, and applied by the reducer — so replay never recomputes
-   * float arithmetic.
-   */
-  function settle(m, status, payoutMicroOf, prices, { adjudicatedBy = null, sustained = false, outcome = null } = {}) {
-    const pool = m.subsidyMicro + m.collectedMicro;
-    const raw = [];
-    let sum = 0;
-    for (const [agent, pos] of Object.entries(m.positions)) {
-      const v = Math.max(0, Math.floor(payoutMicroOf(pos)));
-      if (v > 0) { raw.push([agent, v]); sum += v; }
-    }
-    // Belt and braces: solvency is proved (lmsr.js), but if float drift
-    // ever put us over the pool, everyone takes the same haircut rather
-    // than the last claimant absorbing all of it.
-    let scale = 1;
-    if (sum > pool) {
-      scale = pool / sum;
-      api.log.error(`markets: ${m.id} conservation clamp — payouts ${sum} > pool ${pool}; pro-rata ${scale}`);
-    }
-    const payouts = {};
-    let paid = 0;
-    for (const [agent, v] of raw) {
-      const p = Math.floor(v * scale);
-      if (p > 0) { payouts[agent] = p; paid += p; }
-    }
-
-    // The creator may recover AT MOST what they escrowed. Anything left
-    // beyond that is other people's money and goes to the house — which
-    // is what makes "resolve to an outcome nobody holds" unprofitable.
-    const residual = pool - paid;
-    const creatorFromPool = Math.max(0, Math.min(residual, m.subsidyMicro));
-    const houseFromPool = residual - creatorFromPool;
-    const houseFee = Math.floor((m.feesMicro * houseFeeShareBps) / 10_000);
-    const creatorFee = m.feesMicro - houseFee;
-
-    // Dispute bonds return ONLY when an operator SUSTAINED the dispute —
-    // whether that meant voiding or re-resolving. Inferring it from a
-    // void status was wrong twice over: a re-resolution vindicates the
-    // disputer but isn't a void, and an unadjudicated grace-expiry void
-    // would hand the bond back for free.
-    const bondRefunds = {};
-    let bondToHouse = 0;
-    for (const d of m.disputes || []) {
-      if (!d.bondMicro) continue;
-      if (sustained) bondRefunds[d.agent] = (bondRefunds[d.agent] || 0) + d.bondMicro;
-      else bondToHouse += d.bondMicro;
-    }
-
-    store.commit({
-      type: 'market.settle',
-      marketId: m.id,
-      status,
-      // Journalled so replay reproduces the settled outcome. Assigning
-      // m.resolvedOutcome outside the reducer made the audit trail
-      // contradict the money after a restore.
-      outcome,
-      payouts,
-      bondRefunds,
-      creatorMicro: creatorFromPool + creatorFee,
-      houseMicro: houseFromPool + houseFee + bondToHouse,
-      house: HOUSE,
-      adjudicatedBy,
-      prices: prices ? prices.map((p) => Number(p.toFixed(6))) : null,
-    });
-    broadcast('settle', m);
-  }
-
-  const settleResolved = (m, opts = {}) => {
-    // An adjudicator may settle at a DIFFERENT outcome than the oracle
-    // declared; that corrected outcome rides in the event.
-    const outcome = opts.outcome ?? m.resolvedOutcome;
-    settle(m, 'resolved', (pos) => pos.shares[outcome], null, { ...opts, outcome });
-  };
-  // On a void you receive the LESSER of market value (at the TWAP) and
-  // what you actually paid. The cap is what finally kills the void
-  // arbitrage: the TWAP already defeats a last-second pump, but a
-  // *sustained* pump held across the whole window makes the TWAP equal
-  // the pumped price, and against a dead oracle that is a profitable
-  // grief funded by the creator's escrow. Capping at cost basis means no
-  // holder can ever exit a void for more than they put in, so pumping to
-  // be voided is never profitable at any hold duration. It only ever
-  // pays LESS than the TWAP, so conservation is strictly preserved.
-  const settleVoid = (m, opts) => {
-    const p = voidPrices(m);
-    settle(m, 'void',
-      (pos) => pos.shares.reduce((a, s, i) => a + Math.min(s * p[i], pos.costMicro[i]), 0),
-      p, opts);
-  };
-
-  /**
-   * Advance every market whose deadline has passed. Runs on a timer AND
-   * lazily before reads, so a settlement is never waiting on a tick.
-   *
-   * The auto-void arm is the DEAD-ORACLE BACKSTOP: a market whose oracle
-   * never acts (typo, abandoned, malicious) would otherwise lock every
-   * trader's credits forever, since trading also stops at close. After
-   * settlementWindow anyone's request advances it to a TWAP void.
-   */
-  // Settlement on the request path is bounded to once a second: a mass
-  // expiry otherwise turns an anonymous GET into a multi-second stall
-  // (one fsync per newly-due market).
-  let lastTick = 0;
-  function maybeTick() {
-    if (Date.now() - lastTick < 1000) return;
-    lastTick = Date.now();
-    tick();
-  }
-
-  function tick() {
-    const now = Date.now();
-    for (const m of Object.values(state.markets)) {
-      try {
-        if (m.status === 'resolving' && now >= m.settleAt) settleResolved(m);
-        else if (m.status === 'voiding' && now >= m.settleAt) settleVoid(m);
-        else if (m.status === 'open' && now >= m.closesAt + settlementWindowMs) {
-          api.log.warn(`markets: ${m.id} auto-voiding — no resolution within the settlement window`);
-          settleVoid(m);
-        } else if (m.status === 'disputed' && now >= (m.disputes[0].at + disputeGraceMs)) {
-          // Fall through to the ORACLE'S RESOLUTION, not to a void: an
-          // unadjudicated dispute must not be a way to cancel a bet you
-          // lost. The disputer forfeits their bond; a genuinely wrong
-          // resolution needs an admin to say so before the grace expires.
-          api.log.warn(`markets: ${m.id} dispute expired unadjudicated — the resolution stands`);
-          settleResolved(m);
-        }
-      } catch (e) {
-        api.log.error(`markets: tick failed for ${m.id}: ${e.message}`);
-      }
-    }
-  }
+  // The settlement state machine lives in lifecycle.js — see that file
+  // for why it is not inline here (a state change that skipped the
+  // reducer made the audit trail contradict the money).
+  const { voidPrices, settleResolved, settleVoid, tick, maybeTick } = createLifecycle({
+    state,
+    commit: store.commit,
+    broadcast: (type, m) => broadcast(type, m),
+    log: api.log,
+    cfg: { twapWindowMs, houseFeeShareBps, settlementWindowMs, disputeGraceMs, HOUSE },
+  });
 
   // --------------------------------------------------------- websocket
   const sockets = new Set();
