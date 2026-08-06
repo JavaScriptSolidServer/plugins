@@ -407,9 +407,17 @@ export function createStore({ dir, log, prices }) {
    * ledger ahead of the durable one (the old design mutated first and
    * 500'd after, leaving memory and disk permanently divergent).
    */
+  function reopenJournal() {
+    jfd = fs.openSync(journalFile, 'a');
+  }
+
   function commit(ev) {
     ev.seq = state.seq + 1;
     ev.t = ev.t || Date.now();
+    // A descriptor lost during rotation (or by anything else) must not
+    // wedge the ledger forever: recover it here rather than failing
+    // every trade and settlement from now on.
+    if (jfd === null) reopenJournal();
     const line = Buffer.from(`${JSON.stringify(ev)}\n`, 'utf8');
     let off = 0;
     while (off < line.length) off += fs.writeSync(jfd, line, off, line.length - off);
@@ -443,7 +451,11 @@ export function createStore({ dir, log, prices }) {
           // forever. Always get a working descriptor back.
           log.error(`markets: journal rotation failed: ${err.message}`);
         } finally {
-          jfd = fs.openSync(journalFile, 'a');
+          // If THIS throws, jfd stays null and commit() reopens lazily.
+          jfd = null;
+          try { reopenJournal(); } catch (err) {
+            log.error(`markets: could not reopen the journal after rotation: ${err.message}`);
+          }
         }
         log.info(`markets: rotated journal at seq ${state.seq} (prior segment retained for audit)`);
       }

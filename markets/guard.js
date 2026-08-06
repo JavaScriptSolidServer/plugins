@@ -40,6 +40,16 @@ const b64url = (buf) => Buffer.from(buf).toString('base64url');
  * only this plugin verifies them, so a stolen session token buys markets
  * access and nothing else on the pod.
  */
+// A session-signing key that was committed to this repo's history by a
+// test writing into the source tree. Removing the file from the working
+// tree is NOT remediation: the blob is still `git show`-able, so anyone
+// with the repo could forge a session token for any agent on any
+// deployment whose pluginDir was seeded from those commits. Refusing to
+// boot on it is the only mitigation a plugin can enforce by itself.
+const BURNED_SECRETS = new Set([
+  'c59b6df7144548b73d07746635c6774828bf8cc74af8febb8d2ce5db2699d277',
+]);
+
 export function createSessions({ dir, ttlMs }) {
   const secretFile = path.join(dir, 'session.secret');
   let secret;
@@ -48,6 +58,13 @@ export function createSessions({ dir, ttlMs }) {
   } catch {
     secret = crypto.randomBytes(32);
     fs.writeFileSync(secretFile, secret, { mode: 0o600 });
+  }
+  if (BURNED_SECRETS.has(crypto.createHash('sha256').update(secret).digest('hex'))) {
+    throw new Error(
+      `markets: ${secretFile} is a key that leaked into git history — anyone with the repository `
+      + 'can forge session tokens for any agent. Delete the file (a fresh key is generated on the '
+      + 'next boot; every existing session is invalidated, which is the point).',
+    );
   }
 
   const sign = (payload) => crypto.createHmac('sha256', secret).update(payload).digest();

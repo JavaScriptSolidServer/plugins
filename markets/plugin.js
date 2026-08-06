@@ -261,18 +261,32 @@ export async function activate(api) {
     return claims.agent;
   }
 
-  async function resolveAgent(request) {
+  /**
+   * @returns {Promise<{agent:string|null, ambient:boolean}>} `ambient` is
+   * true when the credential is one a browser attaches by itself — a
+   * cookie, or a WebID-TLS client certificate — i.e. one a cross-origin
+   * page could borrow without knowing it.
+   */
+  async function resolveAgentFull(request) {
     const cookie = cookieToken(request);
     if (cookie) {
       const agent = liveSession(cookie);
-      if (agent) return agent;
+      if (agent) return { agent, ambient: true };
     }
     const auth = request.headers.authorization;
     if (auth && auth.startsWith('Bearer v1.')) {
       const agent = liveSession(auth.slice(7));
-      if (agent) return agent;
+      if (agent) return { agent, ambient: false };
     }
-    return api.auth.getAgent(request);
+    const agent = await api.auth.getAgent(request);
+    // getAgent may have authenticated from an ambient TLS client
+    // certificate; only an explicit Authorization header proves the
+    // caller actually held a secret.
+    return { agent, ambient: agent ? !auth : false };
+  }
+
+  async function resolveAgent(request) {
+    return (await resolveAgentFull(request)).agent;
   }
 
   // ------------------------------------------------------------ replies
@@ -309,9 +323,9 @@ export async function activate(api) {
   async function authed(request, reply, { mutating = true } = {}) {
     // Resolve first so an anonymous caller gets a 401 rather than a
     // confusing 403; nothing is acted on before the CSRF check below.
-    const agent = await resolveAgent(request);
+    const { agent, ambient } = await resolveAgentFull(request);
     if (!agent) { err(reply, 401, 'authentication required'); return null; }
-    if (mutating && !csrfOk(request)) {
+    if (mutating && ambient && !isSameOrigin(request, originFor(request))) {
       err(reply, 403, 'cross-origin request refused — this endpoint is same-origin only');
       return null;
     }

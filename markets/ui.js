@@ -59,6 +59,7 @@ export function renderUi(prefix) {
   .status{font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em}
   .status.open{color:var(--up)} .status.closed{color:var(--ink3)}
   .status.resolving{color:var(--down)} .status.disputed{color:var(--bad)}
+  .status.voiding{color:var(--down)}
   .status.resolved{color:var(--accent)} .status.void{color:var(--bad)}
   table{width:100%;border-collapse:collapse;font-size:.85rem}
   td,th{padding:.45rem .4rem;border-bottom:1px solid var(--line);text-align:left}
@@ -530,6 +531,8 @@ export function renderUi(prefix) {
     $('d-meta').innerHTML = '<span class="status ' + esc(m.status) + '">' + esc(m.status) + '</span>'
       + (m.status === 'resolved' && m.resolvedOutcome != null ? ' → <b>' + esc(m.outcomes[m.resolvedOutcome]) + '</b>' : '')
       + (m.status === 'resolving' ? ' → <b>' + esc(m.outcomes[m.resolvedOutcome]) + '</b> · settles ' + new Date(m.settleAt).toLocaleTimeString() + ' (disputable)' : '')
+      + (m.status === 'voiding' ? ' → <b>void proposed</b> · settles ' + new Date(m.settleAt).toLocaleTimeString()
+        + ' — everyone is refunded at most what they paid, nobody wins (disputable)' : '')
       + ' · <span id="d-countdown">' + (m.tradable ? countdown(m.closesAt)
         : 'closed ' + new Date(m.closesAt).toLocaleString()) + '</span>'
       + ' · pool ' + cr(m.liquidity) + ' · ' + m.trades + ' trades'
@@ -590,13 +593,15 @@ export function renderUi(prefix) {
     const isOracle = me && (me.agent === m.oracle);
     $('oracle-row').classList.toggle('hidden', !(isOracle && m.canResolve));
     $('o-outcome').innerHTML = m.outcomes.map((o, i) => '<option value="' + i + '">' + esc(o) + '</option>').join('');
-    const canDispute = m.status === 'resolving' && pos;
+    const canDispute = (m.status === 'resolving' || m.status === 'voiding') && pos;
     $('dispute-row').classList.toggle('hidden', !canDispute);
     if (canDispute) {
       // State the bond, the stakes and the deadline BEFORE taking money.
       const bond = Math.max(25, pos.totalCost * 0.2);
-      $('dispute-copy').innerHTML = 'This market resolved as <b>' + esc(m.outcomes[m.resolvedOutcome])
-        + '</b>. Disputing stakes a bond of about <b>' + cr(bond) + ' credits</b>, which you '
+      $('dispute-copy').innerHTML = (m.status === 'voiding'
+        ? 'The oracle has proposed to <b>void</b> this market — nobody wins and you get back at most what you paid. '
+        : 'This market resolved as <b>' + esc(m.outcomes[m.resolvedOutcome]) + '</b>. ')
+        + 'Disputing stakes a bond of about <b>' + cr(bond) + ' credits</b>, which you '
         + '<b>lose</b> unless an operator agrees with you. '
         + (m.disputes ? m.disputes + ' dispute(s) already filed. ' : '')
         + 'If nobody adjudicates in time, the resolution stands.';
