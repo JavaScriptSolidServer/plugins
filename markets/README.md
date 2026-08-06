@@ -171,6 +171,24 @@ the walls point at.
   regression test for exactly this attack, and it caught a real bug: the
   price path was seeded with `m.history || [seed]`, and an empty array is
   truthy, so the TWAP degenerated to the post-pump spot price.
+- **A fix is a new attack surface: the state you add needs every branch
+  that reads the old state re-checked.** Making an oracle-initiated void a
+  *proposal* (so holders can object to a cancellation they can only lose
+  on) added a lifecycle state with no `resolvedOutcome`. Every settlement
+  path that assumed one then computed `shares[undefined]` → `NaN`, which
+  `Math.max(0, Math.floor(NaN))` turns into a silent zero: upholding a
+  disputed void paid every holder nothing and burned the pool to the
+  house, while conservation still balanced perfectly. Two lessons — a
+  payout that isn't a finite number must throw rather than floor, and an
+  adjudication verb ("uphold") means different things depending on what
+  was proposed.
+- **A guard clause that ignores lifecycle state is a guard on nothing.**
+  The dead-oracle backstop let *anyone* void an abandoned market past a
+  deadline — but `stale` was computed from timestamps alone, so a market
+  that had been correctly *resolved* and was merely past that deadline
+  could be voided by any loser, refunding their own losing bet with no
+  bond and no dispute, erasing the winner. The backstop exists for an
+  oracle that never acted; an oracle that acted is not dead.
 - **A state change that skips the reducer is a lie the audit trail tells
   later.** Adjudicating a wrong resolution assigned `m.resolvedOutcome`
   directly in the route handler and then settled. Payouts were correct
@@ -214,7 +232,7 @@ the walls point at.
 
 ## Tests
 
-`node --test --test-concurrency=1 markets/test.js` — 66 tests: LMSR and
+`node --test --test-concurrency=1 markets/test.js` — 69 tests: LMSR and
 TWAP math, session/CSRF/rate-limit units, hardened headers, cookie
 scoping, prototype-key ids, grants, escrow, stake-first quotes,
 quote↔trade parity, slippage guards (including the NaN-fails-closed case),

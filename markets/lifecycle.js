@@ -54,7 +54,14 @@ function settle(m, status, payoutMicroOf, prices, { adjudicatedBy = null, sustai
   const raw = [];
   let sum = 0;
   for (const [agent, pos] of Object.entries(m.positions)) {
-    const v = Math.max(0, Math.floor(payoutMicroOf(pos)));
+    const computed = payoutMicroOf(pos);
+    // A non-finite payout must be LOUD. Math.max(0, Math.floor(NaN)) is
+    // NaN and `if (v > 0)` is false, so a broken payout function paid
+    // every holder zero and burned the pool to the house in silence.
+    if (!Number.isFinite(computed)) {
+      throw new Error(`markets: ${m.id} computed a non-finite payout for ${agent} — refusing to settle`);
+    }
+    const v = Math.max(0, Math.floor(computed));
     if (v > 0) { raw.push([agent, v]); sum += v; }
   }
   // Belt and braces: solvency is proved (lmsr.js), but if float drift
@@ -117,6 +124,11 @@ const settleResolved = (m, opts = {}) => {
   // An adjudicator may settle at a DIFFERENT outcome than the oracle
   // declared; that corrected outcome rides in the event.
   const outcome = opts.outcome ?? m.resolvedOutcome;
+  // A disputed VOID PROPOSAL has no resolvedOutcome; resolving it would
+  // index shares[undefined] and pay every holder nothing.
+  if (!Number.isInteger(outcome)) {
+    throw new Error(`markets: ${m.id} has no resolved outcome to settle at`);
+  }
   settle(m, 'resolved', (pos) => pos.shares[outcome], null, { ...opts, outcome });
 };
 // On a void you receive the LESSER of market value (at the TWAP) and
@@ -154,28 +166,40 @@ function maybeTick() {
   tick();
 }
 
+function tickOne(m, now = Date.now()) {
+  if (m.status === 'resolving' && now >= m.settleAt) settleResolved(m);
+  else if (m.status === 'voiding' && now >= m.settleAt) settleVoid(m);
+  else if (m.status === 'open' && now >= m.closesAt + settlementWindowMs) {
+    log.warn(`markets: ${m.id} auto-voiding — no resolution within the settlement window`);
+    settleVoid(m);
+  } else if (m.status === 'disputed'
+    // Anchor to the LATEST dispute: anchoring to the first gave a
+    // late disputer a truncated window and took a bond that could
+    // never be heard.
+    && now >= (m.disputes[m.disputes.length - 1].at + disputeGraceMs)) {
+    // Fall through to WHAT THE ORACLE PROPOSED — a resolution if
+    // there was one, otherwise the void it proposed. An unadjudicated
+    // dispute must not cancel a bet you lost, and must not invent a
+    // resolution that never existed.
+    log.warn(`markets: ${m.id} dispute expired unadjudicated — the oracle's call stands`);
+    if (Number.isInteger(m.resolvedOutcome)) settleResolved(m);
+    else settleVoid(m);
+  }
+}
+
 function tick() {
   const now = Date.now();
   for (const m of Object.values(state.markets)) {
     try {
-      if (m.status === 'resolving' && now >= m.settleAt) settleResolved(m);
-      else if (m.status === 'voiding' && now >= m.settleAt) settleVoid(m);
-      else if (m.status === 'open' && now >= m.closesAt + settlementWindowMs) {
-        log.warn(`markets: ${m.id} auto-voiding — no resolution within the settlement window`);
-        settleVoid(m);
-      } else if (m.status === 'disputed' && now >= (m.disputes[0].at + disputeGraceMs)) {
-        // Fall through to the ORACLE'S RESOLUTION, not to a void: an
-        // unadjudicated dispute must not be a way to cancel a bet you
-        // lost. The disputer forfeits their bond; a genuinely wrong
-        // resolution needs an admin to say so before the grace expires.
-        log.warn(`markets: ${m.id} dispute expired unadjudicated — the resolution stands`);
-        settleResolved(m);
-      }
+      tickOne(m, now);
     } catch (e) {
+      // Isolate one bad market — but a systematic failure (a broken
+      // dependency, say) silently stalls EVERY settlement, so this is
+      // logged at error level and never swallowed quietly.
       log.error(`markets: tick failed for ${m.id}: ${e.message}`);
     }
   }
 }
 
-  return { voidPrices, settle, settleResolved, settleVoid, tick, maybeTick };
+  return { voidPrices, settle, settleResolved, settleVoid, tick, tickOne, maybeTick };
 }

@@ -137,13 +137,15 @@ describe('markets plugin', () => {
   });
 
   it('guard: rate limiter refuses over-budget callers and refills', async () => {
-    const rl = createRateLimiter({ capacity: 3, refillPerSec: 1000 });
+    const rl = createRateLimiter({ capacity: 3, refillPerSec: 1 });
     assert.strictEqual(rl.take('k', 1), 0);
     assert.strictEqual(rl.take('k', 1), 0);
     assert.strictEqual(rl.take('k', 1), 0);
     assert.ok(rl.take('k', 1) > 0, '4th call over capacity is refused');
+    const fast = createRateLimiter({ capacity: 1, refillPerSec: 1000 });
+    assert.strictEqual(fast.take('k', 1), 0);
     await sleep(20);
-    assert.strictEqual(rl.take('k', 1), 0, 'refills');
+    assert.strictEqual(fast.take('k', 1), 0, 'refills');
   });
 
   it('guard: cross-origin is detected via Sec-Fetch-Site and Origin', () => {
@@ -177,6 +179,17 @@ describe('markets plugin', () => {
     await assert.rejects(
       startJss({ plugins: [{ module: module_, prefix: '/markets', config: { admins: ['not-an-agent'] } }] }),
       /admins/,
+    );
+    await assert.rejects(
+      startJss({
+        plugins: [{
+          module: module_,
+          prefix: '/markets',
+          config: { disputeWindowMs: 60_000, settlementWindowMs: 1_000 },
+        }],
+      }),
+      /disputeWindowMs/,
+      'a dispute window longer than the settlement window makes every resolution voidable',
     );
   });
 
@@ -531,6 +544,37 @@ describe('markets plugin', () => {
     assert.strictEqual(none.markets.length, 0);
     const listed = await json(await call(null, 'GET', '/markets'), 200);
     assert.ok(!('position' in listed.markets[0]), 'the list never carries per-agent data (cacheability)');
+  });
+
+  it('a loser CANNOT void a validly-resolved market via the stale backstop', async () => {
+    // The anyone-can-rescue backstop is for a DEAD oracle. When `stale`
+    // ignored lifecycle state, a market that had been resolved but was
+    // past closesAt + settlementWindow could be voided by any loser —
+    // refunding their own losing bet, no bond, no dispute, erasing the
+    // winner's payout.
+    const m = await json(await call('alice', 'POST', '/markets', {
+      title: 'Resolved, and past the backstop deadline',
+      outcomes: ['Home', 'Away'],
+      closesAt: new Date(Date.now() + 600).toISOString(),
+      b: 25,
+    }), 201);
+    await json(await call('bob', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 0, shares: 10 }), 200);
+    await json(await call('carol', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 1, shares: 10 }), 200);
+    const bobStake = await balance('bob');
+    await sleep(700);
+    await json(await call('alice', 'POST', `/markets/${m.id}/resolve`, { outcome: 0 }), 200);
+    await sleep(900); // now past closesAt + settlementWindowMs as well
+
+    const loser = await call('carol', 'POST', `/markets/${m.id}/void`);
+    assert.ok(loser.status === 403 || loser.status === 409,
+      `a resolved market is not abandoned; the loser must not void it (got ${loser.status})`);
+    await call(null, 'POST', `/markets/${m.id}/settle`);
+    const final = await json(await call(null, 'GET', `/markets/${m.id}`), 200);
+    assert.strictEqual(final.status, 'resolved', 'the honest resolution stands');
+    assert.ok(await balance('bob') - bobStake > 9, 'the winner was paid his 10 winning shares');
+    await assertConserved('after a refused stale-void');
   });
 
   // =================================================== settlement rules
@@ -1021,6 +1065,56 @@ describe('markets plugin', () => {
     const positions = (await me('bob')).positions;
     assert.ok(positions.every((x) => x.status !== 'resolved' && x.status !== 'void'),
       'a paid-out market must not also appear as an open position');
+  });
+
+  it('a disputed VOID PROPOSAL settles as a void, never as a zero-payout resolution', async () => {
+    // A void proposal has no resolvedOutcome. Settling it as "resolved"
+    // indexed shares[undefined] → NaN → silently floored to zero, paying
+    // every holder nothing and burning the pool to the house.
+    const m = await json(await call('bob', 'POST', '/markets', {
+      title: 'Void proposal that someone objects to',
+      outcomes: ['Home', 'Away'],
+      closesAt: new Date(Date.now() + 3600e3).toISOString(),
+      b: 25,
+    }), 201);
+    await json(await call('carol', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 0, spend: 60 }), 200);
+    await json(await call('bob', 'POST', `/markets/${m.id}/close`), 200);
+    const proposed = await json(await call('bob', 'POST', `/markets/${m.id}/void`), 200);
+    assert.strictEqual(proposed.status, 'voiding', 'an oracle void is a proposal');
+    await json(await call('carol', 'POST', `/markets/${m.id}/dispute`, { reason: 'should be resolved' }), 200);
+
+    const before = await balance('carol');
+    const out = await json(await call('alice', 'POST', '/admin/adjudicate',
+      { market: m.id, uphold: true }), 200);
+    assert.strictEqual(out.status, 'void', 'upholding a proposed void must VOID it, not resolve it');
+    assert.ok(await balance('carol') - before > 0, 'holders are redeemed, not zeroed');
+    await assertConserved('after upholding a proposed void');
+  });
+
+  it('a sustained dispute against a void proposal resolves it instead', async () => {
+    const m = await json(await call('bob', 'POST', '/markets', {
+      title: 'Void proposed, but the result was clear',
+      outcomes: ['Home', 'Away'],
+      closesAt: new Date(Date.now() + 3600e3).toISOString(),
+      b: 25,
+    }), 201);
+    await json(await call('carol', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 0, shares: 12 }), 200);
+    await json(await call('bob', 'POST', `/markets/${m.id}/close`), 200);
+    await json(await call('bob', 'POST', `/markets/${m.id}/void`), 200);
+    await json(await call('carol', 'POST', `/markets/${m.id}/dispute`, { reason: 'Home won outright' }), 200);
+    // Without an outcome there is nothing to resolve to.
+    const vague = await json(await call('alice', 'POST', '/admin/adjudicate',
+      { market: m.id, uphold: false }), 400);
+    assert.match(vague.error, /supply an outcome/);
+    const before = await balance('carol');
+    const fixed = await json(await call('alice', 'POST', '/admin/adjudicate',
+      { market: m.id, uphold: false, outcome: 0 }), 200);
+    assert.strictEqual(fixed.status, 'resolved');
+    assert.strictEqual(fixed.resolvedOutcome, 0);
+    assert.ok(await balance('carol') - before > 11, 'the vindicated holder is paid 1 credit per share');
+    await assertConserved('after resolving a disputed void proposal');
   });
 
   it('a void never pays a holder more than they paid (kills the sustained pump)', async () => {

@@ -147,6 +147,8 @@ export async function activate(api) {
   const settlementWindowMs = num(cfg.settlementWindowMs, 7 * 24 * 3600 * 1000);
   const twapWindowMs = num(cfg.twapWindowMs, 30 * 60 * 1000);
   const sessionTtlMs = num(cfg.sessionTtlMs, 12 * 3600 * 1000);
+  const rateCapacity = num(cfg.rateCapacity, 120);
+  const rateRefillPerSec = num(cfg.rateRefillPerSec, 2);
   const allowInsiderTrading = cfg.allowInsiderTrading === true;
   const admins = new Set(Array.isArray(cfg.admins) ? cfg.admins : []);
 
@@ -173,6 +175,22 @@ export async function activate(api) {
       throw new Error(`markets: config.${name} must be a positive number of milliseconds (got ${v})`);
     }
   }
+  // Get these two the wrong way round and a resolution is still inside
+  // its dispute window when the abandoned-market backstop opens — which
+  // made every resolution voidable by every loser.
+  if (disputeWindowMs >= settlementWindowMs) {
+    throw new Error(
+      `markets: config.disputeWindowMs (${disputeWindowMs}) must be shorter than `
+      + `settlementWindowMs (${settlementWindowMs})`,
+    );
+  }
+  if (!Number.isFinite(disputeBondBps) || disputeBondBps < 0 || disputeBondBps > 10_000) {
+    throw new Error('markets: config.disputeBondBps must be 0..10000');
+  }
+  if (!Number.isFinite(rateCapacity) || rateCapacity <= 0
+      || !Number.isFinite(rateRefillPerSec) || rateRefillPerSec <= 0) {
+    throw new Error('markets: config.rateCapacity and config.rateRefillPerSec must be positive');
+  }
   if (twapWindowMs > TWAP_PROTECT_MS) {
     throw new Error(
       `markets: config.twapWindowMs (${twapWindowMs}) must not exceed ${TWAP_PROTECT_MS}ms — beyond that, `
@@ -190,7 +208,7 @@ export async function activate(api) {
   const { state } = store;
   const sessions = createSessions({ dir, ttlMs: sessionTtlMs });
   const pseudonymSalt = readOrCreateSecret(path.join(dir, 'pseudonym.salt'));
-  const limiter = createRateLimiter({ capacity: num(cfg.rateCapacity, 120), refillPerSec: num(cfg.rateRefillPerSec, 2) });
+  const limiter = createRateLimiter({ capacity: rateCapacity, refillPerSec: rateRefillPerSec });
 
   /** agent → Set(marketId) — so /api/me is O(your markets), not O(all). */
   const byAgent = new Map();
@@ -496,7 +514,7 @@ export async function activate(api) {
   // The settlement state machine lives in lifecycle.js — see that file
   // for why it is not inline here (a state change that skipped the
   // reducer made the audit trail contradict the money).
-  const { voidPrices, settleResolved, settleVoid, tick, maybeTick } = createLifecycle({
+  const { voidPrices, settleResolved, settleVoid, tick, tickOne, maybeTick } = createLifecycle({
     state,
     commit: store.commit,
     broadcast: (type, m) => broadcast(type, m),
@@ -511,7 +529,7 @@ export async function activate(api) {
     // Reject cross-origin upgrades: public data today, but an unchecked
     // origin makes any future per-agent field on the wire a leak.
     const wsOrigin = request.headers && request.headers.origin;
-    if (wsOrigin && !isSameOrigin({ headers: { origin: wsOrigin } }, ownOrigin())) {
+    if (wsOrigin && !isSameOrigin({ headers: { origin: wsOrigin } }, originFor(request))) {
       try { socket.close(1008, 'cross-origin'); } catch { /* gone */ }
       return;
     }
@@ -965,7 +983,10 @@ export async function activate(api) {
   api.fastify.post(`${prefix}/api/markets/:id/settle`, jsonOpts(512), async (request, reply) => {
     const m = state.markets[request.params.id];
     if (!m) return err(reply, 404, 'no such market');
-    tick();
+    // Advance THIS market only: a full scan here was a free O(all
+    // markets) job for any anonymous caller, and throttling it instead
+    // turned an explicit "settle now" into a silent no-op.
+    tickOne(m);
     if (m.status === 'resolved' || m.status === 'void') return reply.send(marketOut(m));
     if (m.status === 'resolving' || m.status === 'voiding') {
       return err(reply, 409, `settles at ${new Date(m.settleAt).toISOString()} (dispute window open)`);
@@ -985,7 +1006,7 @@ export async function activate(api) {
     // 'disputed' is disputable too: latching on the FIRST disputer meant
     // one person paid the bond and every other loser free-rode on the
     // resulting void. Each disputer posts their own.
-    tick(); // otherwise a market past settleAt is still 'resolving' here
+    tickOne(m); // otherwise a market past settleAt is still 'resolving' here
     if (m.status !== 'resolving' && m.status !== 'disputed' && m.status !== 'voiding') {
       return err(reply, 409, 'only a resolving market can be disputed');
     }
@@ -1022,7 +1043,10 @@ export async function activate(api) {
     if (!agent) return reply;
     const m = state.markets[request.params.id];
     if (!m) return err(reply, 404, 'no such market');
-    const stale = Date.now() >= m.closesAt + settlementWindowMs;
+    // Only an ABANDONED market qualifies for the anyone-can-rescue
+    // backstop: resolving/voiding/disputed all mean the oracle acted and
+    // a settlement is already pending.
+    const stale = m.status === 'open' && Date.now() >= m.closesAt + settlementWindowMs;
     if (m.status === 'resolved' || m.status === 'void') return err(reply, 409, `market is ${m.status}`);
     if (m.status === 'voiding' && !admins.has(agent) && !stale) {
       return err(reply, 409, `a void is already proposed; it settles at ${new Date(m.settleAt).toISOString()}`);
@@ -1159,8 +1183,12 @@ export async function activate(api) {
     const m = state.markets[market];
     if (!m) return err(reply, 404, 'no such market');
     if (m.status !== 'disputed') return err(reply, 409, `market is ${displayStatus(m)}, not disputed`);
+    const proposedVoid = !Number.isInteger(m.resolvedOutcome);
     if (uphold === true) {
-      settleResolved(m, { adjudicatedBy: by });
+      // Uphold whatever the oracle actually proposed — a void proposal
+      // has no resolution to uphold.
+      if (proposedVoid) settleVoid(m, { adjudicatedBy: by });
+      else settleResolved(m, { adjudicatedBy: by });
     } else if (uphold === false && Number.isInteger(outcome)) {
       // RE-RESOLVE: the oracle got it wrong and we know the right answer.
       // Voiding would refund the loser and wipe out whoever was RIGHT, so
@@ -1168,9 +1196,12 @@ export async function activate(api) {
       if (outcome < 0 || outcome >= m.outcomes.length) return err(reply, 400, 'outcome must be a valid outcome index');
       settleResolved(m, { adjudicatedBy: by, sustained: true, outcome });
     } else if (uphold === false) {
+      if (proposedVoid) {
+        return err(reply, 400, 'this market has a void proposed, not a resolution — supply an outcome to resolve it instead');
+      }
       settleVoid(m, { adjudicatedBy: by, sustained: true });
     } else {
-      return err(reply, 400, 'uphold must be true (resolution stands), or false (void) — with an outcome to re-resolve instead');
+      return err(reply, 400, "uphold must be true (the oracle's call stands), or false with an outcome to re-resolve");
     }
     api.log.warn(`markets: admin ${by} adjudicated ${m.id}: ${uphold ? 'upheld' : (Number.isInteger(outcome) ? `re-resolved to ${outcome}` : 'voided')}`);
     return reply.send(marketOut(m));
