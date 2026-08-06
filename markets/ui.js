@@ -27,7 +27,18 @@ export function renderUi(prefix, opts = {}) {
   const brand = typeof opts.brand === 'string' && opts.brand ? opts.brand : 'Markets';
   const tagline = typeof opts.tagline === 'string' && opts.tagline ? opts.tagline : 'prediction markets on your pod';
   // Social/OG affordances for standalone hosts; harmless defaults for JSS.
-  const ogTitle = `${brand} — ${tagline}`;
+  const mk = opts.market && typeof opts.market === 'object' ? opts.market : null;
+  const esc0 = (v) => String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  // A shared market should unfurl as the QUESTION and its live odds — that
+  // is the whole reason someone sends the link.
+  const mkOdds = mk ? mk.outcomes
+    .map((o, i) => `${o} ${(mk.prices[i] * 100).toFixed(0)}%`).slice(0, 4).join(' · ') : '';
+  const mkWhen = mk ? (() => {
+    const d = Math.round((mk.closesAt - Date.now()) / 86400000);
+    return mk.status === 'open' && d > 0 ? `closes in ${d}d` : mk.status;
+  })() : '';
+  const ogTitle = mk ? esc0(mk.title) : `${brand} — ${tagline}`;
   const ogImage = typeof opts.ogImage === 'string' ? opts.ogImage : '';
   const ogUrl = typeof opts.ogUrl === 'string' ? opts.ogUrl : '';
   const favicon = typeof opts.favicon === 'string' && opts.favicon ? opts.favicon
@@ -37,12 +48,15 @@ export function renderUi(prefix, opts = {}) {
     `<meta property="og:type" content="website">`,
     `<meta property="og:site_name" content="${brand}">`,
     `<meta property="og:title" content="${ogTitle}">`,
-    `<meta property="og:description" content="Play-money prediction markets: bet paper credits, watch the odds move, climb the leaderboard, ask your own questions.">`,
-    ogUrl ? `<meta property="og:url" content="${ogUrl}">` : '',
+    `<meta property="og:description" content="${mk
+      ? esc0(`${mkOdds} — ${mkWhen}${mk.category ? ` · ${mk.category}` : ''} · play money on ${brand}`)
+      : 'Play-money prediction markets: bet paper credits, watch the odds move, climb the leaderboard, ask your own questions.'}">`,
+    ogUrl ? `<meta property="og:url" content="${ogUrl}${prefix}${mk ? `/m/${esc0(mk.id)}` : '/'}">` : '',
     ogImage ? `<meta property="og:image" content="${ogImage}">` : '',
     ogImage ? `<meta property="og:image:width" content="1200">\n<meta property="og:image:height" content="630">` : '',
     `<meta name="twitter:card" content="${ogImage ? 'summary_large_image' : 'summary'}">`,
     `<meta name="twitter:title" content="${ogTitle}">`,
+    mk ? `<meta name="twitter:description" content="${esc0(`${mkOdds} — ${mkWhen}`)}">` : '',
     ogImage ? `<meta name="twitter:image" content="${ogImage}">` : '',
   ].filter(Boolean).join('\n');
   const P = JSON.stringify(prefix);
@@ -479,7 +493,8 @@ ${ogMeta}
 
   <!-- ========================== detail view ========================== -->
   <div id="detail-view" class="hidden">
-    <p><a href="#" id="back">&larr; All markets</a></p>
+    <p style="display:flex;align-items:center;gap:var(--s3)"><a href="#" id="back">&larr; All markets</a>
+      <button type="button" id="share" class="ghost" style="font-size:var(--f-sm)">Copy link</button></p>
     <div class="cols">
       <aside class="rail">
         <div class="ticket" id="ticket">
@@ -1417,9 +1432,17 @@ ${ogMeta}
   async function route() {
     renderBoard();
     const h = location.hash;
-    if (h.startsWith('#m/')) return renderDetail(h.slice(3), true);
+    if (h.startsWith('#m/')) {
+      const id = h.slice(3);
+      // Make the ADDRESS BAR shareable: most people copy the URL rather
+      // than press a button, and the path form is the one that unfurls
+      // with this market's question and odds.
+      try { history.replaceState(null, '', PREFIX + '/m/' + id); } catch { /* file:// etc */ }
+      return renderDetail(id, true);
+    }
     $('detail-view').classList.add('hidden');
     $('list-view').classList.remove('hidden');
+    try { if (location.pathname !== (PREFIX || '/')) history.replaceState(null, '', (PREFIX || '/')); } catch { /* ignore */ }
     document.title = ${JSON.stringify(brand + ' — ' + tagline)};
     current = null; cursor = null; paged = false;
     $('d-position').dataset.shape = '';
@@ -1486,6 +1509,15 @@ ${ogMeta}
     $('acct-pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') acctAuth('/login'); });
   }
   $('back').onclick = (e) => { e.preventDefault(); location.hash = ''; };
+  // The share URL is the PATH form (/m/<id>), which the server renders with
+  // this market's question and odds in its meta — a hash link would unfurl
+  // as the generic site card.
+  $('share').onclick = async () => {
+    if (!current) return;
+    const url = location.origin + PREFIX + '/m/' + current.id;
+    try { await navigator.clipboard.writeText(url); toast('Link copied'); }
+    catch { window.prompt('Copy this link', url); }
+  };
   $('t-buy').onclick = () => {
     if (!me) {
       $('auth-card').classList.remove('hidden');
@@ -1581,6 +1613,17 @@ ${ogMeta}
       : 'Escrow: —';
   };
   $('c-outcomes').oninput = $('c-b').oninput = escrowPreview;
+  // Arrived via a share link? Hand off to the hash router.
+  (function shareEntry() {
+    // Both server-visible forms are honoured: the path (/m/<id>) and the
+    // query (?m=<id>). A fragment never reaches the server, which is why
+    // shared #m/ links unfurled as the generic card.
+    const byPath = /\/m\/([A-Za-z0-9_-]+)\/?$/.exec(location.pathname);
+    const byQuery = new URLSearchParams(location.search).get('m');
+    const id = (byPath && byPath[1]) || byQuery;
+    if (!id || location.hash) return;
+    history.replaceState(null, '', (PREFIX || '/') + '#m/' + id);
+  })();
   window.addEventListener('hashchange', () => route());
 
   // Live feed, with reconnect. Only re-render what is on screen.

@@ -1348,12 +1348,43 @@ export async function activate(api) {
   });
 
   // ---------------------------------------------------------------- UI
+  /** Public share view of a market, or null. */
+  function shareOf(id) {
+    if (typeof id !== 'string' || !Object.prototype.hasOwnProperty.call(state.markets, id)) return null;
+    const m = state.markets[id];
+    return {
+      id: m.id,
+      title: m.title,
+      category: m.category || '',
+      status: displayStatus(m),
+      closesAt: m.closesAt,
+      outcomes: m.outcomes,
+      prices: lmsrPrices(m.q, m.bMicro),
+    };
+  }
+  const uiOpts = (market) => ({
+    accounts: accountsUi, brand: cfg.brand, tagline: cfg.tagline,
+    ogImage: cfg.ogImage, ogUrl: cfg.ogUrl, favicon: cfg.favicon, market,
+  });
+
   const uiHandler = async (request, reply) => {
     for (const [k, v] of Object.entries(UI_HEADERS)) reply.header(k, v);
-    return reply.header('content-type', 'text/html; charset=utf-8').send(renderUi(prefix, { accounts: accountsUi, brand: cfg.brand, tagline: cfg.tagline, ogImage: cfg.ogImage, ogUrl: cfg.ogUrl, favicon: cfg.favicon }));
+    return reply.header('content-type', 'text/html; charset=utf-8')
+      .send(renderUi(prefix, uiOpts(shareOf(request.query && request.query.m))));
   };
   if (prefix) api.fastify.get(prefix, uiHandler); // '' would be an empty route path
   api.fastify.get(`${prefix}/`, uiHandler);
+
+  // Share links: a market is the unit people actually send each other, but
+  // the in-app router is hash-based and a fragment never reaches a server —
+  // so every shared market unfurled as the generic site card. This path
+  // route renders the same app with meta describing THAT market (question,
+  // live odds, close time), and the client hands over to the hash router.
+  api.fastify.get(`${prefix}/m/:id`, async (request, reply) => {
+    for (const [k, v] of Object.entries(UI_HEADERS)) reply.header(k, v);
+    return reply.header('content-type', 'text/html; charset=utf-8')
+      .send(renderUi(prefix, uiOpts(shareOf(request.params.id))));
+  });
 
   tick();
   const snap = setInterval(() => store.snapshot(), num(cfg.snapshotIntervalMs, 30_000));
