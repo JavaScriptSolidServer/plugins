@@ -1186,6 +1186,33 @@ describe('markets plugin', () => {
     await assertConserved('after a part-sell void');
   });
 
+  it('a pump before a void cannot rob another holder', async () => {
+    // With a price-based void the pumper was refunded in full while the
+    // victim's redemption collapsed to ~5% of what they paid, the
+    // difference falling to the house. A void refunds what you put in,
+    // so there is no price left to distort.
+    const m = await json(await call('bob', 'POST', '/markets', {
+      title: 'Someone pumps the other side before a void',
+      outcomes: ['Yes', 'No'],
+      closesAt: new Date(Date.now() + 3600e3).toISOString(),
+      b: 40,
+    }), 201);
+    const victimBefore = await balance('carol');
+    const victimBuy = await json(await call('carol', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 1, spend: 60 }), 200);
+    // alice pumps the OTHER outcome hard, collapsing outcome 1's price.
+    await json(await call('alice', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 0, spend: 200 }), 200);
+    await json(await call('bob', 'POST', `/markets/${m.id}/close`), 200);
+    await json(await call('bob', 'POST', `/markets/${m.id}/void`), 200);
+    await sleep(400);
+    await json(await call(null, 'POST', `/markets/${m.id}/settle`), 200);
+    const victimLoss = victimBefore - await balance('carol');
+    assert.ok(victimLoss <= victimBuy.fee + 1e-6,
+      `the victim loses only their fee, not their stake (lost ${victimLoss} of ${victimBuy.total})`);
+    await assertConserved('after a pump-and-void grief attempt');
+  });
+
   it('a void does not tax a market-neutral position', async () => {
     // Capping each leg separately meant a leg that gained could not
     // offset a leg that lost, so a position with NO outcome risk lost
@@ -1345,6 +1372,63 @@ describe('markets plugin', () => {
       'a discontinuous audit trail must not replay silently',
     );
     fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('MIGRATION: a pre-upgrade position is refunded what it paid, not zero', async () => {
+    // netInMicro and proposal are newer than the on-disk format. A
+    // position without netInMicro was capped at zero on a void — the
+    // holder's whole stake fell to the house and conservation still
+    // balanced, so nothing caught it.
+    const { applyEvent, emptyState, createStore } = await import('./store.js');
+    const { lmsrPrices } = await import('./lmsr.js');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'markets-migrate-'));
+
+    // A snapshot in the OLD shape: positions carry shares+costMicro only,
+    // and a market mid-proposal records its kind only in the status.
+    fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({
+      seq: 1,
+      ledger: { 'https://a.example/#me': { balanceMicro: 0, created: '2026-01-01T00:00:00Z', frozen: false } },
+      markets: {
+        M1: {
+          id: 'M1',
+          title: 'Written by the previous release',
+          outcomes: ['Yes', 'No'],
+          creator: 'https://c.example/#me',
+          oracle: 'https://c.example/#me',
+          createdAt: '2026-01-01T00:00:00Z',
+          closesAt: Date.now() - 1000,
+          closedAt: Date.now() - 1000,
+          status: 'voiding',
+          settleAt: Date.now() - 500,
+          resolvedOutcome: 0, // stale: the void proposal abandoned it
+          bMicro: 25e6,
+          q: [50e6, 0],
+          subsidyMicro: Math.ceil(25e6 * Math.log(2)),
+          collectedMicro: 30e6,
+          feesMicro: 0,
+          volumeMicro: 50e6,
+          trades: 1,
+          positions: {
+            'https://a.example/#me': { shares: [50e6, 0], costMicro: [30e6, 0] },
+          },
+          history: [{ t: Date.now() - 2000, p: [0.5, 0.5] }],
+          disputes: [],
+          hidden: false,
+        },
+      },
+      settlements: {},
+    }));
+
+    const store = createStore({ dir, log: { info() {}, warn() {}, error() {} }, prices: lmsrPrices });
+    const pos = store.state.markets.M1.positions['https://a.example/#me'];
+    assert.strictEqual(pos.netInMicro, 30e6, 'net cash in is backfilled from the cost basis');
+    assert.strictEqual(store.state.markets.M1.proposal, 'void',
+      'the proposal kind is backfilled from the status, before a dispute can overwrite it');
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+    // Keep the reducer import honest — it is what replay uses.
+    assert.strictEqual(typeof applyEvent, 'function');
+    assert.strictEqual(typeof emptyState, 'function');
   });
 
   it('refuses to boot on a corrupt snapshot rather than resetting balances', async () => {

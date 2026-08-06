@@ -160,9 +160,10 @@ export function renderUi(prefix) {
 
     <details class="card">
       <summary style="cursor:pointer;font-weight:600">Create a market</summary>
-      <p class="hint">You escrow b·ln(n) credits as maker liquidity. You get your escrow back
-         (never more) plus a share of trade fees at settlement — and you may not trade in
-         your own market.</p>
+      <p class="hint">You escrow b·ln(n) credits as maker liquidity and you may not trade in
+         your own market. You get the escrow back (never more) plus a share of trade fees when
+         the market settles — but <b>you forfeit it entirely if nobody ever settles the market</b>
+         and it has to be rescued automatically, so name an oracle who will actually act.</p>
       <div class="row"><input id="c-title" placeholder="Question — e.g. Arsenal v Spurs: full-time result" style="flex:1;min-width:14rem"></div>
       <div class="row"><input id="c-outcomes" placeholder="Outcomes, comma-separated — Arsenal, Draw, Spurs" style="flex:1;min-width:14rem"></div>
       <div class="row"><textarea id="c-desc" rows="2" placeholder="Rules — exactly what counts as a win, and from which source" style="flex:1;min-width:14rem"></textarea></div>

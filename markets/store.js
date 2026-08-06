@@ -158,10 +158,13 @@ export function applyEvent(state, ev, prices) {
         || (m.positions[ev.agent] = {
           shares: m.outcomes.map(() => 0), costMicro: m.outcomes.map(() => 0), netInMicro: 0,
         });
-      // Net cash in: what this agent has actually put into this market,
-      // net of everything taken back out. It is the cap on a void
-      // redemption — see lifecycle.js.
-      pos.netInMicro = (pos.netInMicro || 0) + (ev.side === 'buy' ? ev.totalMicro : -ev.totalMicro);
+      // Net cash in, EXCLUDING fees: what this agent put into the pool
+      // net of what they took back out. It caps a void redemption (see
+      // lifecycle.js). Fees are deliberately not refundable — including
+      // them made distorting the void price free, and a settlement price
+      // any funded account can move for nothing is not a price.
+      pos.netInMicro = (pos.netInMicro || 0)
+        + (ev.side === 'buy' ? ev.costMicro : -ev.proceedsMicro);
       if (ev.side === 'buy') {
         r.balanceMicro -= ev.totalMicro;
         m.collectedMicro += ev.costMicro;
@@ -337,7 +340,24 @@ export function createStore({ dir, log, prices }) {
       markets: dict(snap.markets),
       settlements: dict(snap.settlements),
     };
-    for (const m of Object.values(state.markets)) m.positions = dict(m.positions);
+    for (const m of Object.values(state.markets)) {
+      m.positions = dict(m.positions);
+      // Backfill fields added after this snapshot was written. Cost
+      // basis is present in every old snapshot and is the correct
+      // conservative stand-in for net cash in.
+      for (const pos of Object.values(m.positions)) {
+        if (pos.netInMicro === undefined) {
+          pos.netInMicro = pos.costMicro.reduce((a, x) => a + x, 0);
+        }
+      }
+      // …and what the oracle proposed, which older states recorded only
+      // in the status. Doing it HERE rather than at read time means
+      // every downstream branch sees a well-formed market.
+      if (!m.proposal) {
+        if (m.status === 'voiding') m.proposal = 'void';
+        else if (m.status === 'resolving' || Number.isInteger(m.resolvedOutcome)) m.proposal = 'resolve';
+      }
+    }
   }
 
   // ---- replay the journal (every segment, in sequence order)

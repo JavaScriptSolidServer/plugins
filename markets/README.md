@@ -43,8 +43,8 @@ routes).
   book is always solvent: settlement provably fits in escrow + collected.
 - A share of the winning outcome redeems for 1 credit. No shorting, so
   outstanding shares never go negative.
-- **Void redeems at a TWAP over the window before close**, not at spot
-  (see Findings — this is what makes voids non-exploitable).
+- **A void refunds what you put in** — net of anything you took out. No
+  market price enters the payout, so there is nothing to manipulate.
 - **The creator's settlement claim is capped at their own escrow**;
   residual beyond it goes to the house, so resolving to an outcome nobody
   holds wins the oracle nothing.
@@ -90,11 +90,18 @@ dispute expires into the oracle's resolution — so the plugin says so
 loudly at boot rather than letting the advertised check be quietly
 inert.
 
-**A void never pays a holder more than they paid.** Redemption is
-`min(TWAP value, cost basis)` per outcome. The TWAP alone defeats a
-last-second pump but not one *held across the whole window*; the cap
-makes pumping-to-be-voided unprofitable at any hold duration, and since
-it only ever pays less than the TWAP, conservation is untouched.
+**A void refunds each holder their net cash in** — everything they paid
+into the market, less everything they took back out, and no market price
+at all. The sum of those refunds is exactly what the pool collected, so
+it is funded by construction; traders who cashed out at a profit are
+covered by the creator's `b·ln n` escrow, which is what that escrow is
+for. See Findings for the four wrong answers that preceded this one.
+
+The creator's escrow is **forfeited only when a market is abandoned** —
+i.e. rescued by the backstop because nobody ever settled it. On every
+other path they recover it, capped at what they put up. Tying it to the
+*outcome* instead made a false resolution strictly dominate an honest
+void.
 
 ## What this is not (deliberately)
 
@@ -181,12 +188,34 @@ the walls point at.
   who was right. Going silent must never beat settling: escrow now comes
   back on a resolution, or on a void an operator decided, and never on
   one the creator's own inaction produced.
-- **Cap a redemption on NET CASH IN, not on cost basis.** A per-outcome
-  cost cap let a trader pump, sell part of the position to bank the gain,
-  and still redeem the remainder at its full remaining basis — a measured
-  5.8% risk-free — and it taxed a perfectly hedged position ~12%, because
-  a leg that gained could not offset a leg that lost. One number per
-  position, `Σ in − Σ out`, fixes both and is equally conserving.
+- **Four wrong answers before the right one: a void should not use a
+  price at all.** Redeeming a void at spot was a guaranteed arbitrage; at
+  a TWAP, a sustained pump defeated it; at `min(TWAP, cost basis)`, a
+  partial sell defeated *that* (5.8% risk-free) while taxing a hedged
+  position 12%; and even once the pumper could no longer profit, a pump
+  still collapsed an innocent holder's refund to 5.6% of what they paid,
+  with the difference falling to the house. Every version left the payout
+  a function of a number somebody could move. The premise was the bug:
+  "stake refunds are impossible under an AMM" is true of GROSS stakes and
+  false of NET ones. `Σ paid − Σ withdrawn` over all holders is exactly
+  `collected`, so refunding it is funded by construction, with the
+  creator's escrow covering traders who cashed out at a profit — which is
+  what a maker subsidy is. There is no price left to distort.
+- **Put a penalty where the behaviour is, not where it correlates.**
+  Slashing the creator's escrow on any void (to stop "go silent and
+  reclaim it") made a FALSE resolution beat an honest void by the whole
+  escrow, and made creating a low-volume market negative-EV, since a
+  creator cannot force the oracle they named to act. The behaviour being
+  punished is ABANDONMENT, so the condition is "did the backstop have to
+  rescue this?" — not "which way did it settle?".
+- **Any new field on persisted state needs a backfill, and any fallback
+  written for legacy state needs a test that reaches it.** Adding
+  `netInMicro` refunded every pre-upgrade position ZERO on a void — the
+  holder's whole stake to the house, conservation still balancing, all
+  tests green. The migration fallback written for the companion field was
+  dead code: it lived inside a branch where the condition it tested could
+  never be true. Both were caught by review, not by a suite that only
+  ever constructed state through the current code path.
 - **A fix is a new attack surface: the state you add needs every branch
   that reads the old state re-checked.** Making an oracle-initiated void a
   *proposal* (so holders can object to a cancellation they can only lose
@@ -248,7 +277,7 @@ the walls point at.
 
 ## Tests
 
-`node --test --test-concurrency=1 markets/test.js` — 73 tests: LMSR and
+`node --test --test-concurrency=1 markets/test.js` — 75 tests: LMSR and
 TWAP math, session/CSRF/rate-limit units, hardened headers, cookie
 scoping, prototype-key ids, grants, escrow, stake-first quotes,
 quote↔trade parity, slippage guards (including the NaN-fails-closed case),

@@ -439,7 +439,7 @@ export async function activate(api) {
       rawStatus: m.status,
       tradable: tradable(m),
       canResolve: m.status === 'open',
-      canVoid: m.status === 'open',
+      canVoid: m.status === 'open' && !tradable(m),
       closesAt: new Date(m.closesAt).toISOString(),
       createdAt: m.createdAt,
       creator: m.creator,
@@ -1106,8 +1106,9 @@ export async function activate(api) {
 
     // An operator, or the anyone-can-rescue backstop, settles now.
     if (admins.has(agent) || stale) {
-      settleVoid(m, m.status === 'disputed' && admins.has(agent)
-        ? { adjudicatedBy: agent, sustained: true } : {});
+      settleVoid(m, admins.has(agent)
+        ? { adjudicatedBy: agent, sustained: m.status === 'disputed' }
+        : { abandoned: stale });
       api.log.info(`markets: ${m.id} voided (redeemed at TWAP)`);
       return reply.send(marketOut(m));
     }
@@ -1222,6 +1223,7 @@ export async function activate(api) {
     if (!m) return err(reply, 404, 'no such market');
     if (m.status !== 'disputed') return err(reply, 409, `market is ${displayStatus(m)}, not disputed`);
     const proposedVoid = m.proposal === 'void';
+    try {
     if (uphold === true) {
       // Uphold whatever the oracle actually proposed — a void proposal
       // has no resolution to uphold.
@@ -1240,6 +1242,12 @@ export async function activate(api) {
       settleVoid(m, { adjudicatedBy: by, sustained: true });
     } else {
       return err(reply, 400, "uphold must be true (the oracle's call stands), or false with an outcome to re-resolve");
+    }
+    } catch (e) {
+      // A settlement that cannot be computed must be a diagnosable 503,
+      // not an unhandled 500 out of the operator's only remedy.
+      api.log.error(`markets: ${m.id} adjudication failed: ${e.message}`);
+      return err(reply, 503, `this market cannot be settled: ${e.message}`);
     }
     api.log.warn(`markets: admin ${by} adjudicated ${m.id}: ${uphold ? 'upheld' : (Number.isInteger(outcome) ? `re-resolved to ${outcome}` : 'voided')}`);
     return reply.send(marketOut(m));
