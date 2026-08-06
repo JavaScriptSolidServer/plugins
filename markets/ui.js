@@ -26,6 +26,25 @@ export function renderUi(prefix, opts = {}) {
   const accounts = !!opts.accounts; // standalone host: register/login form
   const brand = typeof opts.brand === 'string' && opts.brand ? opts.brand : 'Markets';
   const tagline = typeof opts.tagline === 'string' && opts.tagline ? opts.tagline : 'prediction markets on your pod';
+  // Social/OG affordances for standalone hosts; harmless defaults for JSS.
+  const ogTitle = `${brand} — ${tagline}`;
+  const ogImage = typeof opts.ogImage === 'string' ? opts.ogImage : '';
+  const ogUrl = typeof opts.ogUrl === 'string' ? opts.ogUrl : '';
+  const favicon = typeof opts.favicon === 'string' && opts.favicon ? opts.favicon
+    : "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 20 20'%3E%3Crect x='1' y='11' width='4.5' height='8' rx='1.5' fill='%23667' opacity='.6'/%3E%3Crect x='7.75' y='6' width='4.5' height='13' rx='1.5' fill='%23667'/%3E%3Crect x='14.5' y='1' width='4.5' height='18' rx='1.5' fill='%2316A34A'/%3E%3C/svg%3E";
+  const ogMeta = [
+    `<link rel="icon" type="image/svg+xml" href="${favicon}">`,
+    `<meta property="og:type" content="website">`,
+    `<meta property="og:site_name" content="${brand}">`,
+    `<meta property="og:title" content="${ogTitle}">`,
+    `<meta property="og:description" content="Play-money prediction markets: bet paper credits, watch the odds move, climb the leaderboard, ask your own questions.">`,
+    ogUrl ? `<meta property="og:url" content="${ogUrl}">` : '',
+    ogImage ? `<meta property="og:image" content="${ogImage}">` : '',
+    ogImage ? `<meta property="og:image:width" content="1200">\n<meta property="og:image:height" content="630">` : '',
+    `<meta name="twitter:card" content="${ogImage ? 'summary_large_image' : 'summary'}">`,
+    `<meta name="twitter:title" content="${ogTitle}">`,
+    ogImage ? `<meta name="twitter:image" content="${ogImage}">` : '',
+  ].filter(Boolean).join('\n');
   const P = JSON.stringify(prefix);
   return `<!doctype html>
 <html lang="en">
@@ -33,6 +52,7 @@ export function renderUi(prefix, opts = {}) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${brand} — ${tagline}</title>
+${ogMeta}
 <style>
   :root{
     /* surfaces + ink */
