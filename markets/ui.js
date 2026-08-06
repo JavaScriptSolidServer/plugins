@@ -948,7 +948,9 @@ export function renderUi(prefix) {
     // to BODY every few seconds on a live market.
     const existing = $('d-outcomes').querySelectorAll('.out-btn');
     const reuse = !settledView(m) && existing.length === m.outcomes.length
-      && m.outcomes.every((o, i) => existing[i].dataset.o === o);
+      && m.outcomes.every((o, i) => existing[i].dataset.o === o)
+      // …and your holdings are unchanged, or "you hold N to win" goes stale.
+      && held.every((h, i) => existing[i].dataset.h === String(h));
     if (reuse) {
       existing.forEach((b, i) => {
         b.querySelector('.pc').textContent = pct(m.prices[i]);
@@ -957,7 +959,7 @@ export function renderUi(prefix) {
       });
     } else $('d-outcomes').innerHTML = m.outcomes.map((o, i) =>
       '<button type="button" class="out-btn" data-i="' + i + '" data-o="' + esc(o) + '"'
-      + ' aria-pressed="' + (i === pick) + '" style="--oc:' + col(i) + '">'
+      + ' data-h="' + held[i] + '" aria-pressed="' + (i === pick) + '" style="--oc:' + col(i) + '">'
       + '<span class="nm">' + esc(o)
       + (held[i] > 0 ? '<div class="meta" style="margin:0">you hold ' + cr(held[i]) + ' to win</div>' : '')
       + '</span>'
@@ -1043,7 +1045,11 @@ export function renderUi(prefix) {
       // unchanged; rebuilding threw focus off the Cash out buttons every
       // time anyone else traded.
       const legs = pos.shares.map((s, i) => (s > 0 ? i : -1)).filter((i) => i >= 0);
-      const shape = m.id + ':' + legs.join(',');
+      // Include YOUR OWN holdings: the stake and payout text is only
+      // stale when you trade, and a third party's tick leaves shares
+      // untouched, so this keeps the focus-preserving path for ticks and
+      // forces a rebuild for your own bets.
+      const shape = m.id + ':' + legs.join(',') + ':' + pos.shares.join(',');
       // Toggle the up/down class, never ASSIGN className — assigning it
       // dropped the v-pnl/v-total hooks this very function needs, so the
       // next tick threw, froze every P&L figure, and (via an early
