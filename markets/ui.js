@@ -34,7 +34,7 @@ export function renderUi(prefix) {
   :root{
     /* surfaces + ink */
     --surface:#eef1ee; --card:#ffffff; --raised:#ffffff;
-    --line:#dde4de; --line-strong:#c8d3ca;
+    --line:#dde4de; --line-strong:#8d9b93; /* 3.05:1 — control borders */
     --ink:#111815; --ink2:#4a564f; --ink3:#5e6b64;
     /* brand + semantics. up/down are P&L ONLY, never a button. */
     --accent:#0b6b4f; --accent-ink:#ffffff; --accent-tint:rgba(11,107,79,.08);
@@ -57,7 +57,7 @@ export function renderUi(prefix) {
   @media (prefers-color-scheme: dark){
     :root{
       --surface:#0e1512; --card:#151d19; --raised:#1b2420;
-      --line:#26312c; --line-strong:#33423b;
+      --line:#26312c; --line-strong:#6d7d75;
       --ink:#e9efeb; --ink2:#a9b6af; --ink3:#8b9891;
       --accent:#2f9d78; --accent-ink:#06120d; --accent-tint:rgba(47,157,120,.14);
       --up:#3fbf94; --down:#f0685f; --live:#f0685f;
@@ -140,7 +140,7 @@ export function renderUi(prefix) {
   /* tabs */
   .tabs{display:flex;gap:var(--s1);margin:0 0 var(--s3);flex-wrap:wrap}
   .tabs button{min-height:36px;padding:0 14px;border-radius:var(--r-pill);
-    background:transparent;border:1px solid var(--line);color:var(--ink2);font-size:var(--t-meta)}
+    background:transparent;border:1px solid var(--line-strong);color:var(--ink2);font-size:var(--t-meta)}
   /* selection is never colour alone — the active filter carries a mark */
   .tabs button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);
     color:var(--accent-ink);font-weight:700}
@@ -162,7 +162,7 @@ export function renderUi(prefix) {
   /* status chips — a live market must not read as inert grey */
   .status{display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;
     letter-spacing:.08em;text-transform:uppercase;padding:3px 7px;border-radius:5px;white-space:nowrap}
-  .status.open{color:var(--up);background:color-mix(in srgb, var(--up) 12%, transparent)}
+  .status.open{color:var(--accent);background:color-mix(in srgb, var(--up) 20%, transparent)}
   .status.closed,.status.resolving,.status.voiding{color:var(--on-outcome);background:var(--live)}
   .status.disputed{color:var(--on-outcome);background:var(--o3)}
   .status.resolved,.status.void{color:var(--ink3);background:color-mix(in srgb, var(--ink3) 14%, transparent)}
@@ -219,7 +219,7 @@ export function renderUi(prefix) {
   .ticket .on b{color:var(--ink)}
   .stakes{display:flex;gap:var(--s2);flex-wrap:wrap}
   .stakes button{min-height:36px;padding:0 14px;border-radius:var(--r-pill);
-    background:var(--surface);border:1px solid transparent;color:var(--ink2);font-size:var(--t-meta)}
+    background:var(--surface);border:1px solid var(--line-strong);color:var(--ink2);font-size:var(--t-meta)}
   .stakes button[aria-pressed="true"]{background:var(--accent-tint);border-color:var(--accent);
     color:var(--accent);font-weight:700}
   .payout{display:flex;align-items:center;gap:var(--s6);margin:var(--s4) 0 var(--s2)}
@@ -278,10 +278,7 @@ export function renderUi(prefix) {
   /* Below the two-column breakpoint the ticket must come FIRST on a
      market page — it was rendering after the chart and the position
      table, i.e. two screens below the fold. */
-  @media (max-width:999px){
-    .cols{display:flex;flex-direction:column}
-    #detail-view .rail{order:-1}
-  }
+  @media (max-width:999px){ .cols{display:flex;flex-direction:column} }
   @media (max-width:560px){
     main{padding:var(--s3)}
     .mrow{margin:0 calc(-1 * var(--s3));padding:var(--s3)}
@@ -314,7 +311,7 @@ export function renderUi(prefix) {
       <path d="M7 3.6v6.8M5.2 5.2h3.1a1.4 1.4 0 010 2.8H5.2h3.3a1.4 1.4 0 010 2.8" fill="none"
         stroke="currentColor" stroke-width="1.2" stroke-linecap="round"></path>
     </svg>
-    <b id="bal" aria-live="polite">—</b><span class="sr"> credits</span>
+    <b id="bal">—</b><span class="sr"> credits</span>
   </span>
   <button type="button" class="small" id="signin">Sign in</button>
 </header>
@@ -471,7 +468,7 @@ export function renderUi(prefix) {
             <span class="hint">credits</span>
           </div>
           <div class="stakes" id="t-chips" role="group" aria-label="Quick stake"></div>
-          <div class="payout" aria-live="polite" aria-atomic="true">
+          <div class="payout">
             <div>
               <span class="micro">Returns</span>
               <div><span class="big" id="t-towin">—</span><span class="unit">credits</span></div>
@@ -484,7 +481,7 @@ export function renderUi(prefix) {
               <div class="hint" id="t-oddsnote"></div>
             </div>
           </div>
-          <div class="warn hidden" id="t-warn" role="alert"></div>
+          <div class="warn hidden" id="t-warn"></div>
           <button type="button" class="primary big" id="t-buy">Place bet</button>
           <div class="slip hidden" id="t-slip">
             <div id="t-slip-copy"></div>
@@ -676,8 +673,13 @@ export function renderUi(prefix) {
     const shares = m.position.shares[outcome];
     const q = await api('/markets/' + m.id + '/quote?side=sell&outcome=' + outcome + '&shares=' + shares);
     const floor = q.total * 0.98;
-    if (!confirm('Cash out ' + cr(shares) + ' × ' + m.outcomes[outcome] + ' for about '
-      + cr(q.total) + ' credits?\\n\\nYou will receive at least ' + cr(floor) + ' if the price moves.')) return;
+    // Never state a realised loss only as the positive number you receive.
+    const paid = m.position.cost[outcome];
+    const delta = q.total - paid;
+    if (!confirm('Cash out your ' + m.outcomes[outcome] + ' bet?\\n\\n'
+      + 'You risked ' + cr(paid) + ' and would get about ' + cr(q.total) + ' back — '
+      + (delta >= 0 ? 'a profit of ' + cr(delta) : 'a loss of ' + cr(-delta)) + '.\\n'
+      + 'You will receive at least ' + cr(floor) + ' if the price moves.')) return;
     const key = uid();
     try {
       await api('/markets/' + m.id + '/trade', {
@@ -909,7 +911,8 @@ export function renderUi(prefix) {
 
     const isYou = me && me.agent === m.oracle;
     $('d-stats').innerHTML = [
-      ['Closes', m.tradable ? countdown(m.closesAt) : new Date(m.closesAt).toLocaleString()],
+      [m.tradable ? 'Closes' : 'Closed', m.tradable ? countdown(m.closesAt)
+        : new Date(m.closesAt).toLocaleString()],
       ['Traded', cr(m.volume)],
       ['Bets', String(m.trades)],
       ['Oracle', oracleChip(m.oracle, isYou)],
@@ -953,11 +956,23 @@ export function renderUi(prefix) {
     $('t-pick').textContent = m.outcomes[pick];
 
     if (settledView(m)) {
-      $('d-outcomes').querySelectorAll('.out-btn').forEach((b, i) => {
-        b.disabled = true;
-        if (m.resolvedOutcome === i) b.querySelector('.pc').innerHTML = '<b>✓ won</b>';
-        else if (m.status === 'resolved') b.classList.add('lost');
-      });
+      // Render the result as text, not as disabled controls: a decided
+      // market's outcomes ARE the substance, and disabled ink measured
+      // 4.31:1. Odds and the live bar are suppressed too — you could
+      // read odds on a team that had already lost.
+      $('d-outcomes').innerHTML = m.outcomes.map((o, i) =>
+        '<div class="out-btn" style="--oc:' + col(i) + ';cursor:default"'
+        + (m.status === 'resolved' && i !== m.resolvedOutcome ? ' class="lost"' : '') + '>'
+        + '<span class="nm"' + (m.status === 'resolved' && i !== m.resolvedOutcome
+            ? ' style="text-decoration:line-through;color:var(--ink3)"' : '') + '>' + esc(o) + '</span>'
+        + '<span class="pc">' + (m.status === 'void' ? 'refunded'
+            : i === m.resolvedOutcome ? '<b>✓ won</b>' : 'lost') + '</span></div>').join('');
+      $('d-bar').innerHTML = '';
+      $('d-bar').style.display = 'none';
+      $('d-spark').style.display = 'none';
+    } else {
+      $('d-bar').style.display = '';
+      $('d-spark').style.display = '';
     }
     const canTrade = m.tradable && me && me.agent !== m.oracle && me.agent !== m.creator;
     $('ticket').classList.toggle('hidden', !m.tradable);
@@ -1043,12 +1058,22 @@ export function renderUi(prefix) {
     const stake = Number($('t-stake').value);
     $('t-chips').querySelectorAll('button').forEach((c) =>
       c.setAttribute('aria-pressed', String(Number(c.dataset.stake) === stake)));
-    cancelSlip();
+    $('t-msg').textContent = '';      // stale errors outlived the quote
+    $('t-msg').className = 'msg';
+    const slipWasOpen = !$('t-slip').classList.contains('hidden');
     const blank = () => {
       $('t-towin').textContent = '—'; $('t-odds').textContent = '—';
       $('t-profit').textContent = ''; $('t-oddsnote').textContent = '';
     };
-    if (!current || !current.tradable || !(stake > 0)) { blank(); $('t-detail').textContent = ''; warn(''); return; }
+    if (!current || !current.tradable || !(stake > 0)) {
+      blank();
+      $('t-detail').textContent = '';
+      warn('');
+      lastQuote = null;               // nothing to review
+      $('t-buy').disabled = true;
+      $('t-buy').textContent = 'Enter a stake';
+      return;
+    }
 
     // Check the balance HERE, not after the user commits and the server
     // answers with "need 600.000000, have 503.945114".
@@ -1066,6 +1091,7 @@ export function renderUi(prefix) {
     try {
       const q = await api('/markets/' + current.id + '/quote?side=buy&outcome=' + pick + '&spend=' + stake);
       if (seq !== quoteSeq) return; // a newer quote already landed
+      q.spend = stake;               // what the user actually typed
       lastQuote = q;
       $('t-towin').textContent = cr(q.toWin);
       $('t-odds').textContent = q.odds ? q.odds.toFixed(2) : '—';
@@ -1077,7 +1103,11 @@ export function renderUi(prefix) {
       // as you buy. Say so, rather than showing two different "odds".
       const spot = current.prices[pick];
       const impact = q.avgPrice - spot; // percentage POINTS, not relative
-      $('t-oddsnote').textContent = 'fills at ' + pct(q.avgPrice) + ' (now ' + pct(spot) + ')';
+      $('t-oddsnote').textContent = 'after slippage · market ' + (1 / Math.max(spot, 1e-6)).toFixed(2);
+      // If a slip is open, RE-PRICE it rather than deleting it — someone
+      // else's trade silently destroying your confirmation is unusable
+      // on exactly the busy markets this product is for.
+      if (slipWasOpen) reviewBet(true);
 
       const ok = me && me.agent !== current.oracle && me.agent !== current.creator;
       if (q.profit <= 0) {
@@ -1104,27 +1134,59 @@ export function renderUi(prefix) {
   }
 
   function cancelSlip() {
+    const hadFocus = $('t-slip').contains(document.activeElement);
     $('t-slip').classList.add('hidden');
     $('t-detail').classList.remove('hidden');
     $('t-buy').classList.remove('hidden');
-    if (slipTimer) { clearTimeout(slipTimer); slipTimer = null; }
+    if (slipTimer) { clearInterval(slipTimer); slipTimer = null; }
+    // Never strand focus on a hidden control — Tab from there restarts
+    // at the top of the document, mid-purchase.
+    if (hadFocus) $('t-buy').focus();
   }
   let slipTimer = null;
 
   // Review before commit. The bet was the one irreversible action in the
   // product and the only one with no confirmation.
-  function reviewBet() {
+  function reviewBet(reprice) {
     if (!lastQuote || !current) return;
+    // Re-assert the typed stake: the slip must never state a wager the
+    // ticket did not quote.
+    if (!reprice && Number($('t-stake').value) !== lastQuote.spend) { quote(); return; }
     $('t-slip-copy').innerHTML = '<div class="lead">Risk ' + cr(lastQuote.total) + ' on '
       + esc(current.outcomes[pick]) + '</div>'
-      + '<div class="hint">You pay at most ' + cr(lastQuote.total * 1.02) + ' if the price moves.</div>';
+      + '<div class="lead" style="font-size:var(--t-title);color:var(--up)">Returns '
+      + cr(lastQuote.toWin) + ' (+' + cr(lastQuote.profit) + ') at '
+      + (lastQuote.odds || 0).toFixed(2) + '</div>'
+      + '<div class="hint">You pay at most ' + cr(lastQuote.total * 1.02) + ' if the price moves.'
+      + ' <span id="t-countdown"></span></div>';
     $('t-detail').classList.add('hidden');
     $('t-slip').classList.remove('hidden');
     $('t-buy').classList.add('hidden');
-    $('t-confirm').focus();
-    // A quote goes stale; expire the slip rather than filling at a price
-    // the user reviewed a minute ago.
-    slipTimer = setTimeout(() => { cancelSlip(); quote(); toast('Quote expired — check the price and try again'); }, 15000);
+    if (!reprice) $('t-confirm').focus();
+    // A quote goes stale, but a silent 15s cut is a WCAG 2.2.1 failure
+    // and too short to read. Count down visibly, offer an extension, and
+    // never expire while the user is still inside the slip.
+    let left = 60;
+    const tick = () => {
+      const el = $('t-countdown');
+      if (!el) return;
+      el.innerHTML = left > 0
+        ? 'This price holds for <b>' + left + 's</b>. <button type="button" class="small" id="t-extend">Keep this price</button>'
+        : '';
+      const ext = $('t-extend');
+      if (ext) ext.onclick = () => { left = 60; tick(); };
+    };
+    tick();
+    slipTimer = setInterval(() => {
+      left -= 1;
+      if (left <= 0) {
+        cancelSlip();
+        quote();
+        $('t-msg').textContent = 'That price expired — check the new price and review again.';
+        return;
+      }
+      tick();
+    }, 1000);
   }
 
   async function placeBet() {
