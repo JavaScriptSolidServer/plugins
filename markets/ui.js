@@ -22,7 +22,8 @@
 //   - --up/--down never colour a button, only a number;
 //   - one left edge: the gutter lives on `main`, children sit flush.
 
-export function renderUi(prefix) {
+export function renderUi(prefix, opts = {}) {
+  const accounts = !!opts.accounts; // standalone host: register/login form
   const P = JSON.stringify(prefix);
   return `<!doctype html>
 <html lang="en">
@@ -296,6 +297,13 @@ export function renderUi(prefix) {
     .brand span{display:none}
     .stats{grid-template-columns:repeat(2,1fr)}
   }
+.board{list-style:none;margin:0;padding:0}
+.board li{display:flex;align-items:baseline;gap:var(--s3);padding:var(--s2) 0;border-bottom:1px solid var(--line);font-size:var(--f-sm)}
+.board li:last-child{border-bottom:0}
+.board li.you .board-name{font-weight:700;color:var(--accent,inherit)}
+.board-rank{color:var(--ink-3);font-variant-numeric:tabular-nums;min-width:1.4em;text-align:right}
+.board-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.board-pl{font-variant-numeric:tabular-nums;font-weight:600}
 </style>
 </head>
 <body>
@@ -327,6 +335,17 @@ export function renderUi(prefix) {
 <main id="main">
   <div class="card hidden" id="auth-card">
     <h2>Start with 1,000 free paper credits</h2>
+    ${accounts ? `
+    <p class="hint">Pick a username, get 1,000 paper credits, and start calling the news. Your
+       session is an HttpOnly cookie scoped to this app; nothing is stored in the browser.</p>
+    <div class="row">
+      <label class="sr" for="acct-user">Username</label>
+      <input id="acct-user" autocomplete="username" placeholder="Username" style="flex:1;min-width:130px">
+      <label class="sr" for="acct-pass">Password</label>
+      <input id="acct-pass" type="password" autocomplete="current-password" placeholder="Password" style="flex:1;min-width:130px">
+      <button type="button" class="primary" id="do-acct-signin">Sign in</button>
+      <button type="button" id="do-acct-register">Create account</button>
+    </div>` : `
     <p class="hint">New accounts are granted 1,000 paper credits to bet with. Sign in with a pod
        bearer token (from <code>POST /idp/credentials</code>) — it is exchanged for a session cookie
        scoped to this app and <b>never stored in the browser</b>, so this page cannot leak access to
@@ -335,7 +354,7 @@ export function renderUi(prefix) {
       <label class="sr" for="token">Pod bearer token</label>
       <input id="token" type="password" placeholder="Pod bearer token" style="flex:1;min-width:200px">
       <button type="button" class="primary" id="do-signin">Start session</button>
-    </div>
+    </div>`}
     <div class="msg" id="auth-msg" role="alert"></div>
   </div>
 
@@ -359,6 +378,10 @@ export function renderUi(prefix) {
       </div>
 
       <aside class="rail">
+        <div class="card" id="board-card">
+          <h2>Top predictors</h2>
+          <ol id="board" class="board"><li class="empty">No predictions yet.</li></ol>
+        </div>
         <div class="card hidden" id="me-card">
           <h2>My positions</h2>
           <div id="positions"></div>
@@ -1323,7 +1346,26 @@ export function renderUi(prefix) {
     } catch (e) { $('t-msg').textContent = e.message; $('t-msg').className = 'msg err'; }
   }
 
+  async function renderBoard() {
+    // The endpoint is signed-in-only and pseudonymized by design (a public
+    // wealth ranking of identities is recon); signed out, the card is the
+    // invitation instead.
+    const el = $('board');
+    try {
+      const { leaderboard } = await api('/leaderboard');
+      if (!leaderboard.length) { el.innerHTML = '<li class="empty">No predictions yet.</li>'; return; }
+      el.innerHTML = leaderboard.slice(0, 10).map((r) =>
+        '<li' + (r.you ? ' class="you"' : '') + '><span class="board-rank">' + r.rank + '</span>'
+        + '<span class="board-name">' + (r.you ? 'you' : esc(agentName(r.agent))) + '</span>'
+        + '<span class="board-pl">' + r.balance.toFixed(2) + '</span></li>').join('');
+    } catch {
+      el.innerHTML = '<li class="empty">Sign in to see the top predictors.</li>';
+    }
+  }
+  setInterval(renderBoard, 30000);
+
   async function route() {
+    renderBoard();
     const h = location.hash;
     if (h.startsWith('#m/')) return renderDetail(h.slice(3), true);
     $('detail-view').classList.add('hidden');
@@ -1358,17 +1400,40 @@ export function renderUi(prefix) {
     if (me) { await api('/session', { method: 'DELETE' }); me = null; await refreshMe(true); await route(); return; }
     $('auth-card').classList.remove('hidden');
     $('auth-card').scrollIntoView({ behavior: 'smooth', block: 'center' });
-    $('token').focus();
+    ($('token') || $('acct-user')).focus();
   };
-  $('do-signin').onclick = async () => {
-    $('auth-msg').textContent = 'Starting session…'; $('auth-msg').className = 'msg';
+  async function startSession(bearer) {
+    await api('/session', { method: 'POST', headers: { authorization: 'Bearer ' + bearer } });
+    await refreshMe(); await route();
+    toast('Signed in');
+  }
+  if ($('do-signin')) {
+    $('do-signin').onclick = async () => {
+      $('auth-msg').textContent = 'Starting session…'; $('auth-msg').className = 'msg';
+      try {
+        await startSession($('token').value.trim());
+        $('token').value = '';
+      } catch (e) { $('auth-msg').textContent = e.message; $('auth-msg').className = 'msg err'; }
+    };
+  }
+  // Account mode (standalone host): register/login mint a bearer at
+  // {prefix}/api/{register,login}, then the normal session exchange runs.
+  async function acctAuth(pathName) {
+    const username = $('acct-user').value.trim();
+    const password = $('acct-pass').value;
+    $('auth-msg').textContent = pathName === '/register' ? 'Creating account…' : 'Signing in…';
+    $('auth-msg').className = 'msg';
     try {
-      await api('/session', { method: 'POST', headers: { authorization: 'Bearer ' + $('token').value.trim() } });
-      $('token').value = '';
-      await refreshMe(); await route();
-      toast('Signed in');
+      const r = await api(pathName, { method: 'POST', body: JSON.stringify({ username, password }) });
+      await startSession(r.token);
+      $('acct-pass').value = '';
     } catch (e) { $('auth-msg').textContent = e.message; $('auth-msg').className = 'msg err'; }
-  };
+  }
+  if ($('do-acct-signin')) {
+    $('do-acct-signin').onclick = () => acctAuth('/login');
+    $('do-acct-register').onclick = () => acctAuth('/register');
+    $('acct-pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') acctAuth('/login'); });
+  }
   $('back').onclick = (e) => { e.preventDefault(); location.hash = ''; };
   $('t-buy').onclick = () => {
     if (!me) {

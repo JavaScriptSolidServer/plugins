@@ -132,12 +132,13 @@ export function isAgentId(s) {
 }
 
 export async function activate(api) {
-  const prefix = api.prefix || '/markets';
+  const prefix = api.prefix ?? '/markets'; // '' = site root (standalone host)
   const cfg = api.config || {};
 
   // ------------------------------------------------------------ config
   const num = (v, d) => (v === undefined ? d : v);
   const grantMicro = Math.round(num(cfg.grantCredits, 1000) * MICRO);
+  const accountsUi = !!cfg.accountsUi; // standalone hosts: register/login form instead of pod-bearer paste
   const feeBps = num(cfg.feeBps, 100);
   const houseFeeShareBps = num(cfg.houseFeeShareBps, 5000);
   const disputeWindowMs = num(cfg.disputeWindowMs, 60 * 60 * 1000);
@@ -1307,7 +1308,7 @@ export async function activate(api) {
   // ---------------------------------------------------------------- UI
   const uiHandler = async (request, reply) => {
     for (const [k, v] of Object.entries(UI_HEADERS)) reply.header(k, v);
-    return reply.header('content-type', 'text/html; charset=utf-8').send(renderUi(prefix));
+    return reply.header('content-type', 'text/html; charset=utf-8').send(renderUi(prefix, { accounts: accountsUi }));
   };
   api.fastify.get(prefix, uiHandler);
   api.fastify.get(`${prefix}/`, uiHandler);
