@@ -904,7 +904,11 @@ export function renderUi(prefix) {
       return;
     }
     if (seq !== detailSeq) return; // a newer render already landed
-    if (!current || current.id !== m.id) { pick = 0; newIntent(); $('t-fill').textContent = ''; }
+    if (!current || current.id !== m.id) {
+      // A confirmation opened for one market must not follow the user to
+      // another still armed.
+      pick = 0; newIntent(); cancelSlip(); $('t-fill').textContent = '';
+    }
     current = m;
     $('list-view').classList.add('hidden');
     $('detail-view').classList.remove('hidden');
@@ -944,7 +948,7 @@ export function renderUi(prefix) {
     // to BODY every few seconds on a live market.
     const existing = $('d-outcomes').querySelectorAll('.out-btn');
     const reuse = !settledView(m) && existing.length === m.outcomes.length
-      && existing[0].dataset.o === m.outcomes[0];
+      && m.outcomes.every((o, i) => existing[i].dataset.o === o);
     if (reuse) {
       existing.forEach((b, i) => {
         b.querySelector('.pc').textContent = pct(m.prices[i]);
@@ -1011,12 +1015,13 @@ export function renderUi(prefix) {
       // A decided market has no "current price". Show what happened, not
       // a mark-to-market on prices that no longer mean anything.
       pd.classList.remove('hidden');
+      pd.dataset.shape = '';   // settled card is a different shape entirely
       const won = m.resolvedOutcome;
       const receipt = (me && (me.settlements || []).find((x) => x.market === m.id)) || null;
       const returned = receipt ? receipt.payout : null;
       const net = receipt ? (receipt.net === undefined ? receipt.payout : receipt.net) : null;
       pd.innerHTML = '<h2>Your bet</h2>'
-        + '<table><thead><tr><th>Bet</th><th class="num">Sell now for</th><th class="num"></th></tr></thead>'
+        + '<table><thead><tr><th>Bet</th><th class="num">Result</th></tr></thead>'
         + '<tbody>' + pos.shares.map((s, i) => (s > 0
           ? '<tr><td class="' + (m.status === 'resolved' && i !== won ? 'lost' : '') + '">'
             + '<i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:'
@@ -1034,25 +1039,51 @@ export function renderUi(prefix) {
     } else if (pos && pos.shares.some((s) => s > 0)) {
       pd.classList.remove('hidden');
       const cls = pos.unrealizedPnl >= 0 ? 'up' : 'down';
+      // Update the numbers in place when the position's shape is
+      // unchanged; rebuilding threw focus off the Cash out buttons every
+      // time anyone else traded.
+      const legs = pos.shares.map((s, i) => (s > 0 ? i : -1)).filter((i) => i >= 0);
+      const shape = m.id + ':' + legs.join(',');
+      if (pd.dataset.shape === shape) {
+        legs.forEach((i) => {
+          const row = pd.querySelector('tr[data-i="' + i + '"]');
+          if (!row) return;
+          row.querySelector('.v-now').textContent = cr(pos.value[i]);
+          const d = row.querySelector('.v-pnl');
+          d.textContent = (pos.value[i] >= pos.cost[i] ? '+' : '') + cr(pos.value[i] - pos.cost[i]);
+          d.className = 'pnl ' + (pos.value[i] >= pos.cost[i] ? 'up' : 'down');
+        });
+        const tot = pd.querySelector('.v-total');
+        if (tot) {
+          tot.textContent = (pos.unrealizedPnl >= 0 ? '+' : '') + cr(pos.unrealizedPnl);
+          tot.className = 'pnl ' + (pos.unrealizedPnl >= 0 ? 'up' : 'down');
+        }
+        const cost = pd.querySelector('.v-cost');
+        if (cost) cost.textContent = 'cost ' + cr(pos.totalCost) + ' · value ' + cr(pos.totalValue);
+        return;
+      }
+      pd.dataset.shape = shape;
       pd.innerHTML = '<h2>Your position</h2>'
-        + '<table><tbody>' + pos.shares.map((s, i) => (s > 0
-          ? '<tr><td><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:'
+        + '<table><thead><tr><th>Bet</th><th class="num">Sell now for</th>'
+        + '<th class="num"><span class="sr">Actions</span></th></tr></thead>'
+        + '<tbody>' + pos.shares.map((s, i) => (s > 0
+          ? '<tr data-i="' + i + '"><td><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:'
             + col(i) + '"></i> <b>' + esc(m.outcomes[i]) + '</b>'
             + '<div class="meta">risked ' + cr(pos.cost[i]) + '<span class="dot">→</span>returns '
             + cr(s) + ' if right</div></td>'
-            + '<td class="num">' + cr(pos.value[i])
-            + '<div class="pnl ' + (pos.value[i] >= pos.cost[i] ? 'up' : 'down') + '">'
+            + '<td class="num"><span class="v-now">' + cr(pos.value[i]) + '</span>'
+            + '<div class="v-pnl pnl ' + (pos.value[i] >= pos.cost[i] ? 'up' : 'down') + '">'
             + (pos.value[i] >= pos.cost[i] ? '+' : '') + cr(pos.value[i] - pos.cost[i]) + '</div></td>'
             + '<td class="num">' + (m.tradable
               ? '<button type="button" class="small cash sell-one" data-i="' + i + '">Cash out</button>' : '') + '</td></tr>'
           : '')).join('') + '</tbody></table>'
-        + '<div class="row"><span class="hint">cost ' + cr(pos.totalCost) + ' · value ' + cr(pos.totalValue)
-        + '</span><span class="spacer"></span><span class="pnl ' + cls + '">'
+        + '<div class="row"><span class="hint v-cost">cost ' + cr(pos.totalCost) + ' · value '
+        + cr(pos.totalValue) + '</span><span class="spacer"></span><span class="v-total pnl ' + cls + '">'
         + (pos.unrealizedPnl >= 0 ? '+' : '') + cr(pos.unrealizedPnl) + '</span></div>';
       pd.querySelectorAll('.sell-one').forEach((b) => {
         b.onclick = () => cashOut(m.id, Number(b.dataset.i));
       });
-    } else pd.classList.add('hidden');
+    } else { pd.classList.add('hidden'); pd.dataset.shape = ''; }
 
     $('oracle-card').classList.toggle('hidden', !(isYou && m.canResolve));
     $('o-outcome').innerHTML = m.outcomes.map((o, i) => '<option value="' + i + '">' + esc(o) + '</option>').join('');
@@ -1276,6 +1307,7 @@ export function renderUi(prefix) {
     $('list-view').classList.remove('hidden');
     document.title = 'Markets — prediction markets on your pod';
     current = null; cursor = null; paged = false;
+    cancelSlip();
     $('t-msg').textContent = ''; $('t-msg').className = 'msg';
     $('t-fill').textContent = '';
     renderTabs();
