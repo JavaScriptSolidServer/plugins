@@ -1618,9 +1618,14 @@ ${ogMeta}
     // Both server-visible forms are honoured: the path (/m/<id>) and the
     // query (?m=<id>). A fragment never reaches the server, which is why
     // shared #m/ links unfurled as the generic card.
-    const byPath = /\/m\/([A-Za-z0-9_-]+)\/?$/.exec(location.pathname);
+    // NO REGEX HERE: this file is one big server-side template literal, so
+    // a backslash escape is consumed before the browser ever sees it and
+    // /\/m\// arrives as //m// — which is a syntax error that takes the
+    // whole app down. Plain string work is immune.
+    const seg = location.pathname.split('/').filter(Boolean);
+    const byPath = seg.length >= 2 && seg[seg.length - 2] === 'm' ? seg[seg.length - 1] : null;
     const byQuery = new URLSearchParams(location.search).get('m');
-    const id = (byPath && byPath[1]) || byQuery;
+    const id = byPath || byQuery;
     if (!id || location.hash) return;
     history.replaceState(null, '', (PREFIX || '/') + '#m/' + id);
   })();

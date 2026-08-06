@@ -341,6 +341,23 @@ describe('markets plugin', () => {
     assert.ok(sorted, 'ordered by net worth, descending');
   });
 
+  it('the emitted client script actually parses (template-literal escapes bite)', async () => {
+    // ui.js is one big server-side template literal, so a backslash escape
+    // is consumed before the browser sees it: a regex like /\\/m\\// arrives
+    // as //m// and the ENTIRE app dies with "Unexpected token". Meta-tag
+    // assertions cannot see that; parsing can.
+    const { renderUi } = await import('./ui.js');
+    for (const opts of [{}, { accounts: true, brand: 'x', market: { id: 'a', title: 'T', category: 'C', status: 'open', closesAt: Date.now() + 8.64e7, outcomes: ['Yes', 'No'], prices: [0.5, 0.5] } }]) {
+      const html = renderUi('/markets', opts);
+      const scripts = [...html.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+      assert.ok(scripts.length >= 1, 'the page ships an inline script');
+      for (const src of scripts) {
+        // new Function COMPILES without executing: a SyntaxError throws here.
+        assert.doesNotThrow(() => new Function(src), 'inline client script must parse');
+      }
+    }
+  });
+
   it('exposes the category facets for topic browsing', async () => {
     const { categories } = await json(await call(null, 'GET', '/categories'), 200);
     assert.ok(Array.isArray(categories), 'a facet list is public');
