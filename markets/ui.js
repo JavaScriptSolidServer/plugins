@@ -34,7 +34,7 @@ export function renderUi(prefix) {
   :root{
     /* surfaces + ink */
     --surface:#eef1ee; --card:#ffffff; --raised:#ffffff;
-    --line:#dde4de; --line-strong:#8d9b93; /* 3.05:1 — control borders */
+    --line:#dde4de; --line-strong:#74837b; /* measured 3.98:1 on white, 3.50:1 on surface */
     --ink:#111815; --ink2:#4a564f; --ink3:#5e6b64;
     /* brand + semantics. up/down are P&L ONLY, never a button. */
     --accent:#0b6b4f; --accent-ink:#ffffff; --accent-tint:rgba(11,107,79,.08);
@@ -111,6 +111,12 @@ export function renderUi(prefix) {
   @media (min-width:1000px){
     .cols{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:var(--s6);align-items:start}
     .rail{position:sticky;top:calc(56px + var(--s4))}
+    /* The ticket is FIRST in the DOM so that on a phone the primary CTA
+       is both on screen and next in tab order. Desktop puts it back in
+       column two with grid order — doing it visually only would break
+       WCAG 1.3.2 again. */
+    #detail-view .cols>div:not(.rail){order:1}
+    #detail-view .rail{order:2}
   }
   .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r-card);
     box-shadow:var(--shadow);padding:var(--s4);margin:0 0 var(--s4)}
@@ -262,8 +268,9 @@ export function renderUi(prefix) {
   .msg.err{color:var(--down)}
   .hidden{display:none !important}
   .empty{color:var(--ink3);font-size:var(--t-meta);padding:var(--s6) 0;text-align:center}
-  .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:var(--s6);z-index:60;
-    background:var(--ink);color:var(--surface);padding:12px 16px;border-radius:var(--r-card);
+  .toasts{position:fixed;left:50%;transform:translateX(-50%);bottom:var(--s6);z-index:60;
+    display:flex;flex-direction:column-reverse;gap:var(--s2);align-items:center}
+  .toast{background:var(--ink);color:var(--surface);padding:12px 16px;border-radius:var(--r-card);
     font-size:var(--t-body);box-shadow:var(--shadow-lift);max-width:92vw}
   details>summary{list-style:none}
   details>summary::-webkit-details-marker{display:none}
@@ -293,6 +300,7 @@ export function renderUi(prefix) {
 </head>
 <body>
 <a class="skip" href="#main">Skip to markets</a>
+<div class="toasts" id="toasts"></div>
 <header class="topbar">
   <a class="brand" href="${prefix}">
     <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true">
@@ -421,6 +429,47 @@ export function renderUi(prefix) {
   <div id="detail-view" class="hidden">
     <p><a href="#" id="back">&larr; All markets</a></p>
     <div class="cols">
+      <aside class="rail">
+        <div class="ticket" id="ticket">
+          <div class="row" style="justify-content:space-between">
+            <span class="micro">Your bet</span>
+            <span class="on">on <b id="t-pick">—</b></span>
+          </div>
+          <div class="row">
+            <label class="micro" for="t-stake">Risk</label>
+            <input id="t-stake" type="number" min="0" step="1" value="10"
+              style="flex:1;min-width:90px;font-size:28px;font-weight:700;text-align:right;min-height:56px">
+            <span class="hint">credits</span>
+          </div>
+          <div class="stakes" id="t-chips" role="group" aria-label="Quick stake"></div>
+          <div class="payout">
+            <div>
+              <span class="micro">Returns</span>
+              <div><span class="big" id="t-towin">—</span><span class="unit">credits</span></div>
+              <div class="profit" id="t-profit"></div>
+            </div>
+            <div class="sep" aria-hidden="true"></div>
+            <div>
+              <span class="micro">Your odds</span>
+              <div class="odds" id="t-odds">—</div>
+              <div class="hint" id="t-oddsnote"></div>
+            </div>
+          </div>
+          <div class="warn hidden" id="t-warn"></div>
+          <button type="button" class="primary big" id="t-buy">Place bet</button>
+          <div class="slip hidden" id="t-slip">
+            <div id="t-slip-copy"></div>
+            <div class="hint" id="t-countdown"></div>
+            <div class="row">
+              <button type="button" class="primary big" id="t-confirm" style="flex:2">Confirm bet</button>
+              <button type="button" class="big ghost" id="t-cancel" style="flex:1">Cancel</button>
+            </div>
+          </div>
+          <div class="breakdown" id="t-detail"></div>
+          <div class="msg" id="t-fill"></div>
+          <div class="msg" id="t-msg" role="alert"></div>
+        </div>
+      </aside>
       <div>
         <div class="card">
           <div class="row" style="gap:var(--s2)"><span id="d-status"></span></div>
@@ -455,45 +504,6 @@ export function renderUi(prefix) {
         </div>
       </div>
 
-      <aside class="rail">
-        <div class="ticket" id="ticket">
-          <div class="row" style="justify-content:space-between">
-            <span class="micro">Your bet</span>
-            <span class="on">on <b id="t-pick">—</b></span>
-          </div>
-          <div class="row">
-            <label class="micro" for="t-stake">Risk</label>
-            <input id="t-stake" type="number" min="0" step="1" value="10"
-              style="flex:1;min-width:90px;font-size:28px;font-weight:700;text-align:right;min-height:56px">
-            <span class="hint">credits</span>
-          </div>
-          <div class="stakes" id="t-chips" role="group" aria-label="Quick stake"></div>
-          <div class="payout">
-            <div>
-              <span class="micro">Returns</span>
-              <div><span class="big" id="t-towin">—</span><span class="unit">credits</span></div>
-              <div class="profit" id="t-profit"></div>
-            </div>
-            <div class="sep" aria-hidden="true"></div>
-            <div>
-              <span class="micro">Your odds</span>
-              <div class="odds" id="t-odds">—</div>
-              <div class="hint" id="t-oddsnote"></div>
-            </div>
-          </div>
-          <div class="warn hidden" id="t-warn"></div>
-          <button type="button" class="primary big" id="t-buy">Place bet</button>
-          <div class="slip hidden" id="t-slip">
-            <div id="t-slip-copy"></div>
-            <div class="row">
-              <button type="button" class="primary big" id="t-confirm" style="flex:2">Confirm bet</button>
-              <button type="button" class="big ghost" id="t-cancel" style="flex:1">Cancel</button>
-            </div>
-          </div>
-          <div class="breakdown" id="t-detail"></div>
-          <div class="msg" id="t-msg" role="alert"></div>
-        </div>
-      </aside>
     </div>
   </div>
 </main>
@@ -536,7 +546,7 @@ export function renderUi(prefix) {
     const el = document.createElement('div');
     el.className = 'toast'; el.textContent = text;
     el.setAttribute('role', 'status'); el.setAttribute('aria-live', 'polite');
-    document.body.appendChild(el);
+    $('toasts').appendChild(el);   // stack, don't pile in one pixel
     setTimeout(() => el.remove(), ms);
   }
 
@@ -632,7 +642,7 @@ export function renderUi(prefix) {
       const totalVal = me.positions.reduce((a, p) => a + p.totalValue, 0);
       const totalPnl = me.positions.reduce((a, p) => a + p.unrealizedPnl, 0);
       el.innerHTML = '<div class="row" style="justify-content:space-between;align-items:baseline">'
-        + '<span><span class="micro">Open value</span> <b style="font-size:var(--t-title)">' + cr(totalVal) + '</b></span>'
+        + '<span><span class="micro">Sell all now for</span> <b style="font-size:var(--t-title)">' + cr(totalVal) + '</b></span>'
         + '<span class="pnl ' + (totalPnl >= 0 ? 'up' : 'down') + '">'
         + (totalPnl >= 0 ? '+' : '') + cr(totalPnl) + '</span></div>'
         + '<ul class="mlist">' + me.positions.map((p) => {
@@ -644,7 +654,7 @@ export function renderUi(prefix) {
             + '<span style="min-width:0"><span class="t" style="font-size:var(--t-meta);font-weight:600">'
             + esc(p.title) + '</span>'
             + '<div class="meta" style="margin-top:2px">' + esc(on.join(', '))
-            + '<span class="dot">·</span>worth ' + cr(p.totalValue) + '</div></span>'
+            + '<span class="dot">·</span>sell now for ' + cr(p.totalValue) + '</div></span>'
             + '<span class="pnl ' + cls + '" style="white-space:nowrap">' + sign + cr(p.unrealizedPnl)
             + (p.totalCost > 0 ? '<div class="hint" style="text-align:right">' + sign
                 + (p.unrealizedPnl / p.totalCost * 100).toFixed(0) + '%</div>' : '')
@@ -894,7 +904,7 @@ export function renderUi(prefix) {
       return;
     }
     if (seq !== detailSeq) return; // a newer render already landed
-    if (!current || current.id !== m.id) { pick = 0; newIntent(); }
+    if (!current || current.id !== m.id) { pick = 0; newIntent(); $('t-fill').textContent = ''; }
     current = m;
     $('list-view').classList.add('hidden');
     $('detail-view').classList.remove('hidden');
@@ -929,8 +939,21 @@ export function renderUi(prefix) {
 
     if (pick >= m.outcomes.length) pick = 0;
     const held = m.position ? m.position.shares : m.outcomes.map(() => 0);
-    $('d-outcomes').innerHTML = m.outcomes.map((o, i) =>
-      '<button type="button" class="out-btn" data-i="' + i + '" aria-pressed="' + (i === pick) + '" style="--oc:' + col(i) + '">'
+    // Update prices IN PLACE when the market's shape hasn't changed.
+    // Rebuilding this container on every price tick threw keyboard focus
+    // to BODY every few seconds on a live market.
+    const existing = $('d-outcomes').querySelectorAll('.out-btn');
+    const reuse = !settledView(m) && existing.length === m.outcomes.length
+      && existing[0].dataset.o === m.outcomes[0];
+    if (reuse) {
+      existing.forEach((b, i) => {
+        b.querySelector('.pc').textContent = pct(m.prices[i]);
+        b.querySelector('.od').firstChild.nodeValue = (1 / Math.max(m.prices[i], 1e-6)).toFixed(2);
+        b.setAttribute('aria-pressed', String(i === pick));
+      });
+    } else $('d-outcomes').innerHTML = m.outcomes.map((o, i) =>
+      '<button type="button" class="out-btn" data-i="' + i + '" data-o="' + esc(o) + '"'
+      + ' aria-pressed="' + (i === pick) + '" style="--oc:' + col(i) + '">'
       + '<span class="nm">' + esc(o)
       + (held[i] > 0 ? '<div class="meta" style="margin:0">you hold ' + cr(held[i]) + ' to win</div>' : '')
       + '</span>'
@@ -938,7 +961,7 @@ export function renderUi(prefix) {
       + '<span class="od">' + (1 / Math.max(m.prices[i], 1e-6)).toFixed(2)
       + '<span class="sr"> decimal odds</span></span>'
       + '</button>').join('');
-    $('d-outcomes').querySelectorAll('.out-btn').forEach((b) => {
+    if (!reuse) $('d-outcomes').querySelectorAll('.out-btn').forEach((b) => {
       b.onclick = () => {
         // Toggle in place. Rebuilding the container threw keyboard focus
         // to the top of the document and re-fetched the whole market
@@ -961,8 +984,9 @@ export function renderUi(prefix) {
       // 4.31:1. Odds and the live bar are suppressed too — you could
       // read odds on a team that had already lost.
       $('d-outcomes').innerHTML = m.outcomes.map((o, i) =>
-        '<div class="out-btn" style="--oc:' + col(i) + ';cursor:default"'
-        + (m.status === 'resolved' && i !== m.resolvedOutcome ? ' class="lost"' : '') + '>'
+        '<div class="out-btn'
+        + (m.status === 'resolved' && i !== m.resolvedOutcome ? ' lost' : '')
+        + '" style="--oc:' + col(i) + ';cursor:default;min-height:44px">'
         + '<span class="nm"' + (m.status === 'resolved' && i !== m.resolvedOutcome
             ? ' style="text-decoration:line-through;color:var(--ink3)"' : '') + '>' + esc(o) + '</span>'
         + '<span class="pc">' + (m.status === 'void' ? 'refunded'
@@ -992,7 +1016,8 @@ export function renderUi(prefix) {
       const returned = receipt ? receipt.payout : null;
       const net = receipt ? (receipt.net === undefined ? receipt.payout : receipt.net) : null;
       pd.innerHTML = '<h2>Your bet</h2>'
-        + '<table><tbody>' + pos.shares.map((s, i) => (s > 0
+        + '<table><thead><tr><th>Bet</th><th class="num">Sell now for</th><th class="num"></th></tr></thead>'
+        + '<tbody>' + pos.shares.map((s, i) => (s > 0
           ? '<tr><td class="' + (m.status === 'resolved' && i !== won ? 'lost' : '') + '">'
             + '<i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:'
             + col(i) + '"></i> ' + esc(m.outcomes[i]) + ' — risked ' + cr(pos.cost[i]) + '</td>'
@@ -1139,11 +1164,18 @@ export function renderUi(prefix) {
     $('t-detail').classList.remove('hidden');
     $('t-buy').classList.remove('hidden');
     if (slipTimer) { clearInterval(slipTimer); slipTimer = null; }
+    $('t-countdown').innerHTML = '';   // so the next slip rebuilds it
     // Never strand focus on a hidden control — Tab from there restarts
     // at the top of the document, mid-purchase.
-    if (hadFocus) $('t-buy').focus();
+    if (hadFocus) {
+      // .focus() on a disabled control is a no-op, which left focus on
+      // the hidden Confirm button.
+      const target = $('t-buy').disabled ? $('t-stake') : $('t-buy');
+      target.focus();
+    }
   }
   let slipTimer = null;
+  let slipLeft = 0;
 
   // Review before commit. The bet was the one irreversible action in the
   // product and the only one with no confirmation.
@@ -1157,43 +1189,50 @@ export function renderUi(prefix) {
       + '<div class="lead" style="font-size:var(--t-title);color:var(--up)">Returns '
       + cr(lastQuote.toWin) + ' (+' + cr(lastQuote.profit) + ') at '
       + (lastQuote.odds || 0).toFixed(2) + '</div>'
-      + '<div class="hint">You pay at most ' + cr(lastQuote.total * 1.02) + ' if the price moves.'
-      + ' <span id="t-countdown"></span></div>';
+      + '<div class="hint">You pay at most ' + cr(lastQuote.total * 1.02) + ' if the price moves.</div>';
     $('t-detail').classList.add('hidden');
     $('t-slip').classList.remove('hidden');
     $('t-buy').classList.add('hidden');
     if (!reprice) $('t-confirm').focus();
+    // ONE timer per slip. Re-pricing must not start a second one.
+    if (slipTimer) { clearInterval(slipTimer); slipTimer = null; }
     // A quote goes stale, but a silent 15s cut is a WCAG 2.2.1 failure
     // and too short to read. Count down visibly, offer an extension, and
     // never expire while the user is still inside the slip.
-    let left = 60;
-    const tick = () => {
-      const el = $('t-countdown');
-      if (!el) return;
-      el.innerHTML = left > 0
-        ? 'This price holds for <b>' + left + 's</b>. <button type="button" class="small" id="t-extend">Keep this price</button>'
-        : '';
-      const ext = $('t-extend');
-      if (ext) ext.onclick = () => { left = 60; tick(); };
-    };
-    tick();
+    // A re-price keeps the user's remaining time rather than silently
+    // granting a fresh 60s on someone else's trade.
+    if (!reprice || !(slipLeft > 0)) slipLeft = 60;
+    // Build the countdown ONCE: rewriting this container's innerHTML on
+    // every tick destroyed and recreated the button, so focus landed on
+    // BODY a second after you reached it.
+    // Build it ONCE per slip. Re-pricing must not destroy a control the
+    // user may be focused on.
+    if (!$('t-extend')) {
+      $('t-countdown').innerHTML = 'This price holds for <b><span id="t-left"></span>s</b>. '
+        + '<button type="button" class="small" id="t-extend">Keep this price</button>';
+      $('t-extend').onclick = () => { slipLeft = 60; $('t-left').textContent = slipLeft; };
+    }
+    const paint = () => { const el = $('t-left'); if (el) el.textContent = slipLeft; };
+    paint();
     slipTimer = setInterval(() => {
-      left -= 1;
-      if (left <= 0) {
+      slipLeft -= 1;
+      if (slipLeft <= 0) {
         cancelSlip();
         quote();
         $('t-msg').textContent = 'That price expired — check the new price and review again.';
         return;
       }
-      tick();
+      paint();
     }, 1000);
   }
 
   async function placeBet() {
     if (!lastQuote) return;
-    cancelSlip();
+    // Disable BEFORE restoring focus: doing it after blew focus off the
+    // element cancelSlip() had just focused, landing on BODY.
     $('t-msg').textContent = ''; $('t-msg').className = 'msg';
     $('t-buy').disabled = true;
+    cancelSlip();
     try {
       if (!betKey) betKey = uid(); // one key per INTENT, so a retry replays
       const r = await api('/markets/' + current.id + '/trade', {
@@ -1202,7 +1241,11 @@ export function renderUi(prefix) {
         body: JSON.stringify({ side: 'buy', outcome: pick, spend: Number($('t-stake').value), maxCost: lastQuote.total * 1.02 }),
       });
       betKey = null;
-      toast('Bet placed — ' + cr(r.shares) + ' × ' + r.outcomeLabel + ', returns ' + cr(r.toWin));
+      toast('Bet placed — ' + cr(r.total) + ' on ' + r.outcomeLabel + ', returns ' + cr(r.toWin));
+      // A persistent record on the page: a 4.5s toast that a settlement
+      // toast can paint over is not a receipt.
+      $('t-fill').innerHTML = '<b>Bet placed.</b> ' + cr(r.total) + ' on ' + esc(r.outcomeLabel)
+        + ' → returns ' + cr(r.toWin) + '. Balance ' + cr(r.balance) + '.';
       await refreshMe(); await renderDetail(current.id, true);
     } catch (e) {
       $('t-msg').textContent = e.message + (e.status === 409 ? ' — refresh the quote and try again' : '');
@@ -1213,6 +1256,7 @@ export function renderUi(prefix) {
       const ok = current && current.tradable && me
         && me.agent !== current.oracle && me.agent !== current.creator;
       $('t-buy').disabled = !ok;
+      if (ok && document.activeElement === document.body) $('t-buy').focus();
     }
   }
 
@@ -1232,6 +1276,8 @@ export function renderUi(prefix) {
     $('list-view').classList.remove('hidden');
     document.title = 'Markets — prediction markets on your pod';
     current = null; cursor = null; paged = false;
+    $('t-msg').textContent = ''; $('t-msg').className = 'msg';
+    $('t-fill').textContent = '';
     renderTabs();
     return renderList();
   }
