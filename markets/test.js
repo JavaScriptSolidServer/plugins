@@ -328,6 +328,28 @@ describe('markets plugin', () => {
   });
 
   // ======================================================== the market
+  it('the leaderboard ranks by NET WORTH, so a fully-invested trader is not last', async () => {
+    // Ranking on idle cash is perverse here: bet everything and you sink.
+    const { leaderboard: rows } = await json(await call('alice', 'GET', '/leaderboard'), 200);
+    assert.ok(rows.length >= 2);
+    for (const r of rows) {
+      assert.ok(typeof r.netWorth === 'number', 'every row carries net worth');
+      assert.ok(typeof r.profit === 'number', 'and profit against the grant');
+      assert.ok(r.netWorth >= r.balance - 1e-9, 'net worth includes positions, so it is never below cash');
+    }
+    const sorted = rows.every((r, i) => i === 0 || rows[i - 1].netWorth >= r.netWorth);
+    assert.ok(sorted, 'ordered by net worth, descending');
+  });
+
+  it('exposes the category facets for topic browsing', async () => {
+    const { categories } = await json(await call(null, 'GET', '/categories'), 200);
+    assert.ok(Array.isArray(categories), 'a facet list is public');
+    for (const c of categories) {
+      assert.ok(typeof c.name === 'string' && c.name);
+      assert.ok(Number.isInteger(c.open) && c.open > 0, 'counts only open markets');
+    }
+  });
+
   it('grants on first touch and conserves from the start', async () => {
     for (const u of ['alice', 'bob', 'carol']) assert.strictEqual(await balance(u), GRANT);
     await assertConserved('after grants');

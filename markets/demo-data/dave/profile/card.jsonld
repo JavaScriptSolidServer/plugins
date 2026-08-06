@@ -1,0 +1,100 @@
+{
+  "@context": {
+    "foaf": "http://xmlns.com/foaf/0.1/",
+    "solid": "http://www.w3.org/ns/solid/terms#",
+    "schema": "http://schema.org/",
+    "pim": "http://www.w3.org/ns/pim/space#",
+    "ldp": "http://www.w3.org/ns/ldp#",
+    "cid": "https://www.w3.org/ns/cid/v1#",
+    "lws": "https://www.w3.org/ns/lws#",
+    "inbox": {
+      "@id": "ldp:inbox",
+      "@type": "@id"
+    },
+    "storage": {
+      "@id": "pim:storage",
+      "@type": "@id"
+    },
+    "oidcIssuer": {
+      "@id": "solid:oidcIssuer",
+      "@type": "@id"
+    },
+    "preferencesFile": {
+      "@id": "pim:preferencesFile",
+      "@type": "@id"
+    },
+    "publicTypeIndex": {
+      "@id": "solid:publicTypeIndex",
+      "@type": "@id"
+    },
+    "privateTypeIndex": {
+      "@id": "solid:privateTypeIndex",
+      "@type": "@id"
+    },
+    "isPrimaryTopicOf": {
+      "@id": "foaf:isPrimaryTopicOf",
+      "@type": "@id"
+    },
+    "mainEntityOfPage": {
+      "@id": "schema:mainEntityOfPage",
+      "@type": "@id"
+    },
+    "service": {
+      "@id": "cid:service",
+      "@container": "@set"
+    },
+    "serviceEndpoint": {
+      "@id": "cid:serviceEndpoint",
+      "@type": "@id"
+    },
+    "controller": {
+      "@id": "cid:controller",
+      "@type": "@id"
+    },
+    "verificationMethod": {
+      "@id": "cid:verificationMethod",
+      "@container": "@set"
+    },
+    "authentication": {
+      "@id": "cid:authentication",
+      "@type": "@id",
+      "@container": "@set"
+    },
+    "assertionMethod": {
+      "@id": "cid:assertionMethod",
+      "@type": "@id",
+      "@container": "@set"
+    },
+    "publicKeyJwk": {
+      "@id": "cid:publicKeyJwk",
+      "@type": "@json"
+    },
+    "publicKeyMultibase": {
+      "@id": "cid:publicKeyMultibase"
+    },
+    "Multikey": "cid:Multikey",
+    "JsonWebKey": "cid:JsonWebKey"
+  },
+  "@id": "http://localhost:3399/dave/profile/card.jsonld#me",
+  "@type": [
+    "foaf:Person",
+    "schema:Person"
+  ],
+  "foaf:name": "dave",
+  "isPrimaryTopicOf": "",
+  "mainEntityOfPage": "",
+  "controller": "http://localhost:3399/dave/profile/card.jsonld#me",
+  "inbox": "http://localhost:3399/dave/inbox/",
+  "storage": "http://localhost:3399/dave/",
+  "oidcIssuer": "http://localhost:3399",
+  "preferencesFile": "http://localhost:3399/dave/settings/prefs.jsonld",
+  "publicTypeIndex": "http://localhost:3399/dave/settings/publicTypeIndex.jsonld",
+  "privateTypeIndex": "http://localhost:3399/dave/settings/privateTypeIndex.jsonld",
+  "service": [
+    {
+      "@id": "http://localhost:3399/dave/profile/card.jsonld#oidc",
+      "@type": "lws:OpenIdProvider",
+      "serviceEndpoint": "http://localhost:3399"
+    }
+  ]
+}

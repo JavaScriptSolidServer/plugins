@@ -1,0 +1,10 @@
+{
+  "@context": {
+    "solid": "http://www.w3.org/ns/solid/terms#"
+  },
+  "@id": "http://localhost:3399/alice/settings/publicTypeIndex.jsonld",
+  "@type": [
+    "solid:TypeIndex",
+    "solid:ListedDocument"
+  ]
+}

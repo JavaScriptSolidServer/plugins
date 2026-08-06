@@ -1,0 +1,50 @@
+{
+  "@context": {
+    "acl": "http://www.w3.org/ns/auth/acl#",
+    "foaf": "http://xmlns.com/foaf/0.1/"
+  },
+  "@graph": [
+    {
+      "@id": "#owner",
+      "@type": "acl:Authorization",
+      "acl:agent": {
+        "@id": "../profile/card.jsonld#me"
+      },
+      "acl:accessTo": {
+        "@id": "./"
+      },
+      "acl:default": {
+        "@id": "./"
+      },
+      "acl:mode": [
+        {
+          "@id": "acl:Read"
+        },
+        {
+          "@id": "acl:Write"
+        },
+        {
+          "@id": "acl:Control"
+        }
+      ]
+    },
+    {
+      "@id": "#public",
+      "@type": "acl:Authorization",
+      "acl:agentClass": {
+        "@id": "foaf:Agent"
+      },
+      "acl:accessTo": {
+        "@id": "./"
+      },
+      "acl:default": {
+        "@id": "./"
+      },
+      "acl:mode": [
+        {
+          "@id": "acl:Append"
+        }
+      ]
+    }
+  ]
+}

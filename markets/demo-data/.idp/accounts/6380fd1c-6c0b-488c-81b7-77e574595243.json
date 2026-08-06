@@ -1,0 +1,10 @@
+{
+  "id": "6380fd1c-6c0b-488c-81b7-77e574595243",
+  "username": "alice",
+  "email": "alice@jss",
+  "passwordHash": "$2b$10$gZxdcnx7fqlXYM6/uEY2O.aJqJMH9bhLwo4c82O89V5p8iM5QHPJW",
+  "webId": "http://localhost:3399/alice/profile/card.jsonld#me",
+  "podName": "alice",
+  "createdAt": "2026-08-06T10:24:54.039Z",
+  "lastLogin": "2026-08-06T10:24:54.085Z"
+}

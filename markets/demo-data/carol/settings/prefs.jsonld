@@ -1,0 +1,17 @@
+{
+  "@context": {
+    "solid": "http://www.w3.org/ns/solid/terms#",
+    "pim": "http://www.w3.org/ns/pim/space#",
+    "publicTypeIndex": {
+      "@id": "solid:publicTypeIndex",
+      "@type": "@id"
+    },
+    "privateTypeIndex": {
+      "@id": "solid:privateTypeIndex",
+      "@type": "@id"
+    }
+  },
+  "@id": "http://localhost:3399/carol/settings/prefs.jsonld",
+  "publicTypeIndex": "http://localhost:3399/carol/settings/publicTypeIndex.jsonld",
+  "privateTypeIndex": "http://localhost:3399/carol/settings/privateTypeIndex.jsonld"
+}

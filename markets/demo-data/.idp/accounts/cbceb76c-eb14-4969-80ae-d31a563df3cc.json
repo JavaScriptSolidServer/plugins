@@ -1,0 +1,10 @@
+{
+  "id": "cbceb76c-eb14-4969-80ae-d31a563df3cc",
+  "username": "bob",
+  "email": "bob@jss",
+  "passwordHash": "$2b$10$jIQzOX595J0DunG2C6kbMe14Fl0TPTzoZCvJOn/HWRAwkFQpgQtFu",
+  "webId": "http://localhost:3399/bob/profile/card.jsonld#me",
+  "podName": "bob",
+  "createdAt": "2026-08-06T10:24:54.132Z",
+  "lastLogin": "2026-08-06T10:24:54.175Z"
+}

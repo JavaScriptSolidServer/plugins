@@ -319,6 +319,11 @@ ${ogMeta}
     .brand span{display:none}
     .stats{grid-template-columns:repeat(2,1fr)}
   }
+.chips{display:flex;flex-wrap:wrap;gap:var(--s2);margin:var(--s3) 0 0}
+.chips button{border:1px solid var(--line);background:var(--surface);color:var(--ink-2);border-radius:999px;padding:4px 12px;font-size:var(--f-sm);cursor:pointer}
+.chips button:hover{border-color:var(--accent);color:var(--ink)}
+.chips button[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.chips .n{opacity:.65;font-variant-numeric:tabular-nums;margin-left:.35em}
 .board{list-style:none;margin:0;padding:0}
 .board li{display:flex;align-items:baseline;gap:var(--s3);padding:var(--s2) 0;border-bottom:1px solid var(--line);font-size:var(--f-sm)}
 .board li:last-child{border-bottom:0}
@@ -386,6 +391,7 @@ ${ogMeta}
       <div>
         <h1>Markets</h1>
         <nav class="tabs" aria-label="Market status filter" id="tabs"></nav>
+        <nav class="chips" aria-label="Topic" id="cats"></nav>
         <div class="row">
           <label class="sr" for="search">Search markets</label>
           <input id="search" type="search" placeholder="Search markets" style="flex:1;min-width:200px">
@@ -402,6 +408,7 @@ ${ogMeta}
       <aside class="rail">
         <div class="card" id="board-card">
           <h2>Top predictors</h2>
+          <p class="hint" style="margin:0 0 var(--s2)">Ranked by net worth — cash plus open positions.</p>
           <ol id="board" class="board"><li class="empty">No predictions yet.</li></ol>
         </div>
         <div class="card hidden" id="me-card">
@@ -790,6 +797,25 @@ ${ogMeta}
 
   // ---------------------------------------------------------------- list
   const TABS = [['open', 'Open'], ['closed', 'In play'], ['settled', 'Settled'], ['mine', 'Mine']];
+  let cat = '';           // active topic facet ('' = all)
+  let cats = [];          // [{name, open}]
+  async function loadCats() {
+    try { cats = (await api('/categories')).categories || []; } catch { cats = []; }
+    renderCats();
+  }
+  function renderCats() {
+    const el = $('cats');
+    if (!el) return;
+    if (!cats.length) { el.innerHTML = ''; return; }
+    el.innerHTML = ['<button type="button" data-cat="" aria-pressed="' + (cat === '') + '">All</button>']
+      .concat(cats.map((c) =>
+        '<button type="button" data-cat="' + esc(c.name) + '" aria-pressed="' + (cat === c.name) + '">'
+        + esc(c.name) + '<span class="n">' + c.open + '</span></button>')).join('');
+    el.querySelectorAll('button').forEach((b) => {
+      b.onclick = () => { cat = b.dataset.cat; cursor = null; paged = false; renderCats(); renderList(); };
+    });
+  }
+
   function renderTabs() {
     $('tabs').innerHTML = TABS.map(([k, label]) =>
       '<button type="button" data-tab="' + k + '" aria-pressed="' + (tab === k) + '">' + label + '</button>').join('');
@@ -814,6 +840,7 @@ ${ogMeta}
     } else params.set('status', tab);
     const search = $('search').value.trim();
     if (search) params.set('q', search);
+    if (cat) params.set('category', cat);
     if (append && cursor) params.set('cursor', cursor);
     const el = $('list');
     el.setAttribute('aria-busy', 'true');
@@ -1379,7 +1406,8 @@ ${ogMeta}
       el.innerHTML = leaderboard.slice(0, 10).map((r) =>
         '<li' + (r.you ? ' class="you"' : '') + '><span class="board-rank">' + r.rank + '</span>'
         + '<span class="board-name">' + (r.you ? 'you' : esc(agentName(r.agent))) + '</span>'
-        + '<span class="board-pl">' + r.balance.toFixed(2) + '</span></li>').join('');
+        + '<span class="board-pl" title="net worth: cash + open positions">'
+        + (r.netWorth != null ? r.netWorth : r.balance).toFixed(2) + '</span></li>').join('');
     } catch {
       el.innerHTML = '<li class="empty">Sign in to see the top predictors.</li>';
     }
@@ -1399,6 +1427,7 @@ ${ogMeta}
     $('t-msg').textContent = ''; $('t-msg').className = 'msg';
     $('t-fill').textContent = '';
     renderTabs();
+    loadCats();
     return renderList();
   }
 

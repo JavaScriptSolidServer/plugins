@@ -1129,6 +1129,22 @@ export async function activate(api) {
   });
 
   // ---- public stats & leaderboard -------------------------------------
+  // Facet list for topic browsing — a news front page is organised by
+  // subject, and the category field was display-only until now.
+  api.fastify.get(`${prefix}/api/categories`, (request, reply) => {
+    const counts = new Map();
+    for (const m of Object.values(state.markets)) {
+      const c = (m.category || '').trim();
+      if (!c) continue;
+      if (m.status === 'settled' || m.status === 'void') continue;
+      counts.set(c, (counts.get(c) || 0) + 1);
+    }
+    const categories = [...counts.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([name, open]) => ({ name, open }));
+    return reply.headers(API_HEADERS).send({ categories });
+  });
+
   api.fastify.get(`${prefix}/api/stats`, async (request, reply) => {
     let totalMicro = 0;
     let accounts = 0;
@@ -1163,12 +1179,38 @@ export async function activate(api) {
     // reconnaissance step for targeting rich accounts.
     const agent = await resolveAgent(request);
     if (!agent) return err(reply, 401, 'sign in to see the leaderboard');
-    const top = Object.entries(state.ledger)
-      .filter(([a]) => a !== HOUSE)
-      .sort(([, a], [, b]) => b.balanceMicro - a.balanceMicro)
+    // Rank by NET WORTH, not idle cash. Ranking on balance alone is
+    // actively perverse on a prediction market: the sharpest forecaster,
+    // with every credit deployed into positions, sorts to the bottom while
+    // someone who never bets sits on top. Net worth = cash + mark-to-market
+    // of open positions (a winning share redeems for exactly 1 credit, so
+    // the LMSR price IS the market's value estimate) + subsidy still locked
+    // in your unsettled creations (returned, capped, at settlement).
+    const worth = new Map();
+    const add = (a, m) => { if (a !== HOUSE) worth.set(a, (worth.get(a) || 0) + m); };
+    for (const [a, row] of Object.entries(state.ledger)) add(a, row.balanceMicro);
+    for (const m of Object.values(state.markets)) {
+      if (m.status === 'settled' || m.status === 'void') continue;
+      const px = lmsrPrices(m.q, m.b);
+      for (const [holder, pos] of Object.entries(m.positions || {})) {
+        for (let i = 0; i < pos.shares.length; i += 1) {
+          if (pos.shares[i] > 0) add(holder, Math.floor(pos.shares[i] * px[i]));
+        }
+      }
+      if (m.subsidyMicro) add(m.creator, m.subsidyMicro);
+    }
+    const top = [...worth.entries()]
+      .sort((a, b) => b[1] - a[1])
       .slice(0, LIMITS.leaderboard)
-      .map(([a, row], i) => ({ rank: i + 1, agent: a === agent ? a : anonymize(a), you: a === agent, balance: row.balanceMicro / MICRO }));
-    return reply.send({ leaderboard: top });
+      .map(([a, netMicro], i) => ({
+        rank: i + 1,
+        agent: a === agent ? a : anonymize(a),
+        you: a === agent,
+        balance: (state.ledger[a]?.balanceMicro || 0) / MICRO, // cash, for continuity
+        netWorth: netMicro / MICRO,
+        profit: (netMicro - grantMicro) / MICRO, // vs the standard grant
+      }));
+    return reply.send({ leaderboard: top, grant: grantMicro / MICRO });
   });
 
   /** Stable pseudonym: a leaderboard should show a rival, not a dossier.
