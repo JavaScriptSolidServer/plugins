@@ -62,7 +62,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { lmsrPrices, tradeCostRaw, sharesForBudget, twapPrices, uniformPrices } from './lmsr.js';
-import { createStore, dict } from './store.js';
+import { createStore, dict, TWAP_PROTECT_MS } from './store.js';
 import {
   createSessions, createRateLimiter, isSameOrigin, isAmbientCredential, UI_HEADERS, API_HEADERS,
 } from './guard.js';
@@ -171,6 +171,12 @@ export async function activate(api) {
       throw new Error(`markets: config.${name} must be a positive number of milliseconds (got ${v})`);
     }
   }
+  if (twapWindowMs > TWAP_PROTECT_MS) {
+    throw new Error(
+      `markets: config.twapWindowMs (${twapWindowMs}) must not exceed ${TWAP_PROTECT_MS}ms — beyond that, `
+      + 'price-history thinning reaches inside the redemption window and makes the void price steerable by trade timing',
+    );
+  }
   if (!Number.isFinite(disputeBondMicro) || disputeBondMicro < 0) {
     throw new Error('markets: config.disputeBondCredits must be a non-negative number');
   }
@@ -231,7 +237,7 @@ export async function activate(api) {
     const claims = sessions.verify(token);
     if (!claims) return null;
     const row = state.ledger[claims.agent];
-    if (row && (row.epoch || 0) !== claims.epoch) return null;
+    if ((row ? row.epoch || 0 : 0) !== claims.epoch) return null;
     return claims.agent;
   }
 
@@ -262,7 +268,12 @@ export async function activate(api) {
     const known = ownOrigin();
     if (known) return known;
     const host = request.headers.host;
-    return host ? `${request.protocol || 'http'}://${host}` : null;
+    if (!host) return null;
+    // Fastify reports the SOCKET's protocol unless trustProxy is on,
+    // which a plugin cannot set; behind nginx/Caddy that is 'http' while
+    // the browser's Origin says https, and every mutation would 403.
+    const proto = request.headers['x-forwarded-proto'] || request.protocol || 'https';
+    return `${String(proto).split(',')[0].trim()}://${host}`;
   }
 
   function csrfOk(request) {
@@ -492,7 +503,7 @@ export async function activate(api) {
    * in the event, and applied by the reducer — so replay never recomputes
    * float arithmetic.
    */
-  function settle(m, status, payoutMicroOf, prices, { adjudicatedBy = null, sustained = false } = {}) {
+  function settle(m, status, payoutMicroOf, prices, { adjudicatedBy = null, sustained = false, outcome = null } = {}) {
     const pool = m.subsidyMicro + m.collectedMicro;
     const raw = [];
     let sum = 0;
@@ -541,6 +552,10 @@ export async function activate(api) {
       type: 'market.settle',
       marketId: m.id,
       status,
+      // Journalled so replay reproduces the settled outcome. Assigning
+      // m.resolvedOutcome outside the reducer made the audit trail
+      // contradict the money after a restore.
+      outcome,
       payouts,
       bondRefunds,
       creatorMicro: creatorFromPool + creatorFee,
@@ -552,7 +567,12 @@ export async function activate(api) {
     broadcast('settle', m);
   }
 
-  const settleResolved = (m, opts) => settle(m, 'resolved', (pos) => pos.shares[m.resolvedOutcome], null, opts);
+  const settleResolved = (m, opts = {}) => {
+    // An adjudicator may settle at a DIFFERENT outcome than the oracle
+    // declared; that corrected outcome rides in the event.
+    const outcome = opts.outcome ?? m.resolvedOutcome;
+    settle(m, 'resolved', (pos) => pos.shares[outcome], null, { ...opts, outcome });
+  };
   // On a void you receive the LESSER of market value (at the TWAP) and
   // what you actually paid. The cap is what finally kills the void
   // arbitrage: the TWAP already defeats a last-second pump, but a
@@ -593,6 +613,7 @@ export async function activate(api) {
     for (const m of Object.values(state.markets)) {
       try {
         if (m.status === 'resolving' && now >= m.settleAt) settleResolved(m);
+        else if (m.status === 'voiding' && now >= m.settleAt) settleVoid(m);
         else if (m.status === 'open' && now >= m.closesAt + settlementWindowMs) {
           api.log.warn(`markets: ${m.id} auto-voiding — no resolution within the settlement window`);
           settleVoid(m);
@@ -656,6 +677,9 @@ export async function activate(api) {
   ticker.unref?.();
 
   function broadcast(type, m) {
+    // A withdrawn market must not push its title and description to
+    // every connected client when it settles.
+    if (m.hidden) return;
     const msg = JSON.stringify({ type, market: marketOut(m) });
     for (const s of sockets) {
       // Drop a client that isn't draining rather than buffering without
@@ -737,6 +761,7 @@ export async function activate(api) {
     for (const id of byAgent.get(agent) || []) {
       const m = state.markets[id];
       if (!m) continue;
+      if (m.status === 'resolved' || m.status === 'void') continue; // paid out; the receipt is the record
       const pos = m.positions[agent];
       if (!pos || pos.shares.every((s) => s === 0)) continue;
       positions.push({
@@ -919,6 +944,7 @@ export async function activate(api) {
   api.fastify.get(`${prefix}/api/markets/:id/quote`, async (request, reply) => {
     const m = state.markets[request.params.id];
     if (!m) return err(reply, 404, 'no such market');
+    if (m.hidden) return err(reply, 451, 'this market has been withdrawn by the operator');
     const q = request.query || {};
     const t = priceTrade(m, q.side, q.outcome, q.shares, q.spend);
     if (t.error) return err(reply, 400, t.error);
@@ -1014,6 +1040,7 @@ export async function activate(api) {
   api.fastify.get(`${prefix}/api/markets/:id/history`, async (request, reply) => {
     const m = state.markets[request.params.id];
     if (!m) return err(reply, 404, 'no such market');
+    if (m.hidden) return err(reply, 451, 'this market has been withdrawn by the operator');
     return reply.send({
       id: m.id,
       outcomes: m.outcomes,
@@ -1067,7 +1094,7 @@ export async function activate(api) {
     if (!m) return err(reply, 404, 'no such market');
     tick();
     if (m.status === 'resolved' || m.status === 'void') return reply.send(marketOut(m));
-    if (m.status === 'resolving') {
+    if (m.status === 'resolving' || m.status === 'voiding') {
       return err(reply, 409, `settles at ${new Date(m.settleAt).toISOString()} (dispute window open)`);
     }
     return err(reply, 409, `market is ${displayStatus(m)} — nothing to settle`);
@@ -1085,7 +1112,8 @@ export async function activate(api) {
     // 'disputed' is disputable too: latching on the FIRST disputer meant
     // one person paid the bond and every other loser free-rode on the
     // resulting void. Each disputer posts their own.
-    if (m.status !== 'resolving' && m.status !== 'disputed') {
+    tick(); // otherwise a market past settleAt is still 'resolving' here
+    if (m.status !== 'resolving' && m.status !== 'disputed' && m.status !== 'voiding') {
       return err(reply, 409, 'only a resolving market can be disputed');
     }
     const pos = m.positions[agent];
@@ -1096,6 +1124,11 @@ export async function activate(api) {
     const reason = typeof (request.body || {}).reason === 'string'
       ? request.body.reason.slice(0, 500) : '';
     if (!reason.trim()) return err(reply, 400, 'a reason is required to dispute');
+    // With no operator configured, `sustained` can never become true, so
+    // the bond is mathematically unrecoverable. Don't take it.
+    if (!admins.size) {
+      return err(reply, 409, 'this deployment has no operator to adjudicate disputes, so a dispute bond could never be returned');
+    }
     ensureAccount(agent);
     // Scale with what the dispute puts at risk. A flat bond against a
     // large position is trivially +EV to post: the disputer risks 25 to
@@ -1118,6 +1151,9 @@ export async function activate(api) {
     if (!m) return err(reply, 404, 'no such market');
     const stale = Date.now() >= m.closesAt + settlementWindowMs;
     if (m.status === 'resolved' || m.status === 'void') return err(reply, 409, `market is ${m.status}`);
+    if (m.status === 'voiding' && !admins.has(agent) && !stale) {
+      return err(reply, 409, `a void is already proposed; it settles at ${new Date(m.settleAt).toISOString()}`);
+    }
     // Once disputed, ONLY an admin may settle. Otherwise the oracle
     // answers a dispute against itself by voiding the market, and the
     // dispute is no check on the oracle at all.
@@ -1132,11 +1168,21 @@ export async function activate(api) {
         : 'only the oracle may void before the settlement window expires');
     }
     if (!m.closedAt) store.commit({ type: 'market.close', marketId: m.id });
-    // An operator voiding a DISPUTED market has sustained the dispute,
-    // whichever route they used to do it.
-    settleVoid(m, m.status === 'disputed' && admins.has(agent)
-      ? { adjudicatedBy: agent, sustained: true } : {});
-    api.log.info(`markets: ${m.id} voided (redeemed at TWAP)`);
+
+    // An operator, or the anyone-can-rescue backstop, settles now.
+    if (admins.has(agent) || stale) {
+      settleVoid(m, m.status === 'disputed' && admins.has(agent)
+        ? { adjudicatedBy: agent, sustained: true } : {});
+      api.log.info(`markets: ${m.id} voided (redeemed at TWAP)`);
+      return reply.send(marketOut(m));
+    }
+
+    // An ORACLE void is only a proposal: it goes through the same
+    // dispute window as a resolution, so holders can object before a
+    // cancellation they can only lose on becomes final.
+    store.commit({ type: 'market.propose-void', marketId: m.id, agent, settleAt: Date.now() + disputeWindowMs });
+    api.log.info(`markets: ${m.id} void proposed by the oracle — settles after the dispute window`);
+    broadcast('market', m);
     return reply.send(marketOut(m));
   });
 
@@ -1247,8 +1293,7 @@ export async function activate(api) {
       // Voiding would refund the loser and wipe out whoever was RIGHT, so
       // a correctable error needs its own verb.
       if (outcome < 0 || outcome >= m.outcomes.length) return err(reply, 400, 'outcome must be a valid outcome index');
-      m.resolvedOutcome = outcome;
-      settleResolved(m, { adjudicatedBy: by, sustained: true });
+      settleResolved(m, { adjudicatedBy: by, sustained: true, outcome });
     } else if (uphold === false) {
       settleVoid(m, { adjudicatedBy: by, sustained: true });
     } else {

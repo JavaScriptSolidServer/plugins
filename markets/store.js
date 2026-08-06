@@ -99,6 +99,8 @@ function compactHistory(h, nowT) {
   return h;
 }
 
+export const TWAP_PROTECT_MS = PROTECT_MS;
+
 export function emptyState() {
   return { seq: 0, ledger: dict(), markets: dict(), settlements: dict() };
 }
@@ -190,6 +192,15 @@ export function applyEvent(state, ev, prices) {
       m.closedAt = m.closedAt || ev.t;
       break;
     }
+    case 'market.propose-void': {
+      const m = state.markets[ev.marketId];
+      m.status = 'voiding';
+      m.settleAt = ev.settleAt;
+      m.closesAt = Math.min(m.closesAt, ev.t);
+      m.closedAt = m.closedAt || ev.t;
+      m.resolvedBy = ev.agent;
+      break;
+    }
     case 'market.resolve': {
       const m = state.markets[ev.marketId];
       m.status = 'resolving';
@@ -215,6 +226,8 @@ export function applyEvent(state, ev, prices) {
     }
     case 'market.settle': {
       const m = state.markets[ev.marketId];
+      // Set BEFORE the receipts are written — they record it.
+      if (ev.outcome !== undefined && ev.outcome !== null) m.resolvedOutcome = ev.outcome;
       // Everyone who HELD is given a receipt, not only those who were
       // paid: "you lost 12.40 on this" is the settlement a bettor most
       // needs to see, and a payout-only list silently drops it.
@@ -460,7 +473,16 @@ export function createStore({ dir, log, prices }) {
         if (/^journal\.\d+\.jsonl$/.test(f)) current.add(path.join(dir, f));
       }
     } catch { /* directory vanished */ }
-    for (const file of [...current].sort()) {
+    // Numeric order: lexicographic puts journal.100 before journal.20,
+    // so a busy account's "most recent 500 events" were the wrong 500.
+    const ordered = [...current].sort((a, b) => {
+      const na = /journal\.(\d+)\.jsonl$/.exec(a);
+      const nb = /journal\.(\d+)\.jsonl$/.exec(b);
+      if (!na) return 1;   // the live journal sorts last
+      if (!nb) return -1;
+      return Number(na[1]) - Number(nb[1]);
+    });
+    for (const file of ordered) {
       try { all.push(...fs.readFileSync(file, 'utf8').split('\n')); } catch { /* rotated away */ }
     }
     for (const line of all) {

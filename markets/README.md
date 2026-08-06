@@ -73,6 +73,13 @@ the oracle was wrong and we know the right answer), and **void**.
 Re-resolution matters because voiding an incorrect resolution refunds the
 loser and wipes out whoever actually backed the correct outcome.
 
+An **oracle-initiated void is only a proposal** and sits in the same
+dispute window a resolution does. A void pays `min(TWAP, cost basis)`, so
+it is a payoff traders can only lose on while the creator recovers their
+escrow — the oracle never has to steal the pool, only refuse to pay it.
+Operators, and the anyone-can-rescue backstop on an abandoned market,
+still settle immediately.
+
 **A deployment with no `admins` cannot adjudicate anything** — every
 dispute expires into the oracle's resolution — so the plugin says so
 loudly at boot rather than letting the advertised check be quietly
@@ -159,6 +166,17 @@ the walls point at.
   regression test for exactly this attack, and it caught a real bug: the
   price path was seeded with `m.history || [seed]`, and an empty array is
   truthy, so the TWAP degenerated to the post-pump spot price.
+- **A state change that skips the reducer is a lie the audit trail tells
+  later.** Adjudicating a wrong resolution assigned `m.resolvedOutcome`
+  directly in the route handler and then settled. Payouts were correct
+  and journalled; the OUTCOME was not — so replaying the journal (the
+  recovery the boot error itself recommends) restored the oracle's
+  original wrong answer while the credits sat with the corrected one, and
+  the settlement receipts recorded the stale value too. store.js already
+  said "every mutation happens HERE and nowhere else"; one assignment
+  outside it was enough. Event sourcing only holds if the invariant is
+  structural — which is the argument for extracting the lifecycle from
+  the route layer entirely.
 - **A self-verifying credential needs an epoch, and the type of what
   `verify()` returns is a money bug.** Widening the session verifier from
   "returns the agent id" to "returns the claims" without updating its two
@@ -191,7 +209,7 @@ the walls point at.
 
 ## Tests
 
-`node --test --test-concurrency=1 markets/test.js` — 64 tests: LMSR and
+`node --test --test-concurrency=1 markets/test.js` — 66 tests: LMSR and
 TWAP math, session/CSRF/rate-limit units, hardened headers, cookie
 scoping, prototype-key ids, grants, escrow, stake-first quotes,
 quote↔trade parity, slippage guards (including the NaN-fails-closed case),

@@ -197,6 +197,7 @@ describe('markets plugin', () => {
           disputeWindowMs: 300,
           settlementWindowMs: 800,
           twapWindowMs: 30 * 60 * 1000,
+          admins: ['https://operator.example/profile/card#me'],
           rateCapacity: 1e9,
           rateRefillPerSec: 1e6,
         },
@@ -621,7 +622,10 @@ describe('markets plugin', () => {
     const live = await json(await call('alice', 'POST', `/markets/${m.id}/void`), 403);
     assert.match(live.error, /close the market before voiding/);
     await json(await call('alice', 'POST', `/markets/${m.id}/close`), 200);
-    await json(await call('alice', 'POST', `/markets/${m.id}/void`), 200);
+    const proposed = await json(await call('alice', 'POST', `/markets/${m.id}/void`), 200);
+    assert.strictEqual(proposed.status, 'voiding', 'an oracle void is a proposal, not a fait accompli');
+    await sleep(400);
+    await json(await call(null, 'POST', `/markets/${m.id}/settle`), 200);
     const after = await balance('bob');
     assert.ok(after < before,
       `pump-and-void must lose money (before ${before}, after ${after})`);
@@ -641,6 +645,8 @@ describe('markets plugin', () => {
     const before = await balance('carol');
     await json(await call('alice', 'POST', `/markets/${m.id}/close`), 200);
     await json(await call('alice', 'POST', `/markets/${m.id}/void`), 200);
+    await sleep(400); // the oracle's void sits in the dispute window
+    await json(await call(null, 'POST', `/markets/${m.id}/settle`), 200);
     const redeemed = await balance('carol') - before;
     assert.ok(redeemed > 8 && redeemed < 20, `redeemed ${redeemed} ≈ 20 shares near 50c`);
     await assertConserved('after a holder void');
@@ -971,6 +977,52 @@ describe('markets plugin', () => {
     await assertConserved('after a re-resolution');
   });
 
+  it('a re-resolved outcome survives a restart (it must be in the journal)', async () => {
+    const m = await json(await call('alice', 'POST', '/markets', {
+      title: 'Re-resolution must be journalled',
+      outcomes: ['Home', 'Away'],
+      closesAt: new Date(Date.now() + 3600e3).toISOString(),
+      b: 25,
+    }), 201);
+    await json(await call('bob', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 0, shares: 8 }), 200);
+    await json(await call('alice', 'POST', `/markets/${m.id}/resolve`, { outcome: 1 }), 200);
+    await json(await call('bob', 'POST', `/markets/${m.id}/dispute`, { reason: 'wrong' }), 200);
+    await json(await call('alice', 'POST', '/admin/adjudicate',
+      { market: m.id, uphold: false, outcome: 0 }), 200);
+
+    // Rebuild purely from the journal — the recovery the boot error
+    // itself recommends — and the corrected outcome must still be there.
+    const { root } = jss;
+    const port = await probePort();
+    await jss.close({ keepData: true });
+    fs.rmSync(path.join(root, '.plugins', 'markets', 'state.json'), { force: true });
+    base = `http://127.0.0.1:${port}`;
+    mk = `${base}/markets/api`;
+    jss = await startJss({
+      root, port, idp: true,
+      plugins: [{
+        module: module_,
+        prefix: '/markets',
+        config: {
+          grantCredits: GRANT, feeBps: 100, baseUrl: base,
+          disputeWindowMs: 300, settlementWindowMs: 800, disputeBondCredits: 25,
+          rateCapacity: 1e9, rateRefillPerSec: 1e6, admins: [aliceId],
+        },
+      }],
+    });
+    const after = await json(await call(null, 'GET', `/markets/${m.id}`), 200);
+    assert.strictEqual(after.resolvedOutcome, 0,
+      'replay must reproduce the ADJUDICATED outcome, not the oracle’s original');
+    await assertConserved('after replaying a re-resolution');
+  });
+
+  it('settled positions stop showing as live value', async () => {
+    const positions = (await me('bob')).positions;
+    assert.ok(positions.every((x) => x.status !== 'resolved' && x.status !== 'void'),
+      'a paid-out market must not also appear as an open position');
+  });
+
   it('a void never pays a holder more than they paid (kills the sustained pump)', async () => {
     const m = await json(await call('alice', 'POST', '/markets', {
       title: 'Sustained pump attempt',
@@ -984,7 +1036,10 @@ describe('markets plugin', () => {
     await json(await call('bob', 'POST', `/markets/${m.id}/trade`,
       { side: 'buy', outcome: 0, spend: 150 }), 200);
     await sleep(600);
+    await json(await call('alice', 'POST', `/markets/${m.id}/close`), 200);
     await json(await call('alice', 'POST', `/markets/${m.id}/void`), 200);
+    await sleep(400);
+    await json(await call(null, 'POST', `/markets/${m.id}/settle`), 200);
     const net = await balance('bob') - before;
     assert.ok(net <= 1e-6, `pump-and-hold-then-void must not profit (net ${net})`);
     await assertConserved('after a sustained-pump void');
