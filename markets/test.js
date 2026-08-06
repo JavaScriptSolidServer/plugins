@@ -191,6 +191,11 @@ describe('markets plugin', () => {
       /disputeWindowMs/,
       'a dispute window longer than the settlement window makes every resolution voidable',
     );
+    await assert.rejects(
+      startJss({ plugins: [{ module: module_, prefix: '/markets', config: { twapWindowMs: 1 } }] }),
+      /twapWindowMs/,
+      'a 1ms twap window is spot pricing in disguise',
+    );
   });
 
   it('boots with idp and mints three pod bearers', async () => {
@@ -1115,6 +1120,122 @@ describe('markets plugin', () => {
     assert.strictEqual(fixed.resolvedOutcome, 0);
     assert.ok(await balance('carol') - before > 11, 'the vindicated holder is paid 1 credit per share');
     await assertConserved('after resolving a disputed void proposal');
+  });
+
+  it('going silent must NOT pay the creator more than resolving honestly', async () => {
+    // The escrow is the LMSR maker bond. When a void returned it, the
+    // payout cap turned unpaid trader value into residual and the
+    // abandoned-market backstop voided by itself after a week — so
+    // refusing to resolve returned nearly the whole escrow while
+    // resolving honestly returned a fraction of it. Measured at +57
+    // credits for doing nothing, taken from the trader who was right.
+    const mk2 = async (title) => json(await call('bob', 'POST', '/markets', {
+      title,
+      outcomes: ['Yes', 'No'],
+      closesAt: new Date(Date.now() + 500).toISOString(),
+      b: 25,
+    }), 201);
+
+    const honest = await mk2('Creator resolves honestly');
+    await json(await call('carol', 'POST', `/markets/${honest.id}/trade`,
+      { side: 'buy', outcome: 0, spend: 40 }), 200);
+    const beforeHonest = await balance('bob');
+    await sleep(600);
+    await json(await call('bob', 'POST', `/markets/${honest.id}/resolve`, { outcome: 0 }), 200);
+    await sleep(400);
+    await json(await call(null, 'POST', `/markets/${honest.id}/settle`), 200);
+    const honestGain = await balance('bob') - beforeHonest;
+
+    const silent = await mk2('Creator says nothing at all');
+    await json(await call('carol', 'POST', `/markets/${silent.id}/trade`,
+      { side: 'buy', outcome: 0, spend: 40 }), 200);
+    const beforeSilent = await balance('bob');
+    await sleep(1500); // past closesAt + settlementWindowMs → auto-void
+    await json(await call(null, 'POST', `/markets/${silent.id}/settle`), 200);
+    const silentGain = await balance('bob') - beforeSilent;
+
+    assert.ok(silentGain <= honestGain + 1e-6,
+      `refusing to resolve must not pay better than resolving (silent ${silentGain} vs honest ${honestGain})`);
+    await assertConserved('after comparing silence with honesty');
+  });
+
+  it('a partial sell before a void cannot bank a risk-free profit', async () => {
+    // Capping per outcome let a trader realise a gain on part of a
+    // pumped position and still redeem the remainder at its full
+    // remaining basis — a measured 5.8% risk-free. The cap is now net
+    // cash in, over the whole position.
+    const m = await json(await call('bob', 'POST', '/markets', {
+      title: 'Pump, part-sell, then void',
+      outcomes: ['Yes', 'No'],
+      closesAt: new Date(Date.now() + 3600e3).toISOString(),
+      b: 40,
+    }), 201);
+    const before = await balance('carol');
+    const bought = await json(await call('carol', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 0, spend: 120 }), 200);
+    await sleep(400);
+    // Sell just over half, banking the gain from the pump…
+    await json(await call('carol', 'POST', `/markets/${m.id}/trade`,
+      { side: 'sell', outcome: 0, shares: bought.shares * 0.51 }), 200);
+    await json(await call('bob', 'POST', `/markets/${m.id}/close`), 200);
+    await json(await call('bob', 'POST', `/markets/${m.id}/void`), 200);
+    await sleep(400);
+    await json(await call(null, 'POST', `/markets/${m.id}/settle`), 200);
+    const net = await balance('carol') - before;
+    assert.ok(net <= 1e-6, `pump, part-sell and void must not profit (net ${net})`);
+    await assertConserved('after a part-sell void');
+  });
+
+  it('a void does not tax a market-neutral position', async () => {
+    // Capping each leg separately meant a leg that gained could not
+    // offset a leg that lost, so a position with NO outcome risk lost
+    // ~12% to a void.
+    const m = await json(await call('bob', 'POST', '/markets', {
+      title: 'Both sides, no outcome risk',
+      outcomes: ['Yes', 'No'],
+      closesAt: new Date(Date.now() + 3600e3).toISOString(),
+      b: 40,
+    }), 201);
+    const before = await balance('carol');
+    await json(await call('carol', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 0, shares: 30 }), 200);
+    await json(await call('carol', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 1, shares: 30 }), 200);
+    const staked = before - await balance('carol');
+    await json(await call('bob', 'POST', `/markets/${m.id}/close`), 200);
+    await json(await call('bob', 'POST', `/markets/${m.id}/void`), 200);
+    await sleep(400);
+    await json(await call(null, 'POST', `/markets/${m.id}/settle`), 200);
+    const lost = before - await balance('carol');
+    // Only the fees should be gone, not a double-digit percentage.
+    assert.ok(lost < staked * 0.05,
+      `a hedged position should lose only fees to a void (lost ${lost} of ${staked})`);
+    await assertConserved('after voiding a hedged position');
+  });
+
+  it('a void proposal abandons any prior resolution (no bait-and-switch)', async () => {
+    // resolvedOutcome used to survive a void proposal, so an oracle
+    // could resolve, publicly "offer" a void, and have any dispute land
+    // back on the original resolution.
+    const m = await json(await call('bob', 'POST', '/markets', {
+      title: 'Resolution then a void offer',
+      outcomes: ['Home', 'Away'],
+      closesAt: new Date(Date.now() + 3600e3).toISOString(),
+      b: 25,
+    }), 201);
+    await json(await call('carol', 'POST', `/markets/${m.id}/trade`,
+      { side: 'buy', outcome: 0, shares: 10 }), 200);
+    await json(await call('bob', 'POST', `/markets/${m.id}/close`), 200);
+    await json(await call('bob', 'POST', `/markets/${m.id}/resolve`, { outcome: 1 }), 200);
+    // The oracle may not withdraw a pending resolution by proposing a void.
+    const swap = await json(await call('bob', 'POST', `/markets/${m.id}/void`), 409);
+    assert.match(swap.error, /resolution pending/);
+    await sleep(400);
+    await json(await call(null, 'POST', `/markets/${m.id}/settle`), 200);
+    const final = await json(await call(null, 'GET', `/markets/${m.id}`), 200);
+    assert.strictEqual(final.status, 'resolved');
+    assert.strictEqual(final.resolvedOutcome, 1, 'the declared resolution is what settled');
+    await assertConserved('after a refused bait-and-switch');
   });
 
   it('a void never pays a holder more than they paid (kills the sustained pump)', async () => {

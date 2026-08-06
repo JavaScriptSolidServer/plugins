@@ -170,10 +170,17 @@ export async function activate(api) {
   // a value that would silently disable a defence.
   for (const [name, v] of Object.entries({
     disputeWindowMs, disputeGraceMs, settlementWindowMs, twapWindowMs, sessionTtlMs,
+    snapshotIntervalMs: num(cfg.snapshotIntervalMs, 30_000),
   })) {
     if (!Number.isFinite(v) || v <= 0) {
       throw new Error(`markets: config.${name} must be a positive number of milliseconds (got ${v})`);
     }
+  }
+  // "> 0" is not the property that matters: a 1ms window gives the last
+  // price full weight, i.e. the TWAP IS spot — the very arbitrage the
+  // window exists to prevent.
+  if (twapWindowMs < 60_000) {
+    throw new Error('markets: config.twapWindowMs must be at least 60000ms — a shorter window is spot pricing in disguise');
   }
   // Get these two the wrong way round and a resolution is still inside
   // its dispute window when the abandoned-market backstop opens — which
@@ -432,7 +439,7 @@ export async function activate(api) {
       rawStatus: m.status,
       tradable: tradable(m),
       canResolve: m.status === 'open',
-      canVoid: m.status !== 'resolved' && m.status !== 'void',
+      canVoid: m.status === 'open',
       closesAt: new Date(m.closesAt).toISOString(),
       createdAt: m.createdAt,
       creator: m.creator,
@@ -528,7 +535,9 @@ export async function activate(api) {
   // The settlement state machine lives in lifecycle.js — see that file
   // for why it is not inline here (a state change that skipped the
   // reducer made the audit trail contradict the money).
-  const { voidPrices, settleResolved, settleVoid, tick, tickOne, maybeTick } = createLifecycle({
+  const {
+    voidPrices, settleResolved, settleVoid, tick, tickOne, maybeTick, disputeDeadline,
+  } = createLifecycle({
     state,
     commit: store.commit,
     broadcast: (type, m) => broadcast(type, m),
@@ -810,7 +819,10 @@ export async function activate(api) {
     if (search) all = all.filter((m) => m.title.toLowerCase().includes(search)
       || (m.description || '').toLowerCase().includes(search));
     if (wanted === 'open') all = all.filter((m) => tradable(m));
-    else if (wanted === 'closed') all = all.filter((m) => !tradable(m) && (m.status === 'open' || m.status === 'resolving' || m.status === 'disputed'));
+    else if (wanted === 'closed') {
+      all = all.filter((m) => !tradable(m)
+        && ['open', 'resolving', 'voiding', 'disputed'].includes(m.status));
+    }
     else if (wanted === 'settled') all = all.filter((m) => m.status === 'resolved' || m.status === 'void');
 
     // Deterministic total order (createdAt desc, id desc) so the cursor
@@ -1000,7 +1012,12 @@ export async function activate(api) {
     // Advance THIS market only: a full scan here was a free O(all
     // markets) job for any anonymous caller, and throttling it instead
     // turned an explicit "settle now" into a silent no-op.
-    tickOne(m);
+    try {
+      tickOne(m);
+    } catch (e) {
+      api.log.error(`markets: ${m.id} cannot settle: ${e.message}`);
+      return err(reply, 503, `this market cannot be settled automatically and needs an operator: ${e.message}`);
+    }
     if (m.status === 'resolved' || m.status === 'void') return reply.send(marketOut(m));
     if (m.status === 'resolving' || m.status === 'voiding') {
       return err(reply, 409, `settles at ${new Date(m.settleAt).toISOString()} (dispute window open)`);
@@ -1020,7 +1037,11 @@ export async function activate(api) {
     // 'disputed' is disputable too: latching on the FIRST disputer meant
     // one person paid the bond and every other loser free-rode on the
     // resulting void. Each disputer posts their own.
-    tickOne(m); // otherwise a market past settleAt is still 'resolving' here
+    try {
+      tickOne(m); // otherwise a market past settleAt is still 'resolving' here
+    } catch (e) {
+      api.log.error(`markets: ${m.id} cannot settle: ${e.message}`);
+    }
     if (m.status !== 'resolving' && m.status !== 'disputed' && m.status !== 'voiding') {
       return err(reply, 409, 'only a resolving market can be disputed');
     }
@@ -1062,6 +1083,9 @@ export async function activate(api) {
     // a settlement is already pending.
     const stale = m.status === 'open' && Date.now() >= m.closesAt + settlementWindowMs;
     if (m.status === 'resolved' || m.status === 'void') return err(reply, 409, `market is ${m.status}`);
+    if (m.status === 'resolving' && !admins.has(agent)) {
+      return err(reply, 409, 'this market has a resolution pending — only the operator can turn that into a void');
+    }
     if (m.status === 'voiding' && !admins.has(agent) && !stale) {
       return err(reply, 409, `a void is already proposed; it settles at ${new Date(m.settleAt).toISOString()}`);
     }
@@ -1197,7 +1221,7 @@ export async function activate(api) {
     const m = state.markets[market];
     if (!m) return err(reply, 404, 'no such market');
     if (m.status !== 'disputed') return err(reply, 409, `market is ${displayStatus(m)}, not disputed`);
-    const proposedVoid = !Number.isInteger(m.resolvedOutcome);
+    const proposedVoid = m.proposal === 'void';
     if (uphold === true) {
       // Uphold whatever the oracle actually proposed — a void proposal
       // has no resolution to uphold.
@@ -1234,7 +1258,7 @@ export async function activate(api) {
         disputeDetail: (m.disputes || []).map((d) => ({
           agent: d.agent, reason: d.reason, at: new Date(d.at).toISOString(), bond: (d.bondMicro || 0) / MICRO,
         })),
-        autoVoidsAt: new Date((m.disputes[0]?.at || Date.now()) + disputeGraceMs).toISOString(),
+        autoSettlesAt: new Date(disputeDeadline(m)).toISOString(),
       }));
     return reply.send({ disputes: queue });
   });

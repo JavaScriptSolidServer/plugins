@@ -155,7 +155,13 @@ export function applyEvent(state, ev, prices) {
       const m = state.markets[ev.marketId];
       const r = row(state, ev.agent);
       const pos = m.positions[ev.agent]
-        || (m.positions[ev.agent] = { shares: m.outcomes.map(() => 0), costMicro: m.outcomes.map(() => 0) });
+        || (m.positions[ev.agent] = {
+          shares: m.outcomes.map(() => 0), costMicro: m.outcomes.map(() => 0), netInMicro: 0,
+        });
+      // Net cash in: what this agent has actually put into this market,
+      // net of everything taken back out. It is the cap on a void
+      // redemption — see lifecycle.js.
+      pos.netInMicro = (pos.netInMicro || 0) + (ev.side === 'buy' ? ev.totalMicro : -ev.totalMicro);
       if (ev.side === 'buy') {
         r.balanceMicro -= ev.totalMicro;
         m.collectedMicro += ev.costMicro;
@@ -195,6 +201,8 @@ export function applyEvent(state, ev, prices) {
     case 'market.propose-void': {
       const m = state.markets[ev.marketId];
       m.status = 'voiding';
+      m.proposal = 'void';
+      m.resolvedOutcome = null; // a void proposal abandons any prior call
       m.settleAt = ev.settleAt;
       m.closesAt = Math.min(m.closesAt, ev.t);
       m.closedAt = m.closedAt || ev.t;
@@ -204,6 +212,7 @@ export function applyEvent(state, ev, prices) {
     case 'market.resolve': {
       const m = state.markets[ev.marketId];
       m.status = 'resolving';
+      m.proposal = 'resolve';
       m.resolvedOutcome = ev.outcome;
       m.settleAt = ev.settleAt;
       m.closesAt = Math.min(m.closesAt, ev.t);
@@ -254,6 +263,9 @@ export function applyEvent(state, ev, prices) {
       row(state, m.creator).balanceMicro += ev.creatorMicro;
       if (ev.houseMicro) row(state, ev.house).balanceMicro += ev.houseMicro;
       m.status = ev.status;
+      // A void has no winner; leaving a stale outcome on it showed
+      // integrators a winning outcome on a cancelled market.
+      if (ev.status === 'void') m.resolvedOutcome = null;
       m.resolvedAt = new Date(ev.t).toISOString();
       m.settledPrices = ev.prices || null;
       break;

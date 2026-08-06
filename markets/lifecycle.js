@@ -40,7 +40,11 @@ export function createLifecycle({ state, commit, broadcast, log, cfg }) {
 /** Prices to redeem a voided market at: the TWAP over the window ending
  *  at close (see the header — this is what kills the void front-run). */
 function voidPrices(m) {
-  const endT = m.closedAt || Math.min(m.closesAt, Date.now());
+  // Anchor to when TRADING stopped, not to when somebody clicked.
+  // Stamping the anchor at propose time let a late oracle void redeem at
+  // spot — 40 points from the backstop's price on the same market,
+  // chosen simply by waiting.
+  const endT = Math.min(m.closesAt, m.closedAt ?? Infinity, Date.now());
   return twapPrices(m.history, endT - twapWindowMs, endT, m.outcomes.length);
 }
 
@@ -50,6 +54,9 @@ function voidPrices(m) {
  * float arithmetic.
  */
 function settle(m, status, payoutMicroOf, prices, { adjudicatedBy = null, sustained = false, outcome = null } = {}) {
+  // Escrow returns on a resolution, or on a void an operator decided.
+  // Never on a void produced by the creator's own inaction.
+  const creatorMayRecover = status === 'resolved' || !!adjudicatedBy;
   const pool = m.subsidyMicro + m.collectedMicro;
   const raw = [];
   let sum = 0;
@@ -79,11 +86,16 @@ function settle(m, status, payoutMicroOf, prices, { adjudicatedBy = null, sustai
     if (p > 0) { payouts[agent] = p; paid += p; }
   }
 
-  // The creator may recover AT MOST what they escrowed. Anything left
-  // beyond that is other people's money and goes to the house — which
-  // is what makes "resolve to an outcome nobody holds" unprofitable.
+  // The creator may recover AT MOST what they escrowed, and ONLY when
+  // the market settled on an answer. Letting them recover it from a void
+  // made "never resolve" the dominant strategy: the payout cap turns
+  // unpaid trader value into residual, and the abandoned-market backstop
+  // voids by itself after a week — so going silent returned nearly the
+  // whole escrow while resolving honestly returned a fraction of it. The
+  // escrow is the LMSR maker bond, and a void is exactly the case where
+  // a bond must be at risk.
   const residual = pool - paid;
-  const creatorFromPool = Math.max(0, Math.min(residual, m.subsidyMicro));
+  const creatorFromPool = creatorMayRecover ? Math.max(0, Math.min(residual, m.subsidyMicro)) : 0;
   const houseFromPool = residual - creatorFromPool;
   const houseFee = Math.floor((m.feesMicro * houseFeeShareBps) / 10_000);
   const creatorFee = m.feesMicro - houseFee;
@@ -140,10 +152,18 @@ const settleResolved = (m, opts = {}) => {
 // holder can ever exit a void for more than they put in, so pumping to
 // be voided is never profitable at any hold duration. It only ever
 // pays LESS than the TWAP, so conservation is strictly preserved.
-const settleVoid = (m, opts) => {
+const settleVoid = (m, opts = {}) => {
   const p = voidPrices(m);
   settle(m, 'void',
-    (pos) => pos.shares.reduce((a, s, i) => a + Math.min(s * p[i], pos.costMicro[i]), 0),
+    // The lesser of market value and what you actually put in, taken
+    // over the WHOLE position. Capping per outcome let a partial sell
+    // bank a gain and still redeem the remainder at full basis (a
+    // measured 5.8% risk-free), and it taxed a market-neutral position
+    // ~12% for holding two legs with no outcome risk at all.
+    (pos) => Math.min(
+      pos.shares.reduce((a, s, i) => a + s * p[i], 0),
+      Math.max(0, pos.netInMicro || 0),
+    ),
     p, opts);
 };
 
@@ -166,24 +186,45 @@ function maybeTick() {
   tick();
 }
 
+/**
+ * When an unadjudicated dispute stops holding up settlement.
+ *
+ * Anchored to the LATEST dispute so a late disputer gets a real window
+ * rather than a truncated one — but HARD-CAPPED from the first, because
+ * each new disputer otherwise pushes the deadline out again: ten dust
+ * accounts posting the 25-credit floor out of their own free signup
+ * grants could freeze a settlement for seventy days at no real cost.
+ */
+function isVoidProposal(m) {
+  if (m.proposal) return m.proposal === 'void';
+  // Pre-`proposal` state: fall back to the status, which is the only
+  // other record of what was proposed.
+  return m.status === 'voiding';
+}
+
+/** When an unadjudicated dispute stops holding up settlement. Exported
+ *  so the operator queue advertises the deadline the machine uses — the
+ *  two drifting apart made the queue wrong exactly when it mattered. */
+function disputeDeadline(m) {
+  const first = m.disputes[0].at;
+  const last = m.disputes[m.disputes.length - 1].at;
+  return Math.min(last + disputeGraceMs, first + disputeGraceMs * 3);
+}
+
 function tickOne(m, now = Date.now()) {
   if (m.status === 'resolving' && now >= m.settleAt) settleResolved(m);
   else if (m.status === 'voiding' && now >= m.settleAt) settleVoid(m);
   else if (m.status === 'open' && now >= m.closesAt + settlementWindowMs) {
     log.warn(`markets: ${m.id} auto-voiding — no resolution within the settlement window`);
     settleVoid(m);
-  } else if (m.status === 'disputed'
-    // Anchor to the LATEST dispute: anchoring to the first gave a
-    // late disputer a truncated window and took a bond that could
-    // never be heard.
-    && now >= (m.disputes[m.disputes.length - 1].at + disputeGraceMs)) {
+  } else if (m.status === 'disputed' && now >= disputeDeadline(m)) {
     // Fall through to WHAT THE ORACLE PROPOSED — a resolution if
     // there was one, otherwise the void it proposed. An unadjudicated
     // dispute must not cancel a bet you lost, and must not invent a
     // resolution that never existed.
     log.warn(`markets: ${m.id} dispute expired unadjudicated — the oracle's call stands`);
-    if (Number.isInteger(m.resolvedOutcome)) settleResolved(m);
-    else settleVoid(m);
+    if (isVoidProposal(m)) settleVoid(m);
+    else settleResolved(m);
   }
 }
 
@@ -201,5 +242,5 @@ function tick() {
   }
 }
 
-  return { voidPrices, settle, settleResolved, settleVoid, tick, tickOne, maybeTick };
+  return { voidPrices, settle, settleResolved, settleVoid, tick, tickOne, maybeTick, disputeDeadline };
 }

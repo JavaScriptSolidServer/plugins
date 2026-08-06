@@ -405,7 +405,7 @@ export function renderUi(prefix) {
       if (!disputes.length) { el.innerHTML = '<span class="hint">no open disputes</span>'; return; }
       el.innerHTML = disputes.map((d) => '<div class="mrow"><b>' + esc(d.title) + '</b>'
         + '<div class="meta">resolved as <b>' + esc(d.outcomes[d.resolvedOutcome]) + '</b> · '
-        + d.disputeDetail.length + ' dispute(s) · auto-settles ' + new Date(d.autoVoidsAt).toLocaleString()
+        + d.disputeDetail.length + ' dispute(s) · auto-settles ' + new Date(d.autoSettlesAt).toLocaleString()
         + '</div>'
         + d.disputeDetail.map((x) => '<div class="meta">· ' + esc(x.agent) + ' (bond ' + cr(x.bond) + '): '
             + esc(x.reason) + '</div>').join('')

@@ -171,6 +171,22 @@ the walls point at.
   regression test for exactly this attack, and it caught a real bug: the
   price path was seeded with `m.history || [seed]`, and an empty array is
   truthy, so the TWAP degenerated to the post-pump spot price.
+- **An escrow that returns on every path is a deposit, not a bond.** The
+  creator escrows `b·ln n` as the LMSR maker loss, and a void redeeming
+  at `min(value, what you paid)` turns unpaid trader value into residual
+  the creator could claim — while the abandoned-market backstop voids by
+  itself after a week. So *refusing to resolve* returned nearly the whole
+  escrow (68.5 of 69.3 measured) where resolving honestly returned a
+  fraction (11.3), a 57-credit reward for silence taken from the trader
+  who was right. Going silent must never beat settling: escrow now comes
+  back on a resolution, or on a void an operator decided, and never on
+  one the creator's own inaction produced.
+- **Cap a redemption on NET CASH IN, not on cost basis.** A per-outcome
+  cost cap let a trader pump, sell part of the position to bank the gain,
+  and still redeem the remainder at its full remaining basis — a measured
+  5.8% risk-free — and it taxed a perfectly hedged position ~12%, because
+  a leg that gained could not offset a leg that lost. One number per
+  position, `Σ in − Σ out`, fixes both and is equally conserving.
 - **A fix is a new attack surface: the state you add needs every branch
   that reads the old state re-checked.** Making an oracle-initiated void a
   *proposal* (so holders can object to a cancellation they can only lose
@@ -232,7 +248,7 @@ the walls point at.
 
 ## Tests
 
-`node --test --test-concurrency=1 markets/test.js` — 69 tests: LMSR and
+`node --test --test-concurrency=1 markets/test.js` — 73 tests: LMSR and
 TWAP math, session/CSRF/rate-limit units, hardened headers, cookie
 scoping, prototype-key ids, grants, escrow, stake-first quotes,
 quote↔trade parity, slippage guards (including the NaN-fails-closed case),
