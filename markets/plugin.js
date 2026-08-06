@@ -1308,9 +1308,9 @@ export async function activate(api) {
   // ---------------------------------------------------------------- UI
   const uiHandler = async (request, reply) => {
     for (const [k, v] of Object.entries(UI_HEADERS)) reply.header(k, v);
-    return reply.header('content-type', 'text/html; charset=utf-8').send(renderUi(prefix, { accounts: accountsUi }));
+    return reply.header('content-type', 'text/html; charset=utf-8').send(renderUi(prefix, { accounts: accountsUi, brand: cfg.brand, tagline: cfg.tagline }));
   };
-  api.fastify.get(prefix, uiHandler);
+  if (prefix) api.fastify.get(prefix, uiHandler); // '' would be an empty route path
   api.fastify.get(`${prefix}/`, uiHandler);
 
   tick();

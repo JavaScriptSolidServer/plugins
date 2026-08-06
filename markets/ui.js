@@ -24,13 +24,15 @@
 
 export function renderUi(prefix, opts = {}) {
   const accounts = !!opts.accounts; // standalone host: register/login form
+  const brand = typeof opts.brand === 'string' && opts.brand ? opts.brand : 'Markets';
+  const tagline = typeof opts.tagline === 'string' && opts.tagline ? opts.tagline : 'prediction markets on your pod';
   const P = JSON.stringify(prefix);
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Markets — prediction markets on your pod</title>
+<title>${brand} — ${tagline}</title>
 <style>
   :root{
     /* surfaces + ink */
@@ -316,7 +318,7 @@ export function renderUi(prefix, opts = {}) {
       <rect x="7.75" y="6" width="4.5" height="13" rx="1.5" fill="currentColor" opacity=".7"></rect>
       <rect x="14.5" y="1" width="4.5" height="18" rx="1.5" fill="var(--accent)"></rect>
     </svg>
-    Markets
+    ${brand}
   </a>
   <span class="livechip off" id="live"><span class="livedot" aria-hidden="true"></span><span id="live-t">connecting</span></span>
   <span class="spacer"></span>
@@ -1370,7 +1372,7 @@ export function renderUi(prefix, opts = {}) {
     if (h.startsWith('#m/')) return renderDetail(h.slice(3), true);
     $('detail-view').classList.add('hidden');
     $('list-view').classList.remove('hidden');
-    document.title = 'Markets — prediction markets on your pod';
+    document.title = ${JSON.stringify(brand + ' — ' + tagline)};
     current = null; cursor = null; paged = false;
     $('d-position').dataset.shape = '';
     cancelSlip();
