@@ -70,7 +70,7 @@ git -c http.extraHeader="Authorization: Bearer <token>" push forge main
 - **Hex-name collision, decided**: a pod username that is exactly 64
   lowercase hex characters is theoretically registrable and would collide
   with a nostr namespace. Hex-as-nostr wins for display and semantics
-  (the UI shows npub-short); the push check is a string comparison, so
+  (the UI shows did:nostr-short); the push check is a string comparison, so
   such a pod user and the matching keyholder would share the namespace —
   noted rather than papered over, because pod names are human-chosen and
   a 64-hex username is not an accident.
@@ -744,7 +744,7 @@ mirror announcements are a sound, clearly-scoped discovery layer.
 
 ## Nostr agents (tier 2.5)
 
-### Identity model — hex canonical, npub display-only
+### Identity model — hex canonical, did:nostr-short for display
 
 Per [did-nostr.com](https://did-nostr.com), the canonical nostr identity
 is `did:nostr:<64-char-lowercase-hex-pubkey>` — **exactly the string
@@ -754,11 +754,11 @@ mapping exists. The forge keys everything on it:
 - **namespace / storage paths / index keys / API `id` fields: hex.**
   A nostr agent's repos live at `<prefix>/<hex>/<name>.git`; hosted
   content under `pluginDir/hosted/<hex>/`.
-- **UI rendering: shortened npub** (`npub1abcd…wxyz`), produced by a
-  ~30-line pure-node bech32 (BIP-173, full checksum) encoder, unit-tested
-  against the canonical NIP-19 vector
-  (`3bf0c63f…459d` → `npub180cvv07…jh6w6`). Raw hex is never rendered as
-  a display name.
+- **UI rendering: shortened did:nostr** (`did:nostr:4a578b54…`). No npub
+  is rendered anywhere; the npub encoder stays (unit-tested against the
+  canonical NIP-19 vector, `3bf0c63f…459d` → `npub180cvv07…jh6w6`) for
+  the JSON API's additive `npub` field and for callers that want bech32.
+  Raw full hex is never rendered as a display name either.
 - **Author links** point at core's did:nostr DID-document route,
   `/.well-known/did/nostr/<hex>` (`src/idp/well-known-did-nostr.js` —
   real in the published server; it 404s for keys with no local account

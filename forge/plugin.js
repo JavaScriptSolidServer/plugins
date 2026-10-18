@@ -133,7 +133,7 @@ import { promisify } from 'node:util';
 
 import { schnorr, secp256k1 } from '@noble/curves/secp256k1';
 import {
-  npubEncode, p2trAddressEncode, markStateHash, trailProgram, trailAddress, npubShort, gitmarkStateHash,
+  npubEncode, p2trAddressEncode, markStateHash, trailProgram, trailAddress, didShort, gitmarkStateHash,
 } from './lib/blocktrails.js';
 // re-export the four the test suite imports from plugin.js (back-compat)
 export { markStateHash, gitmarkStateHash, npubEncode, trailAddress, trailProgram } from './lib/blocktrails.js';
@@ -1585,7 +1585,7 @@ export async function activate(api) {
     })
     .catch((err) => api.log.warn(`forge: announce ${owner}/${name} failed: ${err.message}`));
 
-  api.log.info(`forge: nostr announce identity ${npubShort(announcePubkey)} (${announcePubkey.slice(0, 8)}…) — `
+  api.log.info(`forge: nostr announce identity ${didShort(announcePubkey)} — `
     + (announceRelays.length
       ? `NIP-34 emission to ${announceRelays.length} relay(s)`
       : 'emission DISABLED (set config.announceRelays to opt in)'));
@@ -1865,25 +1865,26 @@ export async function activate(api) {
     return out;
   }
 
-  // Rendering identity (2.5): nostr agents display as shortened npub —
-  // NEVER as raw hex — and link to core's did:nostr DID-document route
-  // (/.well-known/did/nostr/<hex>, src/idp/well-known-did-nostr.js, real
-  // in the published server). Hex stays canonical in every path/id.
+  // Rendering identity (2.5): nostr agents display as a shortened did:nostr
+  // (did:nostr:4a578b54…), never as an npub, and link to core's did:nostr
+  // DID-document route (/.well-known/did/nostr/<hex>,
+  // src/idp/well-known-did-nostr.js, real in the published server). Hex
+  // stays canonical in every path/id.
   const displayName = (agent) => {
     const hex = nostrHexOf(agent);
-    if (hex) return npubShort(hex);
+    if (hex) return didShort(hex);
     return ownerFromAgent(agent) ?? String(agent);
   };
   const authorHref = (agent) => {
     const hex = nostrHexOf(agent);
     return hex ? `/.well-known/did/nostr/${hex}` : String(agent);
   };
-  /** Owner path segment -> display form (npub-short for hex namespaces). */
-  const dispOwner = (owner) => (NOSTR_HEX.test(owner) ? npubShort(owner) : owner);
+  /** Owner path segment -> display form (did:nostr-short for hex namespaces). */
+  const dispOwner = (owner) => (NOSTR_HEX.test(owner) ? didShort(owner) : owner);
   /** Additive author metadata for the JSON API (list + thread). */
   function authorMeta(agent) {
     const hex = nostrHexOf(agent);
-    if (hex) return { id: agent, displayName: npubShort(hex), npub: npubEncode(hex), kind: 'nostr' };
+    if (hex) return { id: agent, displayName: didShort(hex), npub: npubEncode(hex), kind: 'nostr' };
     return { id: String(agent), displayName: displayName(agent), kind: 'webid' };
   }
   const issueMdCtx = (owner, name) => ({

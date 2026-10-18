@@ -130,7 +130,12 @@ export function trailAddress(pubkeyBaseHex, stateHashes, hrp) {
   return p2trAddressEncode(hrp, Buffer.from(trailProgram(pubkeyBaseHex, stateHashes), 'hex'));
 }
 
-/** Shortened npub for UI rendering: npub1abcd…wxyz. */
+/** Shortened did:nostr for UI rendering: did:nostr:4a578b54… (hex stays canonical). */
+export function didShort(hex) {
+  return `did:nostr:${String(hex).slice(0, 8)}…`;
+}
+
+/** Shortened npub: npub1abcd…wxyz. Kept for callers that want bech32; the UI shows did:nostr. */
 export function npubShort(hex) {
   const npub = npubEncode(hex);
   return `${npub.slice(0, 9)}…${npub.slice(-4)}`;

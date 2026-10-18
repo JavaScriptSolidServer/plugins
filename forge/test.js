@@ -952,15 +952,17 @@ describe('forge plugin', () => {
       );
     });
 
-    it('repo list, owner page and repo home display npub-short, hex stays in paths', async () => {
-      const short = npubShortOf(pkA);
+    it('repo list, owner page and repo home display did:nostr-short, never an npub, hex stays in paths', async () => {
+      const short = `did:nostr:${pkA.slice(0, 8)}…`;
       const idx = await (await fetch(`${base}/forge/`)).text();
-      assert.ok(idx.includes(short), 'index shows the shortened npub');
+      assert.ok(idx.includes(short), 'index shows the shortened did:nostr');
+      assert.ok(!idx.includes(npubShortOf(pkA)) && !idx.includes('npub1'), 'no npub rendered on the index');
       assert.ok(idx.includes(`/forge/${pkA}/nrepo`), 'links keep the canonical hex path');
       const ownerHtml = await (await fetch(`${base}/forge/${pkA}`)).text();
-      assert.ok(ownerHtml.includes(short), 'owner page heading is npub-short');
+      assert.ok(ownerHtml.includes(short), 'owner page heading is did:nostr-short');
       const home = await (await fetch(`${base}/forge/${pkA}/nrepo`)).text();
-      assert.ok(home.includes(short), 'repo crumb is npub-short');
+      assert.ok(home.includes(short), 'repo crumb is did:nostr-short');
+      assert.ok(!home.includes('npub1'), 'no npub on the repo home');
       assert.ok(home.includes(`/forge/${pkA}/nrepo.git`), 'clone URL is hex');
     });
 
@@ -1002,8 +1004,8 @@ describe('forge plugin', () => {
       const t = await (await fetch(`${base}/forge/api/repos/${pkA}/nrepo/issues/1`)).json();
       assert.strictEqual(t.author, didA, 'author string stays the canonical DID');
       assert.deepStrictEqual(t.authorInfo, {
-        id: didA, displayName: npubShortOf(pkA), npub: npubEncode(pkA), kind: 'nostr',
-      }, 'additive author metadata');
+        id: didA, displayName: `did:nostr:${pkA.slice(0, 8)}…`, npub: npubEncode(pkA), kind: 'nostr',
+      }, 'additive author metadata (display is did:nostr-short; npub stays as data)');
       const [head, c1] = t.thread;
       assert.strictEqual(head.hosted, true);
       assert.strictEqual(head.authorInfo.kind, 'nostr');
@@ -1012,10 +1014,11 @@ describe('forge plugin', () => {
       assert.strictEqual(c1.authorInfo.npub, npubEncode(pkB));
     });
 
-    it('thread HTML: "hosted by the forge" tag, npub-short author, no raw-hex name', async () => {
+    it('thread HTML: "hosted by the forge" tag, did:nostr-short author, no npub, no raw-hex name', async () => {
       const html = await (await fetch(`${base}/forge/${pkA}/nrepo/issues/1`)).text();
       assert.ok(html.includes('hosted by the forge'), 'hosted tag rendered');
-      assert.ok(html.includes(`<b>${npubShortOf(pkA)}</b>`), 'author renders as npub-short');
+      assert.ok(html.includes(`<b>did:nostr:${pkA.slice(0, 8)}…</b>`), 'author renders as did:nostr-short');
+      assert.ok(!html.includes('npub1'), 'no npub rendered in the thread');
       assert.ok(!html.includes(`>${pkA}<`), 'raw hex never rendered as a display name');
       assert.ok(html.includes(`/.well-known/did/nostr/${pkA}`), "author links to core's DID-document route");
       assert.ok(html.includes('>owner</span>'), 'hex-namespace owner badge still works');
