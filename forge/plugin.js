@@ -122,7 +122,7 @@
 //     patterns; '..', backslash, leading dots and encoded traversal are
 //     rejected before any path or git argument is built.
 
-import { spawn, execFile } from 'node:child_process';
+import { spawn, execFile, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -133,10 +133,10 @@ import { promisify } from 'node:util';
 
 import { schnorr, secp256k1 } from '@noble/curves/secp256k1';
 import {
-  npubEncode, p2trAddressEncode, markStateHash, trailProgram, trailAddress, npubShort,
+  npubEncode, p2trAddressEncode, markStateHash, trailProgram, trailAddress, npubShort, gitmarkStateHash,
 } from './lib/blocktrails.js';
 // re-export the four the test suite imports from plugin.js (back-compat)
-export { markStateHash, npubEncode, trailAddress, trailProgram } from './lib/blocktrails.js';
+export { markStateHash, gitmarkStateHash, npubEncode, trailAddress, trailProgram } from './lib/blocktrails.js';
 import {
   esc, okSegment, okPath, okRef, relTime, labelTextColor, labelChips, fmtBytes, looksBinary, identicon, REF_RE,
   ICON_DIR, ICON_FILE, ICON_REPO, ICON_BRANCH, ICON_TAG, ICON_ISSUE_OPEN, ICON_ISSUE_CLOSED,
@@ -218,9 +218,17 @@ const SEARCH_EXCERPT_CAP = 200; // chars of line excerpt
 // and mempool.space explorer path. Mainnet identifiers are refused at
 // activate unless config.allowMainnet — this plugin's custody posture is
 // testnet-grade (see README Findings).
-const CHAIN_HRP = { btc: 'bc', mainnet: 'bc', bitcoin: 'bc', tbtc4: 'tb', tbtc3: 'tb', signet: 'tb', regtest: 'bcrt' };
-const MAINNET_CHAINS = new Set(['btc', 'mainnet', 'bitcoin']);
+const CHAIN_HRP = { btc: 'bc', mainnet: 'bc', bitcoin: 'bc', tbtc4: 'tb', tbtc3: 'tb', signet: 'tb', regtest: 'bcrt', txbt4: 'tb', xbt: 'bc' };
+const MAINNET_CHAINS = new Set(['btc', 'mainnet', 'bitcoin', 'xbt']);
 const MEMPOOL_PATH = { btc: '', mainnet: '', bitcoin: '', tbtc4: '/testnet4', tbtc3: '/testnet', signet: '/signet' };
+// Explorer web pages per chain, for trails that arrive in a repo (any chain the
+// git-mark CLI knows), used only to build links the USER clicks.
+const EXPLORER_WEB = {
+  btc: 'https://mempool.space', mainnet: 'https://mempool.space', bitcoin: 'https://mempool.space',
+  tbtc4: 'https://mempool.space/testnet4', tbtc3: 'https://mempool.space/testnet', signet: 'https://mempool.space/signet',
+  txbt4: 'https://mempool.guide/testnet4', xbt: 'https://mempool.kilombino.com',
+};
+const TRAIL_FILE = 'blocktrails.json';
 const TXID64 = /^[0-9a-f]{64}$/;
 const MARK_INDEX_RE = /^(0|[1-9][0-9]{0,5})$/;
 const MARKS_CAP = 500;           // marks per trail (each push stacks one)
@@ -1292,6 +1300,60 @@ export async function activate(api) {
   const recordTipSafe = (owner, name) => recordTip(owner, name)
     .catch((err) => api.log.warn(`forge: recordTip ${owner}/${name} failed: ${err.message}`));
 
+  // ------------------------------------------ repo-held trails (git mark)
+  // The other way a trail reaches the forge: the repo's OWN key (git config
+  // nostr.privkey, the same key as the agent's did:nostr) marks each commit
+  // with the git-mark CLI, and the trail document is committed as
+  // blocktrails.json. The forge then holds no key and records nothing: it
+  // reads the file at the default-branch tip, re-derives every address with
+  // gitmark's state bytes (sha256 of the commit hash as text, same TapTweak
+  // chain as the forge's own marks), and serves the document with CORS so the
+  // hosted verifier can check it against the chain client-side.
+  const TXO_URI_RE = /^txo:([a-z0-9]+):([0-9a-f]{64}):(\d+)(?:\?(.*))?$/i;
+  function parseTxoUri(uri) {
+    const m = String(uri || '').match(TXO_URI_RE);
+    if (!m) return null;
+    const params = Object.fromEntries((m[4] || '').split('&').filter(Boolean).map((kv) => kv.split('=')));
+    return { chain: m[1], txid: m[2].toLowerCase(), vout: Number(m[3]), amount: params.amount ? Number(params.amount) : null, commit: params.commit || null, pubkey: params.pubkey || null };
+  }
+  async function repoTrail(owner, name, branch) {
+    const dir = repoDirOf(owner, name);
+    let raw;
+    try { raw = await gitText(dir, ['show', `refs/heads/${branch}:${TRAIL_FILE}`]); } catch { return null; }
+    let doc;
+    try { doc = JSON.parse(raw); } catch { return null; }
+    if (!doc || doc['@type'] !== 'Blocktrail' || doc.profile !== 'gitmark') return null;
+    if (!/^0[23][0-9a-f]{64}$/i.test(String(doc.pubkeyBase || '')) || typeof doc.chain !== 'string') return null;
+    const states = Array.isArray(doc.states) ? doc.states.filter((c) => /^[0-9a-f]{40}$/i.test(String(c))) : [];
+    const txo = Array.isArray(doc.txo) ? doc.txo.map(String) : [];
+    const hrp = CHAIN_HRP[doc.chain];
+    const marks = states.map((commit, i) => {
+      const hashes = states.slice(0, i + 1).map(gitmarkStateHash);
+      let program = null;
+      let address = null;
+      try { program = trailProgram(doc.pubkeyBase, hashes); address = hrp ? p2trAddressEncode(hrp, Buffer.from(program, 'hex')) : null; } catch { /* bad key */ }
+      const t = parseTxoUri(txo[i]);
+      return { index: i, commit, program, address, txo: t, txoUri: txo[i] || null };
+    });
+    return { doc, raw, branch, chain: doc.chain, pubkeyBase: doc.pubkeyBase, xonly: doc.pubkeyBase.slice(2).toLowerCase(), marks };
+  }
+  // A short-lived, synchronous answer to "does this repo carry a trail?" for the
+  // tab strip (which is sync and renders on every page). One git cat-file per
+  // repo per 30 s.
+  const repoTrailSeen = new Map();
+  function repoHasTrail(owner, name) {
+    const key = `${owner}/${name}`;
+    const hit = repoTrailSeen.get(key);
+    if (hit && hit.until > Date.now()) return hit.value;
+    let value = false;
+    try {
+      execFileSync('git', ['-C', repoDirOf(owner, name), 'cat-file', '-e', `HEAD:${TRAIL_FILE}`], { env: gitEnv, stdio: 'ignore' });
+      value = true;
+    } catch { value = false; }
+    repoTrailSeen.set(key, { value, until: Date.now() + 30_000 });
+    return value;
+  }
+
   // ------------------------------------------ nostr discovery (NIP-34)
   // A repo lives on many forges (mirrors); the Blocktrails mark (a Bitcoin
   // tx) is the source of truth; Nostr NIP-34 events are the discovery +
@@ -1372,15 +1434,44 @@ export async function activate(api) {
     ];
     if (announceRelays.length) tags.push(['relays', ...announceRelays]);
     if (NOSTR_HEX.test(owner)) tags.push(['maintainers', owner]); // owner IS the pubkey
+    for (const t of await anchorTags(owner, name, base)) tags.push(t);
+    return signAnnounceEvent({ kind: 30617, tags, content: description });
+  }
+
+  /**
+   * The anchor tags both NIP-34 events carry when a repo is anchored, from
+   * either trail model. `anchor` [chain, genesis txid] and `r` (the trail
+   * document) are the forge's own; `chain`, `txo` and `commit` name the
+   * LATEST on-chain mark the way `git mark announce` does, so one consumer
+   * (the gitmark console) reads forge-anchored and agent-announced repos alike.
+   */
+  async function anchorTags(owner, name, base) {
+    const tags = [];
     const trail = loadTrail(owner, name);
     // Marks are recorded strictly in order (N spends N-1), so a marked mark 0
     // IS the genesis anchor — the Bitcoin tx a consumer treats as truth.
     const genesis = trail && trail.marks[0];
     if (genesis && genesis.status === 'marked') {
+      const frontier = trail.marks.filter((m) => m.status === 'marked').at(-1);
       tags.push(['r', `${base}/blocktrails.json`]);
       tags.push(['anchor', trail.chain, genesis.txid]);
+      tags.push(['chain', trail.chain]);
+      tags.push(['txo', `txo:${trail.chain}:${frontier.txid}:${frontier.vout}`]);
+      tags.push(['commit', frontier.state.commit]);
+      return tags;
     }
-    return signAnnounceEvent({ kind: 30617, tags, content: description });
+    if (trail) return tags; // forge-held but nothing on-chain yet
+    let rt = null;
+    try { rt = await repoTrail(owner, name, await defaultBranch(repoDirOf(owner, name))); } catch { rt = null; }
+    const last = rt && rt.marks.filter((m) => m.txo).at(-1);
+    if (!last) return tags;
+    const first = rt.marks.find((m) => m.txo);
+    tags.push(['r', `${base}/blocktrails.json`]);
+    tags.push(['anchor', rt.chain, first.txo.txid]);
+    tags.push(['chain', rt.chain]);
+    tags.push(['txo', `txo:${rt.chain}:${last.txo.txid}:${last.txo.vout}`]);
+    tags.push(['commit', last.commit]);
+    return tags;
   }
 
   /**
@@ -1415,12 +1506,7 @@ export async function activate(api) {
     heads.sort((a, b) => (a[0] === `refs/heads/${branch}` ? -1 : b[0] === `refs/heads/${branch}` ? 1 : a[0].localeCompare(b[0])));
     for (const [refname, sha] of heads) tags.push([refname, sha]);
     tags.push(['HEAD', `ref: refs/heads/${branch}`]);
-    const trail = loadTrail(owner, name);
-    const genesis = trail && trail.marks[0];
-    if (genesis && genesis.status === 'marked') {
-      tags.push(['r', `${base}/blocktrails.json`]);
-      tags.push(['anchor', trail.chain, genesis.txid]);
-    }
+    for (const t of await anchorTags(owner, name, base)) tags.push(t);
     return signAnnounceEvent({ kind: 30618, tags, content: '' });
   }
 
@@ -1966,7 +2052,7 @@ ${body}
       // Anchors: always shown when config.anchoringUi is on (discoverable — the
       // marks page carries the Enable pitch when off); otherwise legacy behavior,
       // surfacing only once the owner has enabled anchoring on this repo.
-      ...((anchoringUi || marksEnabled(owner, name)) ? [['anchors', 'Anchors', `${base}/marks`]] : []),
+      ...((anchoringUi || marksEnabled(owner, name) || repoHasTrail(owner, name)) ? [['anchors', 'Anchors', `${base}/marks`]] : []),
     ].map(([id, label, href]) => `<a class="tab${tab === id ? ' active' : ''}" href="${href}">${label}</a>`).join('');
     return `<div class="repo-strip"><div class="container">
 <div class="crumb">${ICON_REPO} <a href="${prefix}/${owner}">${esc(dispOwner(owner))}</a><span class="muted">/</span><a href="${base}"><b>${esc(name)}</b></a>
@@ -3005,10 +3091,65 @@ ${cards || '<div class="empty"><h3>No releases yet</h3><p class="muted">Push a t
     return `<span class="badge">${esc(label)}</span>${MAINNET_CHAINS.has(c) ? '' : ' <span class="muted" style="font-size:12px">(testnet — demonstrations, not value)</span>'}`;
   }
 
+  // The six lines that take a fresh repo to an announced mark with a repo-held
+  // key. Shown wherever the page explains how a trail is made.
+  const SIX_LINES = `npm init agent                 # a key in git config nostr.privkey, a did:nostr
+npx fund-agent                 # 10,000 sats to that key from your voucher file
+git mark init --chain txbt4    # the trail: finds the coin at the key's address
+git add . &amp;&amp; git commit -m first
+git mark                       # spend the coin to the commit's address = the mark
+git mark announce              # NIP-34 kind 30617 with chain, txo and commit tags`;
+
   async function marksPage(reply, owner, name) {
     const branch = await defaultBranch(repoDirOf(owner, name));
     const base = `${prefix}/${owner}/${name}`;
     const trail = loadTrail(owner, name);
+
+    // A trail kept by the repo's own key, committed as blocktrails.json (git
+    // mark). No forge key, nothing to record: read, re-derive, link, verify.
+    const rt = trail ? null : await repoTrail(owner, name, branch);
+    if (rt) {
+      const web = EXPLORER_WEB[rt.chain] || null;
+      const txLink = (t) => (t ? (web
+        ? `<a class="sha" href="${esc(`${web}/tx/${t.txid}`)}">${esc(t.txid.slice(0, 10))}…:${t.vout}</a>`
+        : `<span class="sha">${esc(t.txid.slice(0, 10))}…:${t.vout}</span>`) : '<span class="muted">—</span>');
+      const rows = rt.marks.map((m) => `<tr>
+<td>#${m.index}</td>
+<td><a class="sha" href="${base}/commit/${esc(m.commit)}">${esc(m.commit.slice(0, 7))}</a></td>
+<td>${m.address ? `<code>${esc(m.address)}</code>` : '<span class="muted">unknown chain</span>'}
+${m.txo && m.txo.pubkey && m.program && m.txo.pubkey.toLowerCase() !== m.program ? '<div class="muted" style="font-size:11px">address in the file disagrees with the derivation</div>' : ''}</td>
+<td>${m.txo && m.txo.amount !== null ? `${esc(String(m.txo.amount))} <span class="muted">sat</span>` : '<span class="muted">—</span>'}</td>
+<td>${txLink(m.txo)}</td>
+</tr>`).join('\n');
+      const trailUrl = `${publicOrigin()}${base}/blocktrails.json`;
+      const verifyHref = `https://blocktrails.github.io/verify/?uri=${encodeURIComponent(trailUrl)}`;
+      const baseAddr = CHAIN_HRP[rt.chain] ? p2trAddressEncode(CHAIN_HRP[rt.chain], Buffer.from(rt.xonly, 'hex')) : null;
+      const body = `${repoStrip(owner, name, 'anchors', branch)}<main><div class="container">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+<h1 class="page" style="margin:0">Anchors ${chainBadge(rt.chain)}</h1>
+<div style="display:flex;gap:8px">
+<a class="btn" href="${base}/blocktrails.json">blocktrails.json</a>
+<a class="btn btn-primary" href="${esc(verifyHref)}">Verify independently</a>
+</div>
+</div>
+<p class="muted" style="margin:4px 0 16px">Trail key <code>${esc(rt.xonly.slice(0, 10))}…</code> (<b>repo-held</b>, ${esc(rt.chain)}) &middot;
+did:nostr:<code>${esc(rt.xonly.slice(0, 10))}…</code> &middot; ${rt.marks.length} mark${rt.marks.length === 1 ? '' : 's'} &middot;
+read from <code>${esc(TRAIL_FILE)}</code> at <b>${esc(branch)}</b>; every address below is re-derived here from the base key
+and the commits, and verification runs <b>client-side</b> in the hosted verifier against the chain.</p>
+${baseAddr ? `<p class="muted" style="margin:0 0 12px">Base address <code>${esc(baseAddr)}</code> — where <code>npx fund-agent</code> put the first coin.</p>` : ''}
+<div class="box"><table class="marks">
+<tr><th>mark</th><th>commit</th><th>derived address</th><th>sats</th><th>tx</th></tr>
+${rows}
+</table></div>
+<div class="fundbox">
+<h3 style="margin:0 0 4px">Next mark</h3>
+<p class="muted" style="margin:4px 0 8px">The key never leaves the repo's machine. Each new commit is one <code>git mark</code>
+(300 sats from the trail coin) and one <code>git mark announce</code>; a push brings the updated trail file here.</p>
+<pre>${SIX_LINES}</pre>
+</div>
+</div></main>`;
+      return sendHtml(reply, 200, page(`Anchors · ${owner}/${name}`, body));
+    }
 
     if (!trail) {
       // Not enabled: the Enable pitch. The button is the house client-JS
@@ -3023,6 +3164,10 @@ tamper-evident, Bitcoin-ordered trail. The forge only <b>derives and records</b>
 spending and verification all happen off-server.</p>
 <p class="muted">Enabling mints a forge-held trail key (${esc(chain)} custody — see the README)
 and derives mark&nbsp;0 from the current <b>${esc(branch)}</b> tip.</p>
+<p class="muted"><b>Or keep the key in the repo.</b> Mark commits with the git-mark CLI and commit the trail file;
+once <code>${esc(TRAIL_FILE)}</code> is on <b>${esc(branch)}</b> this page reads it, re-derives every address and
+links each mark. No forge key, nothing to record:</p>
+<pre>${SIX_LINES}</pre>
 ${authBox('Enabling anchoring')}
 <div style="display:flex;align-items:center;gap:8px">
 <button id="do-enable" class="btn btn-primary" type="button" disabled>Enable anchoring</button>
@@ -3087,13 +3232,14 @@ sats to the derived address${firstPending.index > 0 ? ' — by <b>spending the p
 <button class="btn" style="padding:1px 8px;font-size:11px" type="button"
  onclick="navigator.clipboard.writeText(this.previousElementSibling.textContent)">Copy</button>
 </div>
-<pre># on YOUR machine — funding and spending happen off-server
-# 1. redeem a TXO voucher into git config nostr.privkey (maintainer's fund-agent):
-npx fund-agent "txo:${esc(chain)}:&lt;txid&gt;:&lt;vout&gt;?amount=&lt;sats&gt;&amp;key=&lt;privkey&gt;"
-# 2. send/spend to the address above (any ${esc(chain)} wallet, or the git-mark CLI, npm: git-seal):
-git mark ${firstPending.index === 0 ? 'genesis' : 'advance'} --txid &lt;txid&gt; --vout &lt;n&gt; --amount &lt;sats&gt;
-# 3. report where it landed (repo owner), and the mark turns green:
-#    POST ${esc(`${prefix}/api/repos/${owner}/${name}/marks/${firstPending.index}/txo`)}  {"txid":"…","vout":0,"amount":…}</pre>
+<pre># on YOUR machine — the forge derived the address above and never broadcasts
+# 1. ${firstPending.index === 0 ? `send ${esc(chain)} sats to it from any wallet (a faucet, npx fund-agent's voucher key, your own)` : `spend the previous mark's output to it (the spend IS the advance)`}
+# 2. record where it landed (repo owner), and the mark turns green — the form below, or:
+#    POST ${esc(`${prefix}/api/repos/${owner}/${name}/marks/${firstPending.index}/txo`)}  {"txid":"…","vout":0,"amount":…}
+#
+# Prefer the key in the repo? The git-mark CLI (npm gitmark) does the spend, the record
+# and the announcement itself; push the trail file and this page reads it:
+${SIX_LINES}</pre>
 ${authBox('Recording a transaction')}
 <div class="issueform" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
 <input type="text" id="f-txid" placeholder="txid (64 hex)" style="flex:2;min-width:280px;margin-bottom:0">
@@ -4400,9 +4546,20 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
    * yet) — the full list, pending included, rides in the additive `marks`
    * field.
    */
-  function blocktrailsResp(reply, owner, name) {
+  async function blocktrailsResp(reply, owner, name) {
     const trail = loadTrail(owner, name);
     if (!trail) {
+      // A repo-held trail: the committed document itself, as the hosted
+      // verifier wants it (CORS-readable), parsed once so only JSON goes out.
+      let rt = null;
+      try { rt = await repoTrail(owner, name, await defaultBranch(repoDirOf(owner, name))); } catch { rt = null; }
+      if (rt) {
+        return reply.code(200)
+          .header('content-type', 'application/json; charset=utf-8')
+          .header('access-control-allow-origin', '*')
+          .header('x-content-type-options', 'nosniff')
+          .send(JSON.stringify(rt.doc, null, 2));
+      }
       return reply.code(404)
         .header('content-type', 'application/json; charset=utf-8')
         .header('access-control-allow-origin', '*')
@@ -4735,7 +4892,7 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
           case 'search': return tail.length === 0 ? await searchPage(reply, owner, name, request.query) : notFound(reply);
           case 'releases': return tail.length === 0 ? await releasesPage(reply, owner, name) : notFound(reply);
           case 'marks': return tail.length === 0 ? await marksPage(reply, owner, name) : notFound(reply);
-          case 'blocktrails.json': return tail.length === 0 ? blocktrailsResp(reply, owner, name) : notFound(reply);
+          case 'blocktrails.json': return tail.length === 0 ? await blocktrailsResp(reply, owner, name) : notFound(reply);
           case 'archive': return tail.length ? await archiveResp(reply, owner, name, tail) : notFound(reply);
           case 'compare': return tail.length ? await comparePage(reply, owner, name, tail.join('/')) : notFound(reply);
           case 'pulls': {

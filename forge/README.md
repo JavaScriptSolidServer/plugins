@@ -532,8 +532,10 @@ addresses and the expected chain; the transactions happen outside.
    become `marked`. Non-default-branch pushes never advance
    (test-proven). 500-mark cap per trail.
 3. **Fund/spend off-server**: the marks page shows the first pending
-   mark's address plus copy-paste `npx fund-agent "txo:tbtc4:…"` /
-   `git mark advance` instructions per the maintainer's READMEs.
+   mark's address. Any wallet sends to it (a faucet, the voucher key
+   `npx fund-agent` keeps, your own); spending the previous mark's
+   output to it is the advance. The page also shows the six lines of
+   the repo-held flow (below) for those who would rather keep the key.
 4. **Record** (`POST .../marks/<i>/txo`, owner): report `{txid, vout,
    amount}`; the mark flips to `marked`. Recorded in order — the trail
    is a linear spend chain. Shape-checked, never chain-checked.
@@ -559,10 +561,38 @@ already public on the marks page, so CORS widens reach, not exposure.
 CSP's `connect-src 'self'` does not govern — no CSP delta needed.)
 
 **Testnet-only defaults**: `chain: 'tbtc4'` (testnet4). Mainnet chain
-identifiers (`btc`/`mainnet`/`bitcoin`) are **refused at activate** —
+identifiers (`btc`/`mainnet`/`bitcoin`/`xbt`) are **refused at activate** —
 loudly, naming the stakes — unless `config.allowMainnet: true`; unknown
 chains are refused too (no address is better than a wrong-network
 address someone might fund).
+
+### Repo-held trails (git mark)
+
+The other way a trail reaches the forge, and the one an agent uses: the
+repo's **own** key (`git config nostr.privkey`, the same key as its
+`did:nostr`) marks each commit with the git-mark CLI (npm `gitmark`),
+and the trail document is committed as `blocktrails.json`. Six lines
+from nothing to an announced mark:
+
+```bash
+npm init agent                 # a key in git config nostr.privkey, a did:nostr
+npx fund-agent                 # 10,000 sats to that key from your voucher file
+git mark init --chain txbt4    # the trail: finds the coin at the key's address
+git add . && git commit -m first
+git mark                       # spend the coin to the commit's address = the mark
+git mark announce              # NIP-34 kind 30617 with chain, txo and commit tags
+```
+
+When `blocktrails.json` with `profile: gitmark` is on the default
+branch, the forge holds no key and records nothing: the Anchors tab
+reads the file, **re-derives every address** (same TapTweak chain,
+gitmark's state bytes: `sha256(<commit hash as text>)`), links each
+mark to its chain's explorer (`txbt4` → mempool.guide, `xbt` →
+Kilombino, the rest mempool.space), serves the document at
+`…/blocktrails.json` with CORS for the hosted verifier, and names the
+latest mark in its NIP-34 events (`chain`, `txo`, `commit`). A forge-held
+trail, when one exists, takes precedence; the Enable pitch offers both.
+No chain API is fetched for either model.
 
 ## Nostr discovery (NIP-34)
 
@@ -625,13 +655,19 @@ serialization, `sig =` schnorr over the `id`). Tags:
 | `maintainers` | `<owner>` | nostr-owned repos (owner **is** the hex pubkey) |
 | `r` | `<origin><prefix>/<owner>/<name>/blocktrails.json` | when anchored |
 | `anchor` | `[<chain>, <genesis-txid>]` | when anchored |
+| `chain` | `<chain>` | when anchored |
+| `txo` | `txo:<chain>:<txid>:<vout>` of the **latest** on-chain mark | when anchored |
+| `commit` | the commit that latest mark anchors | when anchored |
 
-The last two tie the discovery event back to the Bitcoin source of
+The anchor tags tie the discovery event back to the Bitcoin source of
 truth: `r` hands a consumer the CORS-readable, verifier-compatible trail
-doc, and the custom `anchor` tag carries the **chain + genesis txid** (a
+doc, the custom `anchor` tag carries the **chain + genesis txid** (a
 marked mark 0 — marks are a linear spend chain, so a marked genesis is
-the on-chain root). `created_at` is `Math.floor(Date.now()/1000)`
-(normal plugin runtime).
+the on-chain root), and `chain`/`txo`/`commit` name the latest mark
+exactly as `git mark announce` does, so one consumer (the gitmark
+console) reads forge-anchored and agent-announced repos alike. Both
+trail models (forge-held, repo-held) produce the same tags.
+`created_at` is `Math.floor(Date.now()/1000)` (normal plugin runtime).
 
 ### The kind-30618 event shape (repo state)
 
@@ -1204,20 +1240,20 @@ importing it:
   independent bech32m decode round-trip. bech32 vs bech32m turned out
   to be ONE constant (`1` vs `0x2bc830a3`) over the same polymod — the
   tier-2.5 npub encoder and the tb1p… encoder now share their guts.
-- **The git-mark CLI (npm `git-seal`) does not implement the spec's
-  derivation.** It uses the raw commit hash as the scalar
-  (`t = commit mod n` — no TapTweak, no state hash, no pubkey
-  binding), while the spec mandates
-  `tagged_hash("TapTweak", x_only(P) || sha256(state))` and the
-  git-mark-demo hashes `{commit, repo, branch}`. This plugin follows
-  the SPEC (the task's normative reference) with the demo's state
-  convention — so addresses derived here will not match `git mark
-  address` for the same commits under the same key. Interop survives
-  because the hosted verifier checks the SPEND CHAIN (tx exists,
-  confirmed, amount, spends-previous), not the derivation; the
-  divergence is written down here and self-described in the served
-  document (`derivation`, `stateHash` fields) so a future re-deriving
-  verifier knows exactly what it is looking at.
+- **The git-mark CLI and this plugin hash different state bytes.** The
+  old `git-seal` used the raw commit hash as the scalar; the current CLI
+  (npm `gitmark`) does the spec's `tagged_hash("TapTweak", x_only(P) ||
+  sha256(state))`, but its state is the commit hash **as text**, while
+  this plugin's forge-held marks hash `JSON.stringify({commit, repo,
+  branch})` (the git-mark-demo convention). Same chain, different bytes
+  — so the two models derive different addresses for the same commits
+  under the same key, and the plugin now carries both: `markStateHash`
+  for its own marks and `gitmarkStateHash` for trails pushed from a
+  repo-held key, which the Anchors tab re-derives in full. The hosted
+  verifier checks the SPEND CHAIN (tx exists, confirmed, amount,
+  spends-previous), not the derivation, so interop never depended on
+  this; the served document self-describes its convention
+  (`derivation`, `stateHash` fields) for a future re-deriving verifier.
 
 ### 21. Request-bound proofs make server-side pod writes impossible — the client writes, the forge validates a pointer (the capstone)
 

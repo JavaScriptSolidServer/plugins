@@ -18,9 +18,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { schnorr } from '@noble/curves/secp256k1';
+import { schnorr, secp256k1 } from '@noble/curves/secp256k1';
 import { startJss } from '../helpers.js';
-import { markStateHash, npubEncode, trailAddress, trailProgram } from './plugin.js';
+import { markStateHash, gitmarkStateHash, npubEncode, trailAddress, trailProgram } from './plugin.js';
 import { renderMarkdown } from './lib/markdown.js';
 
 const execFileP = promisify(execFile);
@@ -2101,8 +2101,9 @@ describe('forge plugin', () => {
         'the verifier is pointed at this repo’s trail document');
       assert.ok(html.includes('testnet4'), 'chain badge');
       // the latest mark is pending -> the fund box with CLI instructions
-      assert.ok(html.includes('npx fund-agent'), 'fund-agent voucher instructions');
-      assert.ok(html.includes('git mark advance'), 'git-mark CLI instructions');
+      assert.ok(html.includes('npx fund-agent'), 'fund-agent instructions (the six lines)');
+      assert.ok(html.includes('git mark announce'), 'git-mark CLI instructions end with the announcement');
+      assert.ok(!html.includes('git-seal'), 'the old CLI name is gone');
       assert.ok(html.includes(marks[1].address), 'the first PENDING mark’s address is the one to fund');
       // the tab bar carries Anchors on the enabled repo, not on others
       const home = await (await fetch(`${base}/forge/casey/trail`)).text();
@@ -2225,6 +2226,11 @@ describe('forge plugin', () => {
         'r points at the verifier-readable trail doc');
       assert.deepStrictEqual(tagVal(ev.tags, 'anchor'), ['tbtc4', genesis.txid],
         'anchor = [chain, genesis txid] — the Bitcoin source-of-truth');
+      // the latest on-chain mark, the way git mark announce names it
+      const frontier = marks.marks.filter((m) => m.status === 'marked').at(-1);
+      assert.deepStrictEqual(tagVal(ev.tags, 'chain'), ['tbtc4'], 'chain tag');
+      assert.deepStrictEqual(tagVal(ev.tags, 'txo'), [`txo:tbtc4:${frontier.txid}:${frontier.vout}`], 'txo = the frontier output');
+      assert.deepStrictEqual(tagVal(ev.tags, 'commit'), [frontier.state.commit], 'commit = the frontier state');
     });
 
     it('GET /nostr also returns a valid signed kind-30618 repo-state (HEAD + refs/heads/<default> at the real tip)', async () => {
@@ -2331,6 +2337,95 @@ describe('forge plugin', () => {
     const res = await fetch(`${base}/forge/casey/demo.git`, { redirect: 'manual' });
     assert.ok([301, 302, 303, 307, 308].includes(res.status), `expected redirect, got ${res.status}`);
     assert.strictEqual(res.headers.get('location'), '/forge/casey/demo');
+  });
+
+  describe('repo-held trails (git mark): blocktrails.json pushed with the repo', () => {
+    // A trail made by the git-mark CLI with the repo's own key: the forge holds
+    // nothing, reads the committed document, re-derives with gitmark's state
+    // bytes (sha256 of the commit hash as text), serves it with CORS, and
+    // names the latest mark in its NIP-34 events the way git mark announce does.
+    const sk = '11'.repeat(32);
+    const pubkeyBase = Buffer.from(secp256k1.getPublicKey(sk, true)).toString('hex');
+    const xonly = pubkeyBase.slice(2);
+    const txidA = 'ab'.repeat(32);
+    const txidB = 'cd'.repeat(32);
+    let agentWork;
+    let c0;
+    let c1;
+    const tagVal = (tags, k) => (tags.find((t) => t[0] === k) || []).slice(1);
+
+    before(async () => {
+      agentWork = path.join(tmp, 'agent-work');
+      fs.mkdirSync(agentWork);
+      fs.writeFileSync(path.join(agentWork, 'a.txt'), 'first\n');
+      await git(['init', '--quiet'], { cwd: agentWork });
+      await git(['add', '-A'], { cwd: agentWork });
+      await git(['commit', '--quiet', '-m', 'first'], { cwd: agentWork });
+      c0 = (await git(['rev-parse', 'HEAD'], { cwd: agentWork })).stdout.trim();
+      fs.writeFileSync(path.join(agentWork, 'a.txt'), 'second\n');
+      await git(['commit', '--quiet', '-am', 'second'], { cwd: agentWork });
+      c1 = (await git(['rev-parse', 'HEAD'], { cwd: agentWork })).stdout.trim();
+      // the trail file as gitmark writes it: states = commits, txo = one URI per mark
+      const doc = {
+        '@type': 'Blocktrail', version: '0.0.3', profile: 'gitmark', pubkeyBase, chain: 'txbt4',
+        states: [c0, c1],
+        txo: [`txo:txbt4:${txidA}:0?amount=9700&commit=${c0}`, `txo:txbt4:${txidB}:0?amount=9400&commit=${c1}`],
+      };
+      fs.writeFileSync(path.join(agentWork, 'blocktrails.json'), `${JSON.stringify(doc, null, 2)}\n`);
+      await git(['add', '-A'], { cwd: agentWork });
+      await git(['commit', '--quiet', '-m', 'trail'], { cwd: agentWork });
+      await git([...authFlag(casey.access_token), 'push', `${base}/forge/casey/agent.git`, 'main'], { cwd: agentWork });
+    });
+
+    it('the Anchors page reads the pushed trail and re-derives each address with gitmark state bytes', async () => {
+      const res = await fetch(`${base}/forge/casey/agent/marks`);
+      assert.strictEqual(res.status, 200);
+      const html = await res.text();
+      assert.ok(html.includes('repo-held'), 'names the key model');
+      assert.ok(html.includes(`did:nostr:<code>${xonly.slice(0, 10)}`), 'the trail key is the agent did');
+      const addr0 = trailAddress(pubkeyBase, [gitmarkStateHash(c0)], 'tb');
+      const addr1 = trailAddress(pubkeyBase, [gitmarkStateHash(c0), gitmarkStateHash(c1)], 'tb');
+      assert.ok(html.includes(addr0), 'mark 0 address re-derived from the base key and the first commit');
+      assert.ok(html.includes(addr1), 'mark 1 address chains both commits');
+      assert.notStrictEqual(addr0, trailAddress(pubkeyBase, [markStateHash({ commit: c0, repo: 'casey/agent', branch: 'main' })], 'tb'),
+        'gitmark state bytes differ from the forge-held state convention');
+      assert.ok(html.includes(`https://mempool.guide/testnet4/tx/${txidB}`), 'txbt4 marks link to the BLAKE2b testnet4 explorer');
+      assert.ok(html.includes('git mark announce'), 'the six lines are shown');
+      assert.ok(!html.includes('Enable anchoring'), 'no enable pitch when the repo carries its own trail');
+      // the tab strip on the repo home shows Anchors for a repo-held trail too
+      const home = await (await fetch(`${base}/forge/casey/agent`)).text();
+      assert.ok(home.includes('href="/forge/casey/agent/marks"'), 'Anchors tab from the committed trail file');
+    });
+
+    it('blocktrails.json serves the committed document with CORS', async () => {
+      const res = await fetch(`${base}/forge/casey/agent/blocktrails.json`);
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(res.headers.get('access-control-allow-origin'), '*');
+      const doc = await res.json();
+      assert.strictEqual(doc.profile, 'gitmark');
+      assert.deepStrictEqual(doc.states, [c0, c1]);
+      assert.strictEqual(doc.pubkeyBase, pubkeyBase);
+    });
+
+    it('the NIP-34 events name the latest mark with chain, txo and commit tags, plus anchor and r', async () => {
+      const j = await (await fetch(`${base}/forge/api/repos/casey/agent/nostr`)).json();
+      for (const ev of [j.event, j.state]) {
+        assert.deepStrictEqual(tagVal(ev.tags, 'chain'), ['txbt4']);
+        assert.deepStrictEqual(tagVal(ev.tags, 'txo'), [`txo:txbt4:${txidB}:0`], 'the latest mark, not the genesis');
+        assert.deepStrictEqual(tagVal(ev.tags, 'commit'), [c1]);
+        assert.deepStrictEqual(tagVal(ev.tags, 'anchor'), ['txbt4', txidA], 'anchor stays the genesis');
+        assert.deepStrictEqual(tagVal(ev.tags, 'r'), [`${base}/forge/casey/agent/blocktrails.json`]);
+      }
+    });
+
+    it('a repo without a trail file is unchanged: 404 trail doc, no anchor tags, the enable pitch', async () => {
+      assert.strictEqual((await fetch(`${base}/forge/casey/demo/blocktrails.json`)).status, 404);
+      const j = await (await fetch(`${base}/forge/api/repos/casey/demo/nostr`)).json();
+      assert.ok(!j.event.tags.some((t) => ['chain', 'txo', 'commit', 'anchor', 'r'].includes(t[0])));
+      const pitch = await (await fetch(`${base}/forge/casey/demo/marks`)).text();
+      assert.ok(pitch.includes('Enable anchoring'));
+      assert.ok(pitch.includes('Or keep the key in the repo'), 'the pitch offers the repo-held way');
+    });
   });
 
   describe('web-edit endpoint (single-file commit over HTTP, tier 3.7)', () => {

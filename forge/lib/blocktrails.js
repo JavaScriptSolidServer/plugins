@@ -92,6 +92,15 @@ export function markStateHash(state) {
   return crypto.createHash('sha256').update(JSON.stringify(state), 'utf8').digest('hex');
 }
 
+/**
+ * The git-mark CLI's state hash (npm gitmark, profile 'gitmark'): sha256 of the
+ * commit hash as text. Same TapTweak chain as the forge's own marks, different
+ * state bytes — so a trail pushed from a repo-held key re-derives with this.
+ */
+export function gitmarkStateHash(commit) {
+  return crypto.createHash('sha256').update(String(commit), 'utf8').digest('hex');
+}
+
 /** BIP-341 TapTweak scalar over (x_only(P), stateHash), in [1, n-1]. */
 function tapTweakScalar(xOnly, stateHashBytes) {
   const t = BigInt(`0x${sha256Of(TAPTWEAK_TAG, TAPTWEAK_TAG, xOnly, stateHashBytes).toString('hex')}`) % SECP_N;
