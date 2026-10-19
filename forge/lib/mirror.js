@@ -85,6 +85,10 @@ export function readState(ev) {
   const txo = tagValue(ev, 'txo');
   const commit = tagValue(ev, 'commit');
   const mark = chain && txo && SHA40.test(String(commit || '').toLowerCase()) ? { chain, txo, commit: commit.toLowerCase() } : null;
+  // A state that tries to carry a mark and gets it wrong is not "a state with no
+  // mark": reading it that way would let a garbled commit tag switch the trail
+  // check off. Treat it as no state at all, so nothing moves.
+  if (!mark && (chain !== null || txo !== null || commit !== null)) return null;
   return { d, head, refs, mark, createdAt: ev.created_at, id: ev.id };
 }
 
@@ -125,17 +129,34 @@ export function trailLists(raw, commit) {
 }
 
 /**
+ * Whether a gitmark trail document belongs to this agent: its pubkeyBase
+ * (02/03 + x, or a bare x) carries the agent's x-only key. Without this a trail
+ * copied from any other repository, listing the marked commit, passes trailLists.
+ */
+export function trailBelongsTo(raw, pubkey) {
+  let doc;
+  try { doc = JSON.parse(raw); } catch { return false; }
+  const base = doc && typeof doc.pubkeyBase === 'string' ? doc.pubkeyBase.toLowerCase() : '';
+  const x = /^0[23][0-9a-f]{64}$/.test(base) ? base.slice(2) : (HEX64.test(base) ? base : '');
+  return x !== '' && x === String(pubkey).toLowerCase();
+}
+
+/**
  * The verdict for one branch after the fetch.
  * @param {object} o
  * @param {boolean} o.fetched - the commit is in the mirror after the fetch
  * @param {object|null} o.mark - the state's mark, if any
  * @param {string|null} o.trail - the trail file at the commit, or null when absent
+ * @param {string} [o.pubkey] - the followed agent's key; the trail must carry it
+ * @param {boolean} [o.reachable=true] - the marked commit is the moved-to commit or in its history
  * @returns {{move: boolean, verdict: string}}
  */
-export function branchVerdict({ fetched, mark, trail }) {
+export function branchVerdict({ fetched, mark, trail, pubkey, reachable = true }) {
   if (!fetched) return { move: false, verdict: 'the remote does not have the commit the state names' };
   if (!mark) return { move: true, verdict: 'fetched; the state carries no mark' };
   if (trail === null) return { move: false, verdict: 'the state carries a mark but the commit has no trail file' };
   if (!trailLists(trail, mark.commit)) return { move: false, verdict: `the trail at the commit does not list the marked commit ${mark.commit.slice(0, 8)}` };
-  return { move: true, verdict: `fetched; the trail lists mark ${mark.commit.slice(0, 8)} on ${mark.chain}` };
+  if (!trailBelongsTo(trail, pubkey)) return { move: false, verdict: "the trail at the commit is not the followed agent's (its pubkeyBase differs)" };
+  if (!reachable) return { move: false, verdict: `the marked commit ${mark.commit.slice(0, 8)} is not in the history of the commit the state names` };
+  return { move: true, verdict: `fetched; the agent's committed trail lists mark ${mark.commit.slice(0, 8)} on ${mark.chain} (the chain itself is not checked here)` };
 }

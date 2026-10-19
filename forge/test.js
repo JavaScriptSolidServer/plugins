@@ -2902,7 +2902,7 @@ describe('forge web-edit openEdit demo (anonymous edits)', () => {
 // pushes new ones, a local upstream repo as the clone URL, and states signed
 // by an agent key the forge is configured to follow.
 import {
-  parseMirrorConfig, verifyEvent, readState, readClones, planMirror, branchVerdict, trailLists, MAX_FOLLOW,
+  parseMirrorConfig, verifyEvent, readState, readClones, planMirror, branchVerdict, trailLists, trailBelongsTo, MAX_FOLLOW,
 } from './lib/mirror.js';
 
 function signNostr(sk, { kind, tags, content = '', created_at }) {
@@ -2961,8 +2961,12 @@ describe('forge mirror library (pure)', () => {
     assert.deepStrictEqual(st.refs, { 'refs/heads/main': sha1 });
     assert.strictEqual(st.head, 'refs/heads/main');
     assert.deepStrictEqual(st.mark, { chain: 'txbt4', txo: 'txo:txbt4:' + 'c'.repeat(64) + ':0', commit: sha1 });
-    const noMark = readState(signNostr(sk, { kind: 30618, tags: [['d', 'x'], ['chain', 'txbt4']], created_at: 1 }));
+    const noMark = readState(signNostr(sk, { kind: 30618, tags: [['d', 'x']], created_at: 1 }));
     assert.strictEqual(noMark.mark, null);
+    // a partial or garbled mark must not read as "no mark" (that would switch the trail check off)
+    for (const extra of [[['chain', 'txbt4']], [['commit', 'zz']], [['chain', 'txbt4'], ['txo', 'txo:x'], ['commit', 'nope']]]) {
+      assert.strictEqual(readState(signNostr(sk, { kind: 30618, tags: [['d', 'x'], ...extra], created_at: 1 })), null);
+    }
     assert.strictEqual(readState(signNostr(sk, { kind: 30618, tags: [], created_at: 1 })), null, 'no d, no state');
   });
 
@@ -2984,14 +2988,28 @@ describe('forge mirror library (pure)', () => {
   });
 
   it('branchVerdict: unfetched never moves; no mark moves; a mark needs the trail at the commit to list it', () => {
-    const trail = JSON.stringify({ '@type': 'Blocktrail', profile: 'gitmark', states: [sha1] });
+    const key = 'ab'.repeat(32);
+    const trail = JSON.stringify({ '@type': 'Blocktrail', profile: 'gitmark', pubkeyBase: `02${key}`, states: [sha1] });
     assert.strictEqual(branchVerdict({ fetched: false, mark: null, trail: null }).move, false);
     assert.strictEqual(branchVerdict({ fetched: true, mark: null, trail: null }).move, true);
     const mark = { chain: 'txbt4', txo: 'txo:…', commit: sha1 };
-    assert.strictEqual(branchVerdict({ fetched: true, mark, trail: null }).move, false);
-    assert.strictEqual(branchVerdict({ fetched: true, mark, trail }).move, true);
-    assert.strictEqual(branchVerdict({ fetched: true, mark: { ...mark, commit: sha2 }, trail }).move, false);
+    assert.strictEqual(branchVerdict({ fetched: true, mark, trail: null, pubkey: key }).move, false);
+    assert.strictEqual(branchVerdict({ fetched: true, mark, trail, pubkey: key }).move, true);
+    assert.strictEqual(branchVerdict({ fetched: true, mark: { ...mark, commit: sha2 }, trail, pubkey: key }).move, false);
     assert.strictEqual(trailLists('not json', sha1), false);
+  });
+
+  it('branchVerdict: the trail must carry the followed key, and the marked commit must be reachable', () => {
+    const key = 'ab'.repeat(32);
+    const trail = JSON.stringify({ '@type': 'Blocktrail', profile: 'gitmark', pubkeyBase: `02${key}`, states: [sha1] });
+    const mark = { chain: 'txbt4', txo: 'txo:…', commit: sha1 };
+    assert.strictEqual(branchVerdict({ fetched: true, mark, trail, pubkey: key }).move, true);
+    // a trail copied from another agent's repository lists the commit but is not this agent's
+    assert.strictEqual(branchVerdict({ fetched: true, mark, trail, pubkey: 'cd'.repeat(32) }).move, false);
+    assert.strictEqual(branchVerdict({ fetched: true, mark, trail, pubkey: key, reachable: false }).move, false);
+    assert.strictEqual(trailBelongsTo(JSON.stringify({ pubkeyBase: key }), key), true, 'bare x is accepted');
+    assert.strictEqual(trailBelongsTo(JSON.stringify({ profile: 'gitmark' }), key), false, 'no key, no match');
+    assert.strictEqual(trailBelongsTo('not json', key), false);
   });
 });
 
@@ -3123,7 +3141,7 @@ describe('forge mirrors a repo on its agent\'s kind-30618 state (in-process rela
     push(stateEvent(sk, { 'refs/heads/main': 'f'.repeat(40) }, null, { created_at: 1760000000 }));
     const rec = await until(async () => { const r = await record(); return r.events === before + 1 ? r : null; }, 'the old state to be counted');
     assert.strictEqual(rec.lastSeen.action, 'skip');
-    assert.match(rec.lastSeen.reason, /not newer/);
+    assert.match(rec.lastSeen.reason, /older than a state already seen/);
     await new Promise((r) => { setTimeout(r, 200); });
     assert.strictEqual((await record()).events, before + 1, 'the other key\'s state was never counted');
   });

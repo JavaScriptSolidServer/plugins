@@ -1608,6 +1608,16 @@ export async function activate(api) {
     const rec = mirrorRecord(owner, name) || { pubkey: owner, name, clone: entry.clone, events: 0 };
     const dir = repoDirOf(owner, name);
     const local = repoExists(owner, name) ? await localHeads(dir) : {};
+    // A validly signed but older state is a relay replaying history; moving branches
+    // back to it would be a rollback. A state equal to the newest seen is kept: it is
+    // the catch-up resend of one the rate limit held back.
+    if (state && state.createdAt < (rec.newestSeenAt || 0)) {
+      rec.events += 1;
+      rec.lastSeen = { id: ev.id, created_at: ev.created_at, at: Date.now(), action: 'skip', reason: 'older than a state already seen (replay)' };
+      saveMirrorRecord(owner, name, rec);
+      return rec;
+    }
+    if (state) rec.newestSeenAt = state.createdAt;
     const plan = planMirror({ state, local, lastSeenAt: rec.lastEvent?.created_at, lastFetchAt: rec.lastFetchAt, now: Date.now(), minIntervalMs: mirror.minIntervalMs });
     rec.events += 1;
     rec.lastSeen = { id: ev.id, created_at: ev.created_at, at: Date.now(), action: plan.action, reason: plan.reason };
@@ -1619,6 +1629,10 @@ export async function activate(api) {
     }
     if (!repoExists(owner, name)) await materialize(owner, name, `mirror of ${didShort(owner)}`);
     rec.lastFetchAt = Date.now();
+    // The fetch lands every branch in refs/mirror/* before any verdict. Keep them out of
+    // what upload-pack advertises, or a branch held back here is still fetchable by name.
+    const hidden = (await gitText(dir, ['config', '--get-all', 'uploadpack.hideRefs']).catch(() => '')).split('\n');
+    if (!hidden.includes('refs/mirror/')) await execFileP('git', ['-C', dir, 'config', '--add', 'uploadpack.hideRefs', 'refs/mirror/'], { env: gitEnv });
     try {
       await execFileP('git', ['-C', dir, 'fetch', '--quiet', '--no-tags', clone, '+refs/heads/*:refs/mirror/*'],
         { env: { ...gitEnv, GIT_TERMINAL_PROMPT: '0' }, timeout: MIRROR_FETCH_TIMEOUT_MS, maxBuffer: MAX_EXEC_BUFFER });
@@ -1635,7 +1649,11 @@ export async function activate(api) {
       try { await execFileP('git', ['-C', dir, 'cat-file', '-e', `${sha}^{commit}`], { env: gitEnv }); fetched = true; } catch { fetched = false; }
       let trail = null;
       if (fetched && state.mark) { try { trail = await gitText(dir, ['show', `${sha}:${TRAIL_FILE}`]); } catch { trail = null; } }
-      const v = branchVerdict({ fetched, mark: state.mark, trail });
+      let reachable = true;
+      if (fetched && state.mark) {
+        reachable = await execFileP('git', ['-C', dir, 'merge-base', '--is-ancestor', state.mark.commit, sha], { env: gitEnv }).then(() => true, () => false);
+      }
+      const v = branchVerdict({ fetched, mark: state.mark, trail, pubkey: owner, reachable });
       if (v.move) { await execFileP('git', ['-C', dir, 'update-ref', ref, sha], { env: gitEnv }); moved += 1; }
       branches[ref] = { sha, moved: v.move, verdict: v.verdict };
     }
