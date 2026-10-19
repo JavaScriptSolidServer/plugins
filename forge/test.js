@@ -3132,4 +3132,28 @@ describe('forge mirrors a repo on its agent\'s kind-30618 state (in-process rela
     const r = await fetch(`${base}/forge/api/repos/nobody/none/mirror`);
     assert.strictEqual(r.status, 404);
   });
+
+  it('a followed repo that could not be fetched yet still serves its record, so the reason is visible', async () => {
+    // a second followed repo with no clone URL: its key never announced a clone
+    const sk2 = Buffer.from(schnorr.utils.randomPrivateKey()).toString('hex');
+    const pub2 = Buffer.from(schnorr.getPublicKey(sk2)).toString('hex');
+    const jss2 = await startJss({
+      plugins: [{ id: 'forge', module: module_, prefix: '/forge', config: {
+        mirror: { relays: [relayUrl], follow: [{ pubkey: pub2, name: 'noclone' }], minIntervalMs: 0 },
+      } }],
+    });
+    try {
+      push(signNostr(sk2, { kind: 30618, tags: [['d', 'noclone'], ['refs/heads/main', 'a'.repeat(40)]], created_at: ++t }));
+      const rec = await until(async () => {
+        const r = await fetch(`${jss2.base}/forge/api/repos/${pub2}/noclone/mirror`);
+        return r.status === 200 ? r.json() : null;
+      }, 'the record of the unfetchable mirror');
+      assert.strictEqual(rec.lastSeen.action, 'skip');
+      assert.match(rec.lastSeen.reason, /no clone URL/);
+      const page = await fetch(`${jss2.base}/forge/api/repos/${pub2}/noclone`);
+      assert.strictEqual(page.status, 404, 'no bare repo exists, so the repo itself is still 404');
+    } finally {
+      await jss2.close();
+    }
+  });
 });

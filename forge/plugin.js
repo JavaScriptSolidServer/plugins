@@ -4877,6 +4877,10 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
 
     const name = rest[1];
     if (!REPO_NAME.test(name) || name.includes('..') || name.endsWith('.git')) return apiErr(reply, 404, 'not found');
+    // A followed repo has a mirror record before it has a bare repo (nothing fetched
+    // yet: no clone URL, a failing remote), and that record is the diagnosis the
+    // operator needs, so it is served ahead of the repo-exists guard.
+    if (rest.length === 3 && rest[2] === 'mirror' && isRead) return apiMirror(reply, owner, name);
     if (!repoExists(owner, name)) return apiErr(reply, 404, 'not found');
     if (rest.length === 2) {
       if (request.method === 'PATCH') return apiRepoPatch(request, reply, owner, name);
@@ -4905,7 +4909,6 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
           if (request.method !== 'POST') return apiErr(reply, 405, 'method not allowed');
           return await apiRepoPreview(request, reply, owner, name);
         case 'nostr': return tail.length === 0 && isRead ? await apiNostr(reply, owner, name) : apiErr(reply, 404, 'not found');
-        case 'mirror': return tail.length === 0 && isRead ? await apiMirror(reply, owner, name) : apiErr(reply, 404, 'not found');
         case 'search': return tail.length === 0 ? await apiSearch(reply, owner, name, request.query) : apiErr(reply, 404, 'not found');
         case 'releases': return tail.length === 0 ? await apiReleases(reply, owner, name) : apiErr(reply, 404, 'not found');
         case 'fork':
