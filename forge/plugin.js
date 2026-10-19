@@ -1686,14 +1686,16 @@ export async function activate(api) {
     try { ws = new WS(relay); } catch (err) { return mirrorRetry(relay, attempt, err.message); }
     mirrorSockets.push(ws);
     const authors = [...new Set(mirror.follow.map((f) => f.pubkey))];
-    ws.on('open', () => {
-      attempt = 0;
-      ws.send(JSON.stringify(['REQ', 'forge-mirror', { kinds: [KIND_ANNOUNCE, KIND_STATE], authors }]));
-    });
+    ws.on('open', () => ws.send(JSON.stringify(['REQ', 'forge-mirror', { kinds: [KIND_ANNOUNCE, KIND_STATE], authors }])));
     ws.on('message', (data) => {
       let msg;
       try { msg = JSON.parse(data.toString()); } catch { return; }
-      if (Array.isArray(msg) && msg[0] === 'EVENT' && msg[1] === 'forge-mirror') mirrorOnEvent(msg[2]);
+      if (!Array.isArray(msg)) return;
+      // the relay answered the REQ: this connection counts, so the backoff starts over next time.
+      // Resetting on open would let a relay that accepts and drops be reconnected to every second.
+      if (msg[0] === 'EOSE' || msg[0] === 'EVENT') attempt = 0;
+      if (msg[0] === 'EVENT' && msg[1] === 'forge-mirror') mirrorOnEvent(msg[2]);
+      else if (msg[0] === 'CLOSED' || msg[0] === 'NOTICE') api.log.warn(`forge: mirror relay ${relay}: ${msg[0]} ${String(msg[msg.length - 1] || '')}`);
     });
     ws.on('error', () => { /* close follows */ });
     ws.on('close', () => {
