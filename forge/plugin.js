@@ -42,6 +42,7 @@
 //                 GET  <prefix>/<owner>/<name>/blocktrails.json  (CORS-readable trail doc)
 //   nostr         POST api/repos/<o>/<n>/announce    (owner: publish NIP-34 30617 + 30618 to relays)
 //                 GET  api/repos/<o>/<n>/nostr        (the signed 30617 + 30618 that WOULD be published)
+//   mirror        GET  api/repos/<o>/<n>/mirror       (a repo pulled on its agent's 30618: last state, last fetch, verdicts)
 //   fork          POST <prefix>/api/repos/<o>/<n>/fork
 //   web edit      POST api/repos/<o>/<n>/edit  {path,content,message?,branch?}
 //                 (owner-signed by default; config.openEdit => anon DEMO; CORS+preflight)
@@ -143,6 +144,9 @@ import {
   ICON_PR_OPEN, ICON_PR_TAB, ICON_PR_MERGED, ICON_PR_CLOSED,
 } from './lib/helpers.js';
 import { renderMarkdown } from './lib/markdown.js';
+import {
+  parseMirrorConfig, followedEntry, verifyEvent, readState, readClones, planMirror, branchVerdict, KIND_ANNOUNCE, KIND_STATE,
+} from './lib/mirror.js';
 
 const execFileP = promisify(execFile);
 
@@ -1557,6 +1561,171 @@ export async function activate(api) {
     if (!relays.length) return [];
     const WS = await getWebSocket();
     return Promise.all(relays.map((relay) => publishToRelay(WS, event, relay, timeoutMs)));
+  }
+
+  // ------------------------------------------ mirror on 30618 (opt-in)
+  // The other direction. gitmark's `git mark announce` publishes a kind-30618
+  // repository state after every mark, signed by the agent's key. A forge
+  // told to follow (pubkey, name) pairs subscribes to those states on the
+  // configured relays and pulls when one changes: one small event per
+  // announce instead of polling, one git fetch per real change. A branch
+  // moves only to a commit the fetch brought and, when the state carries a
+  // mark, whose trail file lists the marked commit. The stance holds: the
+  // plugin talks to relays and git remotes, never to a chain API; the mark
+  // itself is checked in the browser. Off unless config.mirror names relays
+  // and repos. pluginDir/mirror/<pubkey>/<name>.json is the record.
+  const mirror = parseMirrorConfig(api.config.mirror);
+  const mirrorDir = path.join(api.storage.pluginDir(), 'mirror');
+  const mirrorSockets = [];
+  const mirrorTimers = new Set();
+  let mirrorClosed = false;
+  const mirrorQueues = new Map(); // `${pubkey}/${name}` -> promise chain, one state at a time per repo
+  const MIRROR_FETCH_TIMEOUT_MS = 60_000;
+
+  const mirrorRecordFile = (owner, name) => path.join(mirrorDir, owner, `${name}.json`);
+  function mirrorRecord(owner, name) {
+    try { return JSON.parse(fs.readFileSync(mirrorRecordFile(owner, name), 'utf8')); } catch { return null; }
+  }
+  function saveMirrorRecord(owner, name, rec) {
+    fs.mkdirSync(path.join(mirrorDir, owner), { recursive: true });
+    fs.writeFileSync(mirrorRecordFile(owner, name), JSON.stringify(rec, null, 2));
+  }
+
+  async function localHeads(dir) {
+    const out = {};
+    try {
+      const txt = await gitText(dir, ['for-each-ref', '--format=%(refname)%00%(objectname)', 'refs/heads']);
+      for (const l of txt.split('\n').filter(Boolean)) { const [r, sha] = l.split('\0'); out[r] = sha; }
+    } catch { /* no repo yet */ }
+    return out;
+  }
+
+  /** One 30618 for one followed repo: plan, fetch into refs/mirror, verify each branch, move what passes. */
+  async function mirrorApply(entry, ev) {
+    const owner = entry.pubkey;
+    const { name } = entry;
+    const state = readState(ev);
+    const rec = mirrorRecord(owner, name) || { pubkey: owner, name, clone: entry.clone, events: 0 };
+    const dir = repoDirOf(owner, name);
+    const local = repoExists(owner, name) ? await localHeads(dir) : {};
+    const plan = planMirror({ state, local, lastSeenAt: rec.lastEvent?.created_at, lastFetchAt: rec.lastFetchAt, now: Date.now(), minIntervalMs: mirror.minIntervalMs });
+    rec.events += 1;
+    rec.lastSeen = { id: ev.id, created_at: ev.created_at, at: Date.now(), action: plan.action, reason: plan.reason };
+    if (plan.action === 'skip') { saveMirrorRecord(owner, name, rec); return rec; }
+    const clone = entry.clone || rec.clone;
+    if (!clone) {
+      rec.lastSeen.action = 'skip'; rec.lastSeen.reason = 'no clone URL: none configured and no 30617 from this key seen yet';
+      saveMirrorRecord(owner, name, rec); return rec;
+    }
+    if (!repoExists(owner, name)) await materialize(owner, name, `mirror of ${didShort(owner)}`);
+    rec.lastFetchAt = Date.now();
+    try {
+      await execFileP('git', ['-C', dir, 'fetch', '--quiet', '--no-tags', clone, '+refs/heads/*:refs/mirror/*'],
+        { env: { ...gitEnv, GIT_TERMINAL_PROMPT: '0' }, timeout: MIRROR_FETCH_TIMEOUT_MS, maxBuffer: MAX_EXEC_BUFFER });
+    } catch (err) {
+      rec.lastSeen.action = 'fetch-failed'; rec.lastSeen.reason = err.message.split('\n')[0];
+      saveMirrorRecord(owner, name, rec);
+      api.log.warn(`forge: mirror ${didShort(owner)}/${name}: fetch from ${clone} failed: ${rec.lastSeen.reason}`);
+      return rec;
+    }
+    const branches = {};
+    let moved = 0;
+    for (const [ref, sha] of plan.changed) {
+      let fetched = false;
+      try { await execFileP('git', ['-C', dir, 'cat-file', '-e', `${sha}^{commit}`], { env: gitEnv }); fetched = true; } catch { fetched = false; }
+      let trail = null;
+      if (fetched && state.mark) { try { trail = await gitText(dir, ['show', `${sha}:${TRAIL_FILE}`]); } catch { trail = null; } }
+      const v = branchVerdict({ fetched, mark: state.mark, trail });
+      if (v.move) { await execFileP('git', ['-C', dir, 'update-ref', ref, sha], { env: gitEnv }); moved += 1; }
+      branches[ref] = { sha, moved: v.move, verdict: v.verdict };
+    }
+    if (moved && state.head && branches[state.head]?.moved) {
+      await execFileP('git', ['-C', dir, 'symbolic-ref', 'HEAD', state.head], { env: gitEnv }).catch(() => {});
+    }
+    rec.lastEvent = { id: ev.id, created_at: ev.created_at };
+    rec.lastFetch = { at: rec.lastFetchAt, clone, branches, moved, mark: state.mark };
+    rec.lastSeen.action = moved ? 'moved' : 'held'; rec.lastSeen.reason = moved ? `${moved} of ${plan.changed.length} moved` : 'nothing passed';
+    saveMirrorRecord(owner, name, rec);
+    repoTrailSeen.delete(`${owner}/${name}`);
+    api.log.info(`forge: mirror ${didShort(owner)}/${name}: ${rec.lastSeen.reason}${state.mark ? ` (mark ${state.mark.commit.slice(0, 8)} on ${state.mark.chain})` : ''}`);
+    return rec;
+  }
+
+  function mirrorEnqueue(entry, ev) {
+    const key = `${entry.pubkey}/${entry.name}`;
+    const prev = mirrorQueues.get(key) || Promise.resolve();
+    const next = prev.then(() => mirrorApply(entry, ev)).catch((err) => api.log.warn(`forge: mirror ${key}: ${err.message}`));
+    mirrorQueues.set(key, next);
+    return next;
+  }
+
+  function mirrorOnEvent(ev) {
+    if (!verifyEvent(ev)) return;
+    if (ev.kind !== KIND_ANNOUNCE && ev.kind !== KIND_STATE) return;
+    const d = (ev.tags.find((t) => t[0] === 'd') || [])[1];
+    const entry = followedEntry(mirror.follow, ev.pubkey, d);
+    if (!entry) return;
+    if (ev.kind === KIND_ANNOUNCE) {
+      // the newest announcement from the key supplies the clone URL when none is configured
+      const clones = readClones(ev);
+      if (!clones.length) return;
+      const rec = mirrorRecord(entry.pubkey, entry.name) || { pubkey: entry.pubkey, name: entry.name, events: 0 };
+      if (rec.announceAt && rec.announceAt >= ev.created_at) return;
+      rec.clone = clones[0]; rec.announceAt = ev.created_at; rec.clones = clones;
+      saveMirrorRecord(entry.pubkey, entry.name, rec);
+      return;
+    }
+    mirrorEnqueue(entry, ev);
+  }
+
+  /** One socket per relay, one REQ for both kinds from the followed keys; reconnect with backoff. */
+  async function mirrorConnect(relay, attempt = 0) {
+    if (mirrorClosed) return;
+    const WS = await getWebSocket();
+    let ws;
+    try { ws = new WS(relay); } catch (err) { return mirrorRetry(relay, attempt, err.message); }
+    mirrorSockets.push(ws);
+    const authors = [...new Set(mirror.follow.map((f) => f.pubkey))];
+    ws.on('open', () => {
+      attempt = 0;
+      ws.send(JSON.stringify(['REQ', 'forge-mirror', { kinds: [KIND_ANNOUNCE, KIND_STATE], authors }]));
+    });
+    ws.on('message', (data) => {
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
+      if (Array.isArray(msg) && msg[0] === 'EVENT' && msg[1] === 'forge-mirror') mirrorOnEvent(msg[2]);
+    });
+    ws.on('error', () => { /* close follows */ });
+    ws.on('close', () => {
+      const i = mirrorSockets.indexOf(ws);
+      if (i >= 0) mirrorSockets.splice(i, 1);
+      mirrorRetry(relay, attempt, 'closed');
+    });
+  }
+  function mirrorRetry(relay, attempt, why) {
+    if (mirrorClosed) return;
+    const delay = Math.min(60_000, 1000 * 2 ** Math.min(attempt, 6));
+    const t = setTimeout(() => { mirrorTimers.delete(t); mirrorConnect(relay, attempt + 1); }, delay);
+    mirrorTimers.add(t);
+    if (attempt === 0) api.log.warn(`forge: mirror relay ${relay} ${why}; reconnecting`);
+  }
+  function mirrorStop() {
+    mirrorClosed = true;
+    for (const t of mirrorTimers) clearTimeout(t);
+    mirrorTimers.clear();
+    for (const ws of mirrorSockets.splice(0)) { try { ws.close(); } catch { /* already closed */ } }
+  }
+  if (mirror) {
+    fs.mkdirSync(mirrorDir, { recursive: true });
+    for (const relay of mirror.relays) mirrorConnect(relay);
+    api.log.info(`forge: mirroring ${mirror.follow.length} repo${mirror.follow.length === 1 ? '' : 's'} on kind-30618 state from ${mirror.relays.length} relay${mirror.relays.length === 1 ? '' : 's'}`);
+  }
+
+  /** GET api/repos/<o>/<n>/mirror: the mirror record, or 404 when the repo is not a mirror. */
+  async function apiMirror(reply, owner, name) {
+    const rec = mirrorRecord(owner, name);
+    if (!rec) return apiErr(reply, 404, 'not a mirror');
+    return sendJson(reply, 200, rec);
   }
 
   /**
@@ -4736,6 +4905,7 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
           if (request.method !== 'POST') return apiErr(reply, 405, 'method not allowed');
           return await apiRepoPreview(request, reply, owner, name);
         case 'nostr': return tail.length === 0 && isRead ? await apiNostr(reply, owner, name) : apiErr(reply, 404, 'not found');
+        case 'mirror': return tail.length === 0 && isRead ? await apiMirror(reply, owner, name) : apiErr(reply, 404, 'not found');
         case 'search': return tail.length === 0 ? await apiSearch(reply, owner, name, request.query) : apiErr(reply, 404, 'not found');
         case 'releases': return tail.length === 0 ? await apiReleases(reply, owner, name) : apiErr(reply, 404, 'not found');
         case 'fork':
@@ -4932,5 +5102,5 @@ ${issuesScript({ api: `${prefix}/api/repos/${owner}/${name}`, owner, name, base,
     + `anchoring on ${chain} — derive-and-record only, no chain I/O)`,
   );
 
-  return { deactivate() { /* nothing persistent to tear down */ } };
+  return { deactivate() { mirrorStop(); } };
 }

@@ -2895,3 +2895,241 @@ describe('forge web-edit openEdit demo (anonymous edits)', () => {
     assert.strictEqual(res.status, 400);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Mirror on kind-30618 (issue #12). The pure library first, then a live run:
+// an in-process relay that answers the forge's REQ with stored events and
+// pushes new ones, a local upstream repo as the clone URL, and states signed
+// by an agent key the forge is configured to follow.
+import {
+  parseMirrorConfig, verifyEvent, readState, readClones, planMirror, branchVerdict, trailLists, MAX_FOLLOW,
+} from './lib/mirror.js';
+
+function signNostr(sk, { kind, tags, content = '', created_at }) {
+  const pubkey = Buffer.from(schnorr.getPublicKey(sk)).toString('hex');
+  const ev = { pubkey, created_at, kind, tags, content };
+  ev.id = crypto.createHash('sha256').update(JSON.stringify([0, pubkey, created_at, kind, tags, content]), 'utf8').digest('hex');
+  ev.sig = Buffer.from(schnorr.sign(ev.id, sk)).toString('hex');
+  return ev;
+}
+
+describe('forge mirror library (pure)', () => {
+  const sk = Buffer.from(schnorr.utils.randomPrivateKey()).toString('hex');
+  const pub = Buffer.from(schnorr.getPublicKey(sk)).toString('hex');
+  const sha1 = 'a'.repeat(40);
+  const sha2 = 'b'.repeat(40);
+
+  it('config: off unless relays and well-formed follow entries are given; capped; keyed by pubkey+name', () => {
+    assert.strictEqual(parseMirrorConfig(undefined), null);
+    assert.strictEqual(parseMirrorConfig({}), null);
+    assert.strictEqual(parseMirrorConfig({ relays: ['wss://r.example'], follow: [] }), null);
+    assert.strictEqual(parseMirrorConfig({ relays: [], follow: [{ pubkey: pub, name: 'x' }] }), null, 'no relays, no mirror');
+    const m = parseMirrorConfig({
+      relays: ['wss://r.example', 'http://not-a-relay', 'ws://127.0.0.1:1'],
+      follow: [
+        { pubkey: pub.toUpperCase(), name: 'x', clone: 'https://example.org/x.git' },
+        { pubkey: pub, name: 'x' },                       // duplicate
+        { pubkey: 'nothex', name: 'y' },                  // bad key
+        { pubkey: pub, name: '../etc' },                  // bad name
+        { pubkey: pub, name: 'z', clone: 'ssh://nope' },  // clone scheme not allowed -> null clone, entry kept
+      ],
+    });
+    assert.deepStrictEqual(m.relays, ['wss://r.example', 'ws://127.0.0.1:1']);
+    assert.deepStrictEqual(m.follow, [{ pubkey: pub, name: 'x', clone: 'https://example.org/x.git' }, { pubkey: pub, name: 'z', clone: null }]);
+    assert.strictEqual(m.minIntervalMs, 30_000);
+    const many = parseMirrorConfig({ relays: ['wss://r'], follow: Array.from({ length: 80 }, (_, i) => ({ pubkey: pub, name: `r${i}` })) });
+    assert.strictEqual(many.follow.length, MAX_FOLLOW);
+  });
+
+  it('verifyEvent: id and schnorr signature must check out; a tampered tag fails', () => {
+    const ev = signNostr(sk, { kind: 30618, tags: [['d', 'x'], ['refs/heads/main', sha1]], created_at: 1760000000 });
+    assert.strictEqual(verifyEvent(ev), true);
+    const tampered = { ...ev, tags: [['d', 'x'], ['refs/heads/main', sha2]] };
+    assert.strictEqual(verifyEvent(tampered), false);
+    assert.strictEqual(verifyEvent({ ...ev, sig: 'f'.repeat(128) }), false);
+    assert.strictEqual(verifyEvent(null), false);
+  });
+
+  it('readState: d, HEAD, well-formed branch refs, and the mark only when all three tags are present', () => {
+    const ev = signNostr(sk, {
+      kind: 30618,
+      tags: [['d', 'x'], ['HEAD', 'ref: refs/heads/main'], ['refs/heads/main', sha1], ['refs/heads/dev', 'short'], ['refs/tags/v1', sha2],
+        ['chain', 'txbt4'], ['txo', 'txo:txbt4:' + 'c'.repeat(64) + ':0'], ['commit', sha1]],
+      created_at: 1760000000,
+    });
+    const st = readState(ev);
+    assert.deepStrictEqual(st.refs, { 'refs/heads/main': sha1 });
+    assert.strictEqual(st.head, 'refs/heads/main');
+    assert.deepStrictEqual(st.mark, { chain: 'txbt4', txo: 'txo:txbt4:' + 'c'.repeat(64) + ':0', commit: sha1 });
+    const noMark = readState(signNostr(sk, { kind: 30618, tags: [['d', 'x'], ['chain', 'txbt4']], created_at: 1 }));
+    assert.strictEqual(noMark.mark, null);
+    assert.strictEqual(readState(signNostr(sk, { kind: 30618, tags: [], created_at: 1 })), null, 'no d, no state');
+  });
+
+  it('readClones: http(s) clone URLs from a 30617, in order, file: never', () => {
+    const ev = signNostr(sk, { kind: 30617, tags: [['d', 'x'], ['clone', 'https://a.example/x.git', 'git@a.example:x.git'], ['clone', 'file:///tmp/x'], ['clone', 'http://b.example/x.git']], created_at: 1 });
+    assert.deepStrictEqual(readClones(ev), ['https://a.example/x.git', 'http://b.example/x.git']);
+  });
+
+  it('planMirror: skips older states, in-sync states and rate-limited fetches; otherwise names the moved branches', () => {
+    const state = { createdAt: 100, refs: { 'refs/heads/main': sha2, 'refs/heads/dev': sha1 } };
+    const base = { state, local: { 'refs/heads/main': sha1, 'refs/heads/dev': sha1 }, now: 1_000_000, minIntervalMs: 30_000 };
+    assert.strictEqual(planMirror({ ...base, lastSeenAt: 100 }).action, 'skip');
+    assert.strictEqual(planMirror({ ...base, local: state.refs }).reason, 'already at this state');
+    assert.match(planMirror({ ...base, lastFetchAt: 990_000 }).reason, /fetched 10 s ago; next in 20 s/);
+    const p = planMirror(base);
+    assert.strictEqual(p.action, 'fetch');
+    assert.deepStrictEqual(p.changed, [['refs/heads/main', sha2]]);
+    assert.strictEqual(planMirror({ ...base, state: { createdAt: 100, refs: {} } }).reason, 'the state names no branch');
+  });
+
+  it('branchVerdict: unfetched never moves; no mark moves; a mark needs the trail at the commit to list it', () => {
+    const trail = JSON.stringify({ '@type': 'Blocktrail', profile: 'gitmark', states: [sha1] });
+    assert.strictEqual(branchVerdict({ fetched: false, mark: null, trail: null }).move, false);
+    assert.strictEqual(branchVerdict({ fetched: true, mark: null, trail: null }).move, true);
+    const mark = { chain: 'txbt4', txo: 'txo:…', commit: sha1 };
+    assert.strictEqual(branchVerdict({ fetched: true, mark, trail: null }).move, false);
+    assert.strictEqual(branchVerdict({ fetched: true, mark, trail }).move, true);
+    assert.strictEqual(branchVerdict({ fetched: true, mark: { ...mark, commit: sha2 }, trail }).move, false);
+    assert.strictEqual(trailLists('not json', sha1), false);
+  });
+});
+
+describe('forge mirrors a repo on its agent\'s kind-30618 state (in-process relay, local upstream)', () => {
+  const tmp3 = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-mirror-'));
+  const up = path.join(tmp3, 'up');
+  const sk = Buffer.from(schnorr.utils.randomPrivateKey()).toString('hex');
+  const pub = Buffer.from(schnorr.getPublicKey(sk)).toString('hex');
+  const other = Buffer.from(schnorr.utils.randomPrivateKey()).toString('hex');
+  let relay; let relayUrl; let jss; let base;
+  const stored = [];   // events the relay holds; served on REQ
+  const clients = new Set();
+  let reqs = 0;
+  let t = 1760000000;
+  const g = (args, opts = {}) => git(args, { ...opts, env: { HOME: tmp3, ...(opts.env ?? {}) } });
+  const head = async () => (await g(['rev-parse', 'HEAD'], { cwd: up })).stdout.trim();
+  const until = async (fn, what, ms = 8000) => {
+    const t0 = Date.now();
+    for (;;) {
+      const v = await fn();
+      if (v) return v;
+      if (Date.now() - t0 > ms) throw new Error(`timed out waiting for ${what}`);
+      await new Promise((r) => { setTimeout(r, 50); });
+    }
+  };
+  const record = async () => {
+    const r = await fetch(`${base}/forge/api/repos/${pub}/up/mirror`);
+    return r.status === 200 ? r.json() : null;
+  };
+  const mirrorHead = async () => {
+    const r = await g(['ls-remote', `${base}/forge/${pub}/up.git`, 'refs/heads/main']).catch(() => ({ stdout: '' }));
+    return r.stdout.trim().split('\t')[0] || null;
+  };
+  const stateEvent = (key, refs, mark, extra = {}) => signNostr(key, {
+    kind: 30618,
+    tags: [['d', 'up'], ['HEAD', 'ref: refs/heads/main'], ...Object.entries(refs), ...(mark ? [['chain', mark.chain], ['txo', mark.txo], ['commit', mark.commit]] : [])],
+    created_at: extra.created_at ?? ++t,
+  });
+  const push = (ev) => { stored.push(ev); for (const ws of clients) ws.send(JSON.stringify(['EVENT', 'forge-mirror', ev])); };
+
+  before(async () => {
+    fs.writeFileSync(path.join(tmp3, '.gitconfig'), '[user]\n\temail = agent@example.org\n\tname = Agent\n[init]\n\tdefaultBranch = main\n');
+    fs.mkdirSync(up);
+    fs.writeFileSync(path.join(up, 'README.md'), '# up\n');
+    await g(['init', '--quiet'], { cwd: up });
+    await g(['add', '-A'], { cwd: up });
+    await g(['commit', '--quiet', '-m', 'first'], { cwd: up });
+
+    const { WebSocketServer } = await import('ws');
+    relay = new WebSocketServer({ port: 0 });
+    await new Promise((r) => relay.on('listening', r));
+    relayUrl = `ws://127.0.0.1:${relay.address().port}`;
+    relay.on('connection', (ws) => {
+      clients.add(ws);
+      ws.on('close', () => clients.delete(ws));
+      ws.on('message', (data) => {
+        let msg;
+        try { msg = JSON.parse(data.toString()); } catch { return; }
+        if (Array.isArray(msg) && msg[0] === 'REQ') {
+          reqs += 1;
+          const [, sub, filter] = msg;
+          for (const ev of stored) {
+            if ((filter.kinds || []).includes(ev.kind) && (filter.authors || []).includes(ev.pubkey)) ws.send(JSON.stringify(['EVENT', sub, ev]));
+          }
+          ws.send(JSON.stringify(['EOSE', sub]));
+        }
+      });
+    });
+
+    // a state already on the relay before the forge boots: the catch-up path
+    push(stateEvent(sk, { 'refs/heads/main': await head() }, null));
+
+    jss = await startJss({
+      plugins: [{ id: 'forge', module: module_, prefix: '/forge', config: {
+        mirror: { relays: [relayUrl], follow: [{ pubkey: pub, name: 'up', clone: `file://${up}` }], minIntervalMs: 0 },
+      } }],
+    });
+    base = jss.base;
+  });
+
+  after(async () => {
+    if (jss) await jss.close();
+    await new Promise((r) => relay.close(r));
+    fs.rmSync(tmp3, { recursive: true, force: true });
+  });
+
+  it('subscribes with one REQ for both kinds from the followed key, and pulls the state it finds on the relay', async () => {
+    const c1 = await head();
+    const rec = await until(async () => { const r = await record(); return r && r.lastFetch ? r : null; }, 'the first fetch');
+    assert.ok(reqs >= 1, 'the forge sent a REQ');
+    assert.strictEqual(rec.lastFetch.moved, 1);
+    assert.strictEqual(rec.lastFetch.branches['refs/heads/main'].sha, c1);
+    assert.strictEqual(rec.lastSeen.action, 'moved');
+    assert.strictEqual(await mirrorHead(), c1, 'the mirror serves the upstream commit');
+    const page = await fetch(`${base}/forge/${pub}/up`);
+    assert.strictEqual(page.status, 200, 'the mirrored repo has a page like any pushed repo');
+  });
+
+  it('a state with a mark moves the branch only when the trail at the commit lists the marked commit', async () => {
+    const c1 = await head();
+    const txo = `txo:txbt4:${'c'.repeat(64)}:0`;
+    fs.writeFileSync(path.join(up, 'blocktrails.json'), JSON.stringify({
+      '@type': 'Blocktrail', profile: 'gitmark', chain: 'txbt4', pubkeyBase: `02${pub}`, states: [c1], txo: [txo],
+    }, null, 2));
+    await g(['add', '-A'], { cwd: up });
+    await g(['commit', '--quiet', '-m', 'trail: first mark'], { cwd: up });
+    const c2 = await head();
+    push(stateEvent(sk, { 'refs/heads/main': c2 }, { chain: 'txbt4', txo, commit: c1 }));
+    const rec = await until(async () => { const r = await record(); return r && r.lastFetch && r.lastFetch.branches['refs/heads/main'].sha === c2 ? r : null; }, 'the marked state');
+    assert.strictEqual(rec.lastFetch.moved, 1);
+    assert.match(rec.lastFetch.branches['refs/heads/main'].verdict, /trail lists mark/);
+    assert.strictEqual(await mirrorHead(), c2);
+
+    // a state whose mark the trail does not list: fetched, held, nothing moves
+    fs.writeFileSync(path.join(up, 'NOTES.md'), 'more\n');
+    await g(['add', '-A'], { cwd: up });
+    await g(['commit', '--quiet', '-m', 'unmarked work'], { cwd: up });
+    const c3 = await head();
+    push(stateEvent(sk, { 'refs/heads/main': c3 }, { chain: 'txbt4', txo, commit: 'd'.repeat(40) }));
+    const held = await until(async () => { const r = await record(); return r && r.lastSeen.action === 'held' ? r : null; }, 'the held state');
+    assert.strictEqual(held.lastFetch.moved, 0);
+    assert.match(held.lastFetch.branches['refs/heads/main'].verdict, /does not list the marked commit dddddddd/);
+    assert.strictEqual(await mirrorHead(), c2, 'the branch stayed where the last verified state put it');
+  });
+
+  it('ignores a state from another key with the same d, and one older than the last acted on', async () => {
+    const before = (await record()).events;
+    push(stateEvent(other, { 'refs/heads/main': 'e'.repeat(40) }, null));
+    push(stateEvent(sk, { 'refs/heads/main': 'f'.repeat(40) }, null, { created_at: 1760000000 }));
+    const rec = await until(async () => { const r = await record(); return r.events === before + 1 ? r : null; }, 'the old state to be counted');
+    assert.strictEqual(rec.lastSeen.action, 'skip');
+    assert.match(rec.lastSeen.reason, /not newer/);
+    await new Promise((r) => { setTimeout(r, 200); });
+    assert.strictEqual((await record()).events, before + 1, 'the other key\'s state was never counted');
+  });
+
+  it('a repo that is not a mirror has no mirror record', async () => {
+    const r = await fetch(`${base}/forge/api/repos/nobody/none/mirror`);
+    assert.strictEqual(r.status, 404);
+  });
+});

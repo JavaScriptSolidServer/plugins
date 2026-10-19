@@ -727,6 +727,59 @@ Every announce emits **both** events (30617 then 30618) to the relays.
   30618]`) — inspect the exact shapes, including the commit-precise refs,
   without a relay.
 
+### Mirroring on kind-30618 (opt-in)
+
+The other direction. [gitmark](https://git-mark.com/) publishes a
+kind-30618 repository state after every `git mark announce`, signed by the
+agent's own key: `d` = repo name, `HEAD`, one `refs/heads/<branch>` tag per
+branch with its commit, and the latest mark as `chain`, `txo`, `commit`.
+It is replaceable, so the newest from the key says where the repo is now.
+A forge told to follow that key pulls when the state changes: one small
+event per announce instead of polling, one `git fetch` per real change.
+
+```js
+mirror: {
+  relays: ['wss://relay.damus.io', 'wss://nos.lol'],
+  follow: [
+    { pubkey: '<64-hex agent key>', name: 'proj', clone: 'https://github.com/o/proj.git' },
+    { pubkey: '<64-hex agent key>', name: 'other' },   // clone URL from the key's newest 30617
+  ],
+  minIntervalMs: 30000,   // at most one fetch per repo per 30 s (default)
+}
+```
+
+**Unset ⇒ nothing happens**: no sockets, no fetches. With it, activation
+opens one `ws` socket per relay and sends one `REQ` for kinds 30617 and
+30618 from the followed pubkeys; the relay filters, so the forge receives
+only events about repos it mirrors. Sockets reconnect with backoff (1 s
+doubling to 60 s) and every connect re-sends the `REQ`, which is the
+catch-up: a replaceable event comes back as its newest version.
+
+A 30618 is acted on only when the signature verifies, `(pubkey, d)` is a
+followed repo (never name alone: anyone can publish a 30618 with any `d`),
+`created_at` is newer than the last state acted on, and a branch differs
+from the local one. Then one fetch from the clone URL into `refs/mirror/*`,
+and per changed branch a verdict:
+
+- the commit the state names was not fetched ⇒ the branch stays;
+- no mark on the state ⇒ the branch moves;
+- a mark ⇒ the branch moves only if `blocktrails.json` **at that commit**
+  lists the marked commit among its states. A state that claims a mark its
+  own trail does not carry moves nothing, and the reason is recorded.
+
+The mirror lives at `repos/<pubkey>/<name>.git` like a pushed repo, so it
+has the usual pages and the Anchors tab reads its repo-held trail. The
+record is `pluginDir/mirror/<pubkey>/<name>.json` and
+`GET <prefix>/api/repos/<o>/<n>/mirror` returns it: the last state seen
+with its action and reason, the last fetch with per-branch verdicts, the
+clone URL in use. Caps: 50 followed repos, 60 s per fetch.
+
+The stance holds. The plugin talks to relays and to git remotes, never to
+a chain API; whether the mark is really on the chain is still the
+browser's question on the Anchors tab. `forge/lib/mirror.js` is the pure
+part (config, event checks, the plan, the verdict), tested on its own;
+the sockets and the git are in plugin.js.
+
 ### Who signs — forge instance key, not the maintainer (a Finding)
 
 The forge signs with its **own instance key**, not the maintainer's
